@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+proxy-ca/
+# Personal working routing config with production providers and internal
+# hosts -- not published. The repository example is routing.example.yaml,
+# see ROUTER_CONFIG_PATH in .env
+routing.yaml
+# Local CA bundles for upstream providers -- personal, not published; the
+# certs/ directory itself is tracked via certs/.gitkeep
+certs/*.pem
+# Internal agent-workflow journal -- not published
+tasks/

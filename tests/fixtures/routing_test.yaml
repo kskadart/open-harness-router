@@ -1,0 +1,67 @@
+# Test provider registry and routing rules.
+# Does not use ca_bundle, to avoid pulling real certificates into pytest.
+version: 1
+
+providers:
+  anthropic:
+    type: passthrough
+    base_url: https://api.anthropic.com
+    forward_client_auth: true
+    timeout_s: 30
+    stream_read_timeout_s: 30
+
+  openai_compatible:
+    type: openai-translate
+    base_url: https://gateway.example.com/v1
+    api_key_env: OPENAI_COMPATIBLE_KEY
+    timeout_s: 30
+    max_tokens_limit: 65536
+    extra_headers:
+      User-Agent: open-harness-router-tests/0.1
+
+  # OpenAI GPT-5.x reasoning: max_completion_tokens instead of max_tokens,
+  # temperature is dropped as an unsupported parameter.
+  # tools_max=128: OpenAI's hard limit on the tools array (trims the MCP tail).
+  # api_flavor=responses: on /v1/chat/completions GPT-5.6 cannot use function
+  # tools together with reasoning -- upstream returns 400.
+  openai:
+    type: openai-translate
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    token_param: max_completion_tokens
+    drop_params: [temperature, top_p]
+    tools_max: 128
+    api_flavor: responses
+    reasoning_effort: high
+    max_tokens_limit: 128000
+    timeout_s: 30
+
+  # Regression fixture: explicit chat path (classic /v1/chat/completions).
+  # Proves the old chat completions path is not broken after adding responses.
+  # The compatibility profile mirrors openai's reasoning settings: on the
+  # chat path it checks the token-limit rename, sampling-parameter removal,
+  # and tools array truncation.
+  openai_chat:
+    type: openai-translate
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    api_flavor: chat
+    token_param: max_completion_tokens
+    drop_params: [temperature, top_p]
+    tools_max: 128
+    max_tokens_limit: 128000
+    timeout_s: 30
+
+rules:
+  - match: {type: prefix, value: "claude-"}
+    provider: anthropic
+  - match: {type: contains, value: "GLM"}
+    provider: openai_compatible
+    upstream_model: zai-org/GLM-5.2-FP8
+  - match: {type: prefix, value: "gpt-"}
+    provider: openai
+  - match: {type: prefix, value: "chat-"}
+    provider: openai_chat
+
+default:
+  provider: anthropic

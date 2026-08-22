@@ -1,0 +1,163 @@
+# Provider and routing rule registry for open-harness-router.
+# This is a MINIMAL WORKING EXAMPLE for the repository: only anthropic is
+# active (comes up right after cloning, no key needed -- billing goes
+# through the Claude Code OAuth subscription). The other providers below
+# are commented out as templates: uncomment the block you need and the
+# matching routing rule for it, set api_key_env and the actual environment
+# variable holding the key.
+#
+# Personal working config -- routing.yaml, created by copying this file
+# (cp routing.example.yaml routing.yaml) and already in .gitignore: edit it
+# freely, repository updates (this file) won't conflict with personal keys
+# and internal hosts.
+#
+# Adding a provider/model = editing this file, no code changes needed.
+version: 1
+
+providers:
+  # Native Anthropic: passthrough (byte-for-byte), the orchestrator always
+  # runs here. Claude Code logs in via OAuth subscription (/login) and sends
+  # the Bearer token itself; the router forwards it to api.anthropic.com
+  # unchanged, including the anthropic-beta header (required for OAuth,
+  # otherwise upstream returns 401). Billing goes through the subscription.
+  # ANTHROPIC_API_KEY does NOT need to be set.
+  anthropic:
+    type: passthrough
+    base_url: https://api.anthropic.com
+    forward_client_auth: true          # forward authorization / anthropic-version / anthropic-beta
+    timeout_s: 120
+    stream_read_timeout_s: 600
+
+  # Template for an OpenAI-compatible provider behind a translation layer
+  # (type: openai-translate). The primary use case is a corporate
+  # OpenAI-compatible gateway: an internal proxy reachable only inside a
+  # company network, presented with its own CA bundle (e.g. a GLM-family
+  # model served through such a gateway) -- that is exactly what the
+  # ca_bundle and extra_headers options below exist for. The same template
+  # also covers public OpenAI-compatible vendors that don't need a custom
+  # CA bundle; just drop the ca_bundle line.
+  # Replace base_url with the real gateway host and put the CA bundle in
+  # certs/ (ca_bundle is given relative to certs_dir).
+  # openai_compatible:
+  #   type: openai-translate
+  #   base_url: https://gateway.example.com/v1
+  #   api_key_env: OPENAI_COMPATIBLE_KEY
+  #   ca_bundle: your_ca_bundle.pem   # relative to certs_dir
+  #   timeout_s: 120
+  #   # GLM-5.x is a reasoning model: with a low max_tokens ceiling, reasoning
+  #   # burns the budget and upstream returns empty content (stop_reason max_tokens).
+  #   max_tokens_limit: 65536
+  #   extra_headers:
+  #     User-Agent: open-harness-router/0.1
+
+  # OpenAI GPT-5.x reasoning models (Sol/Terra/Luna, released 2026-07-09):
+  # upstream requires max_completion_tokens instead of max_tokens and does
+  # not accept temperature/top_p (returns "Unsupported parameter").
+  # tools_max=128: OpenAI hard limit on the tools array size; when exceeded,
+  # built-in Claude Code tools are kept and the MCP tail gets truncated.
+  # api_flavor=responses: on /v1/chat/completions the GPT-5.6 family can't
+  # do function tools together with reasoning -- upstream returns 400.
+  # openai:
+  #   type: openai-translate
+  #   base_url: https://api.openai.com/v1
+  #   api_key_env: OPENAI_API_KEY
+  #   token_param: max_output_tokens       # Responses API: max_output_tokens instead of max_completion_tokens
+  #   drop_params: [temperature, top_p]    # GPT-5.x reasoning: unsupported parameter
+  #   tools_max: 128                       # OpenAI hard limit on the tools array
+  #   api_flavor: responses                # Responses API: /v1/responses instead of /v1/chat/completions
+  #   reasoning_effort: high               # reasoning level for the Responses API
+  #   # Without an explicit value the schema default of 4096 applied:
+  #   # reasoning tokens burned the entire budget before any visible output,
+  #   # and the client got empty content with stop_reason max_tokens. 128000
+  #   # is the documented max output for GPT-5.6.
+  #   max_tokens_limit: 128000
+  #   timeout_s: 180
+
+  # Kimi (Moonshot AI): public OpenAI-compatible Chat Completions API, a
+  # separate account and key (unlike openai_compatible above, this is not
+  # an internal proxy, no ca_bundle needed). The official quickstart uses
+  # the MOONSHOT_API_KEY variable. Global domain api.moonshot.ai; there is
+  # a separate api.moonshot.cn for mainland China, but that is an
+  # independent account with its own billing (a key from one domain doesn't
+  # work on the other) -- the router uses the global domain.
+  # https://platform.kimi.ai/docs/guide/start-using-kimi-api
+  # kimi:
+  #   type: openai-translate
+  #   base_url: https://api.moonshot.ai/v1
+  #   api_key_env: MOONSHOT_API_KEY
+  #   # The Kimi K series (k3 / k2.7-code / k2.6) fixes temperature=1.0 and
+  #   # top_p=0.95 at the model level: any other value -> HTTP 400
+  #   # invalid_request_error, not a silent ignore.
+  #   # https://platform.kimi.ai/docs/api/models-overview
+  #   drop_params: [temperature, top_p]
+  #   # max_tokens is deprecated for Kimi in favor of max_completion_tokens.
+  #   # api_flavor is not set -> defaults to the "chat" schema: Kimi has no
+  #   # Responses-style endpoint, only /v1/chat/completions.
+  #   # https://platform.kimi.ai/docs/api/chat
+  #   token_param: max_completion_tokens
+  #   # kimi-k3 keeps thinking enabled at all times (like the GLM/GPT-5.x
+  #   # reasoning models): a low ceiling risks burning the budget on
+  #   # reasoning tokens before any visible output. 131072 is the documented
+  #   # default max_completion_tokens for kimi-k3 (the ceiling can be raised
+  #   # to 1048576 with the 1M context); with margin it also fits the 256K
+  #   # context of kimi-k2.6 / kimi-k2.7-code-highspeed, which route to this
+  #   # same provider.
+  #   max_tokens_limit: 131072
+  #   timeout_s: 180
+
+  # --- Other provider templates (uncomment and set api_key_env) ---
+  # deepseek:
+  #   type: openai-translate
+  #   base_url: https://api.deepseek.com/v1
+  #   api_key_env: DEEPSEEK_API_KEY
+  #   # DeepSeek API accepts up to 32768; reasoning models (R1) burn part of
+  #   # the budget on reasoning tokens, so the ceiling needs headroom.
+  #   max_tokens_limit: 32768
+  # openrouter:
+  #   type: openai-translate
+  #   base_url: https://openrouter.ai/api/v1
+  #   api_key_env: OPENROUTER_API_KEY
+  #   # OpenRouter routes to different models; 32000 is a safe ceiling for
+  #   # most reasoning models in the catalog.
+  #   max_tokens_limit: 32000
+  #   extra_headers:
+  #     HTTP-Referer: https://github.com/kskadart/open-harness-router
+  #     X-Title: open-harness-router
+  # local_vllm:
+  #   type: openai-translate
+  #   base_url: http://localhost:8000/v1
+  #   api_key_env: VLLM_API_KEY
+  #   # Local vLLM: the limit depends on the deployed model. Reasoning
+  #   # models (GLM-5.x) need headroom for reasoning tokens, like
+  #   # openai_compatible above.
+  #   max_tokens_limit: 65536
+
+# Rules: top to bottom, first match wins.
+rules:
+  - match: {type: prefix, value: "claude-"}
+    provider: anthropic
+  - match: {type: regex, value: "^(opus|sonnet|haiku|fable)"}
+    provider: anthropic
+  # Rules for the provider templates above -- uncomment together with the
+  # matching block in providers:.
+  # - match: {type: contains, value: "GLM"}
+  #   provider: openai_compatible
+  #   upstream_model: zai-org/GLM-5.2-FP8
+  # The "gpt-" prefix deliberately also covers OpenAI's codex models
+  # (gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-mini, gpt-5.3-codex etc.):
+  # same api.openai.com upstream with the same Responses API contract (only
+  # /v1/responses, Chat Completions is not supported for codex models), no
+  # separate provider needed. gpt-5-codex's 400K context / 128K max output
+  # fit within the openai provider's max_tokens_limit=128000.
+  # https://developers.openai.com/api/docs/models/gpt-5-codex
+  # - match: {type: prefix, value: "gpt-"}
+  #   provider: openai
+  # - match: {type: prefix, value: "kimi-"}
+  #   provider: kimi
+  # - match: {type: prefix, value: "deepseek-"}
+  #   provider: deepseek
+
+# Default for an unmatched model. CRITICAL: must be passthrough so the
+# orchestrator never ends up on a fleet model.
+default:
+  provider: anthropic

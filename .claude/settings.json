@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make full-check)",
+      "Bash(make test)",
+      "Bash(make lint)",
+      "Bash(make typecheck)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(uv run pytest *)",
+      "Bash(uv run ruff *)",
+      "Bash(uv run mypy *)"
+    ]
+  }
+}
