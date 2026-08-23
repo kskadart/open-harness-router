@@ -62,7 +62,32 @@ def test_openai_translate_without_api_key_env_is_rejected() -> None:
 def test_default_route_must_point_to_passthrough_provider() -> None:
     raw = _clone_valid()
     raw["default"] = {"provider": "openai_compatible"}
-    with pytest.raises(ValueError, match="default.provider must be of type 'passthrough'"):
+    with pytest.raises(
+        ValueError, match="default.provider must be passthrough with forward_client_auth=true"
+    ):
+        RoutingConfig.model_validate(raw)
+
+
+def test_default_route_to_own_key_passthrough_provider_is_rejected() -> None:
+    """A passthrough provider alone is not enough for the default route.
+
+    Regression for the tightened invariant: passthrough used to be
+    synonymous with "native Anthropic on the user's subscription", which
+    stopped being true once passthrough also covers third-party upstreams
+    billed on their own key (forward_client_auth=false). An unmatched model
+    must never silently land on a paid third-party vendor.
+    """
+    raw = _clone_valid()
+    raw["providers"]["moonshot"] = {  # type: ignore[index]
+        "type": "passthrough",
+        "base_url": "https://api.moonshot.ai/anthropic",
+        "forward_client_auth": False,
+        "api_key_env": "MOONSHOT_API_KEY",
+    }
+    raw["default"] = {"provider": "moonshot"}
+    with pytest.raises(
+        ValueError, match="default.provider must be passthrough with forward_client_auth=true"
+    ):
         RoutingConfig.model_validate(raw)
 
 
@@ -263,3 +288,233 @@ def test_max_tokens_limit_parsed_when_set() -> None:
     raw["providers"]["openai_compatible"]["max_tokens_limit"] = 131072  # type: ignore[index]
     cfg = RoutingConfig.model_validate(raw)
     assert cfg.providers["openai_compatible"].max_tokens_limit == 131072
+
+
+def test_forward_client_auth_defaults_to_true() -> None:
+    """Preserves pre-fix behavior for configs that don't set the flag.
+
+    Before this field had any effect, every passthrough provider forwarded
+    the client's credentials unconditionally, so the default must keep
+    doing that.
+    """
+    cfg = RoutingConfig.model_validate(_clone_valid())
+    assert cfg.providers["anthropic"].forward_client_auth is True
+
+
+def test_passthrough_own_key_without_api_key_env_is_rejected() -> None:
+    """passthrough with forward_client_auth=false requires api_key_env.
+
+    Without the key the router would have nothing to inject and the client's
+    own Claude Code OAuth token would keep being the only credential
+    available -- exactly the leak this whole feature exists to prevent.
+    """
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["forward_client_auth"] = False  # type: ignore[index]
+    with pytest.raises(
+        ValueError, match="passthrough with forward_client_auth=false requires 'api_key_env'"
+    ):
+        RoutingConfig.model_validate(raw)
+
+
+def test_passthrough_forward_client_auth_true_with_api_key_env_is_rejected() -> None:
+    """passthrough with forward_client_auth=true must not also set api_key_env.
+
+    Before this validator, factory.py returned before resolving the key, so
+    a stray api_key_env on a native-Anthropic provider was silently ignored
+    -- a trap where the configured key quietly did nothing. Now it fails
+    loudly at startup.
+    """
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["forward_client_auth"] = True  # type: ignore[index]
+    raw["providers"]["anthropic"]["api_key_env"] = "ANTHROPIC_API_KEY"  # type: ignore[index]
+    with pytest.raises(
+        ValueError, match="passthrough with forward_client_auth=true must not set 'api_key_env'"
+    ):
+        RoutingConfig.model_validate(raw)
+
+
+def test_passthrough_own_key_with_api_key_env_and_auth_header_is_accepted() -> None:
+    """A fully specified own-key passthrough provider validates and parses auth_header."""
+    raw = _clone_valid()
+    raw["providers"]["moonshot"] = {  # type: ignore[index]
+        "type": "passthrough",
+        "base_url": "https://api.moonshot.ai/anthropic",
+        "forward_client_auth": False,
+        "api_key_env": "MOONSHOT_API_KEY",
+        "auth_header": "x-api-key",
+    }
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.providers["moonshot"].forward_client_auth is False
+    assert cfg.providers["moonshot"].api_key_env == "MOONSHOT_API_KEY"
+    assert cfg.providers["moonshot"].auth_header == "x-api-key"
+
+
+def test_auth_header_defaults_to_bearer() -> None:
+    """auth_header defaults to bearer when omitted (most third-party upstreams)."""
+    cfg = RoutingConfig.model_validate(_clone_valid())
+    assert cfg.providers["anthropic"].auth_header == "bearer"
+
+
+def test_auth_header_invalid_value_is_rejected() -> None:
+    """An invalid auth_header -> pydantic validation error."""
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["auth_header"] = "basic"  # type: ignore[index]
+    with pytest.raises(ValueError, match="auth_header"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_auth_header_set_with_forward_client_auth_true_is_rejected() -> None:
+    """auth_header is meaningless (and rejected) on forward_client_auth=true.
+
+    Same trap as api_key_env in that mode: a configured value that quietly
+    does nothing, now a startup error instead.
+    """
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["auth_header"] = "x-api-key"  # type: ignore[index]
+    with pytest.raises(ValueError, match="auth_header has no effect"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_auth_header_set_on_openai_translate_is_rejected() -> None:
+    """auth_header is meaningless (and rejected) on openai-translate providers.
+
+    A separate message from the forward_client_auth=true case: this branch
+    names the wrong provider type, not the wrong passthrough mode, so
+    "set forward_client_auth=false" (impossible on openai-translate) must
+    not appear here.
+    """
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["auth_header"] = "bearer"  # type: ignore[index]
+    with pytest.raises(ValueError, match="auth_header only applies to passthrough"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_auth_header_unset_with_forward_client_auth_true_is_accepted() -> None:
+    """Not setting auth_header at all is fine on forward_client_auth=true (the default)."""
+    cfg = RoutingConfig.model_validate(_clone_valid())
+    assert cfg.providers["anthropic"].auth_header == "bearer"
+
+
+def test_rule_upstream_model_on_passthrough_provider_is_rejected() -> None:
+    """upstream_model on a rule pointing at a passthrough provider -> startup error.
+
+    Byte-for-byte proxying forwards the request body (including the model
+    field) unchanged and cannot rewrite it: a user copying the Kimi
+    passthrough template who naturally writes upstream_model on the rule
+    would otherwise get it silently dropped and a confusing model-not-found
+    from the vendor.
+    """
+    raw = _clone_valid()
+    raw["rules"][0]["upstream_model"] = "claude-opus-4-8-20260101"  # type: ignore[index]
+    with pytest.raises(
+        ValueError, match="upstream_model is not supported on passthrough"
+    ):
+        RoutingConfig.model_validate(raw)
+
+
+def test_rule_upstream_model_on_openai_translate_provider_is_accepted() -> None:
+    """Regression: upstream_model remains valid on openai-translate rules."""
+    raw = _clone_valid()
+    raw["rules"][1]["upstream_model"] = "zai-org/GLM-5.2-FP8"  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.rules[1].upstream_model == "zai-org/GLM-5.2-FP8"
+
+
+def test_forward_client_auth_true_with_api_key_env_message_offers_own_key_alternative() -> None:
+    """The error for forward_client_auth=true + api_key_env also names the intended fix.
+
+    The likeliest way to hit this branch (now that the default is true) is
+    someone writing a NEW own-key third-party provider who set api_key_env
+    and auth_header but forgot forward_client_auth: false -- the message
+    must point at that fix, not just say "remove the key".
+    """
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["forward_client_auth"] = True  # type: ignore[index]
+    raw["providers"]["anthropic"]["api_key_env"] = "ANTHROPIC_API_KEY"  # type: ignore[index]
+    with pytest.raises(ValueError, match="set forward_client_auth=false"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_forward_client_auth_set_on_openai_translate_is_rejected() -> None:
+    """forward_client_auth is meaningless (and rejected) on openai-translate providers.
+
+    Same trap class as auth_header in the same position: _validate_passthrough_auth
+    used to return early for non-passthrough, letting forward_client_auth=false
+    on openai-translate validate and silently do nothing.
+    """
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["forward_client_auth"] = False  # type: ignore[index]
+    with pytest.raises(
+        ValueError, match="forward_client_auth only applies to passthrough"
+    ):
+        RoutingConfig.model_validate(raw)
+
+
+def test_forward_client_auth_unset_on_openai_translate_is_accepted() -> None:
+    """Regression: not setting forward_client_auth at all is fine on openai-translate."""
+    cfg = RoutingConfig.model_validate(_clone_valid())
+    assert cfg.providers["openai_compatible"].forward_client_auth is True
+
+
+def test_passthrough_extra_headers_naming_authorization_is_rejected() -> None:
+    """extra_headers must not name authorization on a passthrough provider.
+
+    Merged in AFTER this provider's auth handling (see
+    providers/passthrough.py _build_headers), so it would silently override
+    the auth header this provider forwards or injects.
+    """
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["extra_headers"] = {"Authorization": "Bearer sneaky"}  # type: ignore[index]
+    with pytest.raises(ValueError, match=r"extra_headers must not set \['authorization'\]"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_passthrough_extra_headers_naming_x_api_key_is_rejected() -> None:
+    """extra_headers must not name x-api-key on a passthrough provider (case-insensitive)."""
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["extra_headers"] = {"X-Api-Key": "sneaky-key"}  # type: ignore[index]
+    with pytest.raises(ValueError, match=r"extra_headers must not set \['x-api-key'\]"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_passthrough_extra_headers_other_names_are_accepted() -> None:
+    """extra_headers with non-colliding names validates and parses on passthrough."""
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["extra_headers"] = {  # type: ignore[index]
+        "HTTP-Referer": "https://example.com",
+        "X-Title": "my-router",
+    }
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.providers["anthropic"].extra_headers == {
+        "HTTP-Referer": "https://example.com",
+        "X-Title": "my-router",
+    }
+
+
+def test_openai_translate_extra_headers_naming_authorization_is_rejected() -> None:
+    """extra_headers must not name authorization on openai-translate either.
+
+    Verified against the installed OpenAI SDK (openai/_base_client.py):
+    default_headers (which folds in our extra_headers last) is merged in
+    AFTER _auth_headers (the api_key_env-derived Authorization header), so
+    extra_headers["Authorization"] silently wins over the configured key.
+    The collision check is provider-agnostic for exactly this reason.
+    """
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["extra_headers"] = {  # type: ignore[index]
+        "Authorization": "Bearer sneaky"
+    }
+    with pytest.raises(ValueError, match=r"extra_headers must not set \['authorization'\]"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_openai_translate_extra_headers_other_names_are_accepted() -> None:
+    """Regression: non-colliding extra_headers remain valid on openai-translate."""
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["extra_headers"] = {  # type: ignore[index]
+        "User-Agent": "open-harness-router/0.1"
+    }
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.providers["openai_compatible"].extra_headers == {
+        "User-Agent": "open-harness-router/0.1"
+    }

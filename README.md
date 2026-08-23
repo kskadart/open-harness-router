@@ -33,9 +33,91 @@ The provider and rule registry lives in `routing.yaml`. Adding a
 provider/model is a YAML edit, no code changes. Provider types:
 
 - `passthrough` -- reverse-proxy to an Anthropic-compatible upstream, no
-  translation;
+  translation. Setting `upstream_model` on a routing rule pointing at a
+  passthrough provider is a startup error: byte-for-byte proxying forwards
+  the request body, including the `model` field, unchanged and cannot
+  rewrite it (`upstream_model` is only meaningful for `openai-translate`).
+  Supports `ca_bundle` (for a corporate/self-hosted Anthropic-compatible
+  gateway behind a private CA, same as `openai-translate` below) and
+  `extra_headers` (merged in after this provider's own auth handling, so it
+  cannot reintroduce a stripped client credential -- but it also must not
+  name `authorization`/`x-api-key` itself, or it would silently override
+  the auth header this provider forwards or injects; rejected at startup);
 - `openai-translate` -- translates to OpenAI ChatCompletions (its own
   `base_url`, key via `api_key_env`, optional `ca_bundle` in `certs/`).
+
+`passthrough` has two mutually exclusive auth modes, set by
+`forward_client_auth` (`ProviderCfg`, `src/routing/schema.py`):
+
+- `forward_client_auth: true` (the default, for backward compatibility)
+  forwards the client's own request headers unchanged, including
+  `authorization`/`x-api-key` -- the native-Anthropic path, billed through
+  the Claude Code OAuth subscription. Because this path legitimately
+  proxies the client's full request to the client's own vendor, it is not
+  narrowed to a fixed set of headers (Claude Code features can ride
+  uncommon ones). Setting `api_key_env` alongside it is a startup error:
+  the client's credential is what reaches the upstream, so a configured key
+  here would silently do nothing;
+- `forward_client_auth: false` injects the provider's own key from
+  `api_key_env` instead, under an ALLOWLIST of outgoing headers -- not a
+  denylist over just `authorization`/`x-api-key`, which would still leak
+  any other credential the client happens to carry (e.g. a cookie session
+  token) to a vendor the client did not choose. Only `anthropic-version`,
+  `anthropic-beta`, `content-type`, `accept`, `accept-encoding`, and
+  `user-agent` (kept verbatim, never rewritten -- Kimi's terms of service
+  treat client-identifier tampering as grounds for suspending the
+  membership) are forwarded, plus the injected key. This is what makes a
+  third-party Anthropic-compatible upstream usable via passthrough (Kimi,
+  Z.ai, DeepSeek, MiniMax, ...) without ever letting the client's Claude
+  Code subscription credential -- or any other credential it carries --
+  reach it: Anthropic bans using a subscription credential with
+  third-party products. `api_key_env` is required in this mode (startup
+  error if missing). `auth_header` (`bearer` or `x-api-key`, default
+  `bearer`, rejected at startup if set anywhere this mode isn't active)
+  picks which header the own key goes into -- third-party upstreams
+  disagree on this even when both expose an otherwise Anthropic-compatible
+  endpoint.
+
+Because of this, `default.provider` must be a passthrough provider with
+`forward_client_auth: true`, not merely `type: passthrough` -- an unmatched
+model must never silently land on a third-party vendor billed on its own
+key, any more than on a fleet model (see "How rules work" below).
+
+At startup, each passthrough provider logs a `passthrough_auth_mode` event
+(`provider`, `own_key`, `auth_header`) -- so which credential actually goes
+out on the wire for that provider is visible in the logs, not only on the
+vendor's invoice.
+
+### Upgrading
+
+`forward_client_auth` now defaults to `true` and is enforced (previously it
+was declared but never read). If an existing `routing.yaml` has a
+passthrough provider with `forward_client_auth: false` and no
+`api_key_env`, the router now refuses to start -- the validation error
+names the missing field and how to fix it (add `api_key_env`, or switch to
+`forward_client_auth: true` if forwarding the client's own credentials was
+intended). Since `ProviderRegistry.build` constructs every provider
+eagerly, this failure blocks the whole router, not just that one provider,
+so it surfaces immediately rather than as an in-production surprise.
+
+Two more previously-inert fields on passthrough are now enforced/honored,
+with the same eager-boot consequence as above (one bad provider blocks the
+whole router, not just itself):
+
+- `api_key_env` on a `forward_client_auth: true` (the default) passthrough
+  provider used to be accepted and silently ignored; it is now a startup
+  error (the client's own credentials are what get forwarded, so a
+  configured key would never be used).
+- `ca_bundle` on a passthrough provider used to be accepted and silently
+  ignored (the transport always verified against the system trust roots
+  regardless); it is now resolved and applied. A `ca_bundle` left over from
+  before this change either points at a file that doesn't exist (startup
+  `ConfigError`) or, if it does exist, now actually replaces the system
+  trust roots for that provider's outgoing connections -- a passthrough
+  provider that never needed a private CA (e.g. native `api.anthropic.com`)
+  would start failing every request with TLS verification errors (502) if
+  it happened to carry a stray `ca_bundle`. Remove `ca_bundle` from any
+  passthrough provider that doesn't actually sit behind a private CA.
 
 Required variable: `ROUTER_CONFIG_PATH` (path to `routing.yaml`).
 Provider secrets are set via environment variables whose names are declared in
@@ -93,12 +175,16 @@ them first.
 - `regex` -- `re.search(value, model)` (a search, not anchored to the start).
 
 `upstream_model` in a rule (optional) -- the name the request is sent
-upstream under, when it must differ from what the client sent.
+upstream under, when it must differ from what the client sent. Only valid on
+rules pointing at an `openai-translate` provider: on `passthrough`, setting
+it is a startup error (see "Configuration" above).
 
 If no rule matches, `default.provider` is used. The schema
 (`src/routing/schema.py`) requires `default.provider` to be a `passthrough`
-provider -- this is a safety invariant: an unmatched model must never
-accidentally end up on a fleet provider.
+provider with `forward_client_auth: true` -- this is a safety invariant: an
+unmatched model must never accidentally end up on a fleet provider or on a
+third-party vendor billed on its own key (see "Configuration" above for the
+two passthrough auth modes).
 
 ### How to check where a model will go
 
@@ -175,6 +261,12 @@ Fields of an `openai-translate` provider (`ProviderCfg`,
   (`/v1/responses`, allowed only for `openai-translate`): some reasoning
   models reject function tools combined with reasoning on the chat endpoint
   and return a 400.
+
+`timeout_s` on `ProviderCfg` (either provider type) is currently unused --
+only `connect_timeout_s` (`ROUTER_UPSTREAM_CONNECT_TIMEOUT_S`, shared
+across all upstreams) and `stream_read_timeout_s` (per provider) ever reach
+`httpx.Timeout`. Setting `timeout_s` in `routing.yaml` parses without error
+but has no effect on either provider type.
 
 ## Running
 
