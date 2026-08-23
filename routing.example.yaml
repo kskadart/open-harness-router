@@ -105,6 +105,45 @@ providers:
   #   max_tokens_limit: 131072
   #   timeout_s: 180
 
+  # Kimi via passthrough: an ALTERNATIVE to the openai-translate "kimi" block
+  # above, not a second copy of it -- pick one, not both. Kimi also exposes
+  # Anthropic-compatible (not OpenAI-compatible) endpoints, so no
+  # request/response translation is needed: passthrough forwards
+  # /v1/messages byte-for-byte, the same code path as the anthropic
+  # provider above, just to a different host and with the router's own key
+  # instead of the client's subscription token.
+  #
+  # forward_client_auth: false is REQUIRED here (the schema enforces it at
+  # startup, together with api_key_env): forward_client_auth: true would
+  # mean forwarding the client's own Claude Code OAuth Bearer token to a
+  # third-party host -- Anthropic bans using a subscription credential with
+  # third-party products (Feb 2026 policy update), so leaking it here is an
+  # account-level risk, not just a failed request. false switches the
+  # router to an ALLOWLIST of outgoing headers (not merely stripping
+  # authorization/x-api-key -- that would still leak e.g. a cookie session
+  # token) and injects api_key_env's own key instead, so billing goes
+  # through that key's account, never the subscription.
+  #
+  # Kimi has two endpoint/header variants for this passthrough path, pick
+  # one and set auth_header to match (mixing base_url and auth_header from
+  # different variants sends the wrong header shape and the upstream
+  # rejects the request):
+  # - Moonshot's Anthropic-compatible endpoint: base_url
+  #   https://api.moonshot.ai/anthropic, auth_header: bearer. Same
+  #   MOONSHOT_API_KEY as the openai-translate "kimi" block above -- one
+  #   Moonshot account, two endpoint styles to reach it.
+  # - Kimi Code subscription endpoint: base_url
+  #   https://api.kimi.com/coding/, auth_header: x-api-key (like native
+  #   Anthropic). A separate Kimi Code subscription key, not the Moonshot
+  #   platform key above -- do not reuse MOONSHOT_API_KEY here.
+  # kimi_anthropic:
+  #   type: passthrough
+  #   base_url: https://api.moonshot.ai/anthropic
+  #   forward_client_auth: false
+  #   api_key_env: MOONSHOT_API_KEY
+  #   auth_header: bearer
+  #   stream_read_timeout_s: 600
+
   # Qwen (Alibaba Cloud Model Studio, DashScope): public OpenAI-compatible
   # Chat Completions API, a separate account and key. Regions are
   # independent installations -- access domain, API key and model list of
@@ -228,6 +267,11 @@ rules:
   #   provider: openai
   # - match: {type: prefix, value: "kimi-"}
   #   provider: kimi
+  # Alternative to the rule above -- only if the kimi_anthropic passthrough
+  # provider is uncommented instead of (not in addition to) openai-translate
+  # "kimi"; both rules would otherwise fight over the same "kimi-" prefix.
+  # - match: {type: prefix, value: "kimi-"}
+  #   provider: kimi_anthropic
   # No trailing dash in the qwen prefix: the family mixes a dash right after
   # the vendor name (qwen-plus, qwen-max, qwen-turbo, qwen-flash) with a
   # version first (qwen3.8-max, qwen3.7-plus, qwen3-coder-plus), and "qwen-"

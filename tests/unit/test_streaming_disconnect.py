@@ -406,6 +406,8 @@ def _passthrough_provider() -> PassthroughProvider:
     provider = PassthroughProvider.__new__(PassthroughProvider)
     provider.name = "anthropic"
     provider.cfg = cfg
+    # forward_client_auth defaults to true on cfg above -> no own key.
+    provider._api_key = None
     # Retries are disabled: the tests exercise single-attempt failure
     # handling, and the retry pauses would stretch every connect-failure
     # test by tens of seconds.
