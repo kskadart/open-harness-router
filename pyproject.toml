@@ -1,7 +1,7 @@
 [project]
 name = "open-harness-router"
 version = "0.1.0"
-description = "Anthropic-compatible routing proxy for Claude Code CLI"
+description = "Routing proxy that runs OpenAI, Kimi, GLM and other models inside the Claude Code CLI"
 requires-python = "==3.13.*"
 license = { text = "MIT" }
 authors = [

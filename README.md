@@ -1,10 +1,12 @@
-# open-harness-router
+# Open Harness Router
 
-An Anthropic-compatible routing proxy for the Claude Code CLI. A single process
-accepts Anthropic requests (`/v1/messages`) and dispatches them by model name
-across a fleet of providers: native Anthropic models go passthrough
-(byte-for-byte), while fleet models (GLM and others) go through Anthropic
-<-> OpenAI translation.
+Run models from any vendor inside the Claude Code CLI. A single process speaks
+the Anthropic API (`/v1/messages`) to the client and dispatches each request by
+model name across a fleet of providers: native Anthropic models go passthrough
+(byte-for-byte), while everything else goes through Anthropic <-> OpenAI
+translation -- OpenAI GPT-5.x (including the Responses API, needed for
+reasoning models with tools), Kimi (Moonshot AI), GLM behind a corporate
+OpenAI-compatible gateway, DeepSeek, OpenRouter, or a local vLLM instance.
 
 The Claude Code orchestrator always stays on native Anthropic models: the
 `claude-*` and alias rules route to passthrough, and the default route must be
