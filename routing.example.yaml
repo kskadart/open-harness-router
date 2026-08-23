@@ -105,6 +105,80 @@ providers:
   #   max_tokens_limit: 131072
   #   timeout_s: 180
 
+  # Qwen (Alibaba Cloud Model Studio, DashScope): public OpenAI-compatible
+  # Chat Completions API, a separate account and key. Regions are
+  # independent installations -- access domain, API key and model list of
+  # one region are not usable in another, so base_url must match the region
+  # the key was issued in. dashscope-intl.aliyuncs.com is the Singapore
+  # (international) domain; mainland China is dashscope.aliyuncs.com with
+  # the same /compatible-mode/v1 path.
+  # https://www.alibabacloud.com/help/en/model-studio/regions/
+  # The official quickstart reads the key from DASHSCOPE_API_KEY.
+  # https://www.alibabacloud.com/help/en/model-studio/compatibility-of-openai-with-dashscope
+  # qwen:
+  #   type: openai-translate
+  #   base_url: https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+  #   api_key_env: DASHSCOPE_API_KEY
+  #   # max_tokens is marked "to be deprecated" in the Model Studio
+  #   # reference; max_completion_tokens is the current field and, unlike
+  #   # max_tokens, counts chain-of-thought tokens toward the budget.
+  #   # https://www.alibabacloud.com/help/en/model-studio/qwen-api-via-openai-chat-completions
+  #   token_param: max_completion_tokens
+  #   # No drop_params: temperature and top_p are plain optional parameters
+  #   # for Qwen text models (ranges [0, 2) and (0, 1.0]), not a fixed
+  #   # model-level constant like on Kimi and GPT-5.x above.
+  #   # The Qwen3.5+ hybrid flagships (qwen3.7-*, qwen3.6-*, qwen3.5-*)
+  #   # think by default and their thinking tokens count against
+  #   # max_completion_tokens, so a low ceiling burns the budget before any
+  #   # visible answer. 131072 is the documented max output of the
+  #   # qwen3.8-max / qwen3.7-max flagships.
+  #   # https://www.qwencloud.com/models/qwen3.8-max
+  #   max_tokens_limit: 131072
+  #   # api_flavor stays at the "chat" default: enable_thinking travels
+  #   # alongside the tools array on /v1/chat/completions, so thinking and
+  #   # function calling coexist and the Responses detour that GPT-5.6
+  #   # requires is unnecessary here.
+  #   # https://docs.qwencloud.com/developer-guides/text-generation/thinking
+  #   timeout_s: 180
+
+  # Grok (xAI): public OpenAI-compatible Chat Completions API on
+  # api.x.ai/v1, a separate account and key (XAI_API_KEY per the
+  # quickstart). xAI also exposes an Anthropic-shaped /v1/messages on the
+  # same host, yet type: passthrough is still wrong here -- passthrough
+  # exists to forward the client's own Claude Code OAuth token to
+  # api.anthropic.com, while xAI bills its own XAI_API_KEY, and a forwarded
+  # subscription token authenticates nothing there.
+  # https://docs.x.ai/developers/quickstart
+  # grok:
+  #   type: openai-translate
+  #   base_url: https://api.x.ai/v1
+  #   api_key_env: XAI_API_KEY
+  #   # max_tokens is deprecated in the xAI reference in favor of
+  #   # max_completion_tokens.
+  #   # https://docs.x.ai/developers/rest-api-reference/inference/chat
+  #   token_param: max_completion_tokens
+  #   # Reasoning models reject stop (along with presence_penalty and
+  #   # frequency_penalty) with an error, and the chat translation emits
+  #   # stop whenever the client sends stop_sequences. temperature and top_p
+  #   # are documented as supported for reasoning models, so they stay.
+  #   # https://docs.x.ai/developers/model-capabilities/text/reasoning
+  #   drop_params: [stop]
+  #   # Documented cap on the tools array; over it, built-in Claude Code
+  #   # tools are kept and the MCP tail gets truncated.
+  #   # https://docs.x.ai/developers/tools/function-calling
+  #   tools_max: 200
+  #   # grok-4.5 and grok-4.6 cannot disable reasoning, so reasoning tokens
+  #   # always eat into the budget. 128000 is the max_completion_tokens
+  #   # default the API itself applies when the field is absent.
+  #   max_tokens_limit: 128000
+  #   # api_flavor stays "chat": tools and reasoning coexist on
+  #   # /v1/chat/completions, unlike the GPT-5.6 family above, so no
+  #   # Responses detour. reasoning_effort is deliberately left unset -- the
+  #   # accepted values are per-model (grok-4.6 low..xhigh, grok-4.5
+  #   # low..high, older models answer 400 for the parameter itself), and
+  #   # this router only sends it on api_flavor: responses anyway.
+  #   timeout_s: 180
+
   # --- Other provider templates (uncomment and set api_key_env) ---
   # deepseek:
   #   type: openai-translate
@@ -154,6 +228,14 @@ rules:
   #   provider: openai
   # - match: {type: prefix, value: "kimi-"}
   #   provider: kimi
+  # No trailing dash in the qwen prefix: the family mixes a dash right after
+  # the vendor name (qwen-plus, qwen-max, qwen-turbo, qwen-flash) with a
+  # version first (qwen3.8-max, qwen3.7-plus, qwen3-coder-plus), and "qwen-"
+  # would miss every versioned id.
+  # - match: {type: prefix, value: "qwen"}
+  #   provider: qwen
+  # - match: {type: prefix, value: "grok-"}
+  #   provider: grok
   # - match: {type: prefix, value: "deepseek-"}
   #   provider: deepseek
 
