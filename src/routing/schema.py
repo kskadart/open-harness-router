@@ -96,6 +96,13 @@ class ProviderCfg(BaseModel):
     ``openai-translate``) is a startup error, same reasoning as
     ``forward_client_auth`` above.
 
+    ``tls_verify_hostname`` -- when false, the outbound TLS connection
+    skips only the hostname match against the leaf certificate; the
+    certificate chain is still FULLY verified against ``ca_bundle`` (or the
+    system roots): ``check_hostname=False`` with ``verify_mode`` kept at
+    ``CERT_REQUIRED``, never ``verify=False``. Exists for internal dev
+    gateways whose leaf certificate does not cover their FQDN.
+
     ``ca_bundle`` and ``extra_headers`` apply to both provider types:
     ``ca_bundle`` verifies the upstream against a private CA (a
     corporate/self-hosted Anthropic-compatible gateway); ``extra_headers``
@@ -111,6 +118,7 @@ class ProviderCfg(BaseModel):
     base_url: str
     api_key_env: str | None = None
     ca_bundle: str | None = None
+    tls_verify_hostname: bool = True
     timeout_s: int = 120
     stream_read_timeout_s: int = 600
     extra_headers: dict[str, str] = Field(default_factory=dict)

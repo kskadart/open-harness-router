@@ -16,8 +16,11 @@ passthrough (enforced by the config validator).
 Two launch modes share the same provider registry: reverse-proxy
 (`make run`, the client points at the router via `ANTHROPIC_BASE_URL`) and
 forward-proxy (`make run-proxy`, the client uses `HTTPS_PROXY`,
-`ANTHROPIC_BASE_URL` is left untouched) -- see the "Forward-proxy" section
-below.
+`ANTHROPIC_BASE_URL` is left untouched). Forward-proxy keeps claude.ai
+Remote Control working: the CLI disables it under a custom
+`ANTHROPIC_BASE_URL`, but with the base URL untouched the feature stays on
+while every request is still routed across the fleet -- see the
+"Forward-proxy" section below.
 
 ## Installation
 

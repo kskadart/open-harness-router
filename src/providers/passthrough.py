@@ -33,7 +33,7 @@ from services.header_utils import (
     own_key_headers,
     response_headers,
 )
-from services.http_transport import build_upstream_transport
+from services.http_transport import build_upstream_transport, build_upstream_verify
 from services.retry import retry_connect
 from settings import UpstreamSettings
 
@@ -147,7 +147,7 @@ class PassthroughProvider:
             write=60.0,
             pool=10.0,
         )
-        verify: str | bool = str(ca_bundle_path) if ca_bundle_path else True
+        verify = build_upstream_verify(ca_bundle_path, cfg.tls_verify_hostname)
         self._client = httpx.AsyncClient(
             base_url=cfg.base_url,
             timeout=timeout,

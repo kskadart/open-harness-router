@@ -13,6 +13,9 @@ a forward-proxy loop.
 
 from __future__ import annotations
 
+import ssl
+from pathlib import Path
+
 import httpx
 
 from settings import UpstreamSettings
@@ -21,15 +24,49 @@ from settings import UpstreamSettings
 _IPV4_ANY = "0.0.0.0"
 
 
+def build_upstream_verify(
+    ca_bundle_path: Path | None, tls_verify_hostname: bool
+) -> ssl.SSLContext | str | bool:
+    """Build the ``verify`` value for a provider's outbound TLS.
+
+    Exists for internal dev gateways whose leaf certificate does not cover
+    their FQDN (``tls_verify_hostname=false`` in ``routing.yaml``): only the
+    hostname match against the leaf certificate is skipped, the certificate
+    chain is still FULLY verified against the bundle (or the system roots).
+
+    Args:
+        ca_bundle_path: path to a CA bundle, or ``None`` for the system's
+            trusted roots.
+        tls_verify_hostname: when false, hostname verification is disabled
+            while ``verify_mode`` stays ``CERT_REQUIRED``.
+
+    Returns:
+        A bundle path / ``True`` for full default verification, or an
+        explicit ``ssl.SSLContext`` when hostname verification is off.
+    """
+    if tls_verify_hostname:
+        return str(ca_bundle_path) if ca_bundle_path else True
+    context = ssl.create_default_context(
+        cafile=str(ca_bundle_path) if ca_bundle_path else None
+    )
+    # CERT_REQUIRED is re-asserted explicitly (create_default_context already
+    # sets it) so a future edit cannot silently downgrade this context to
+    # CERT_NONE -- chain verification must survive check_hostname=False.
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_REQUIRED
+    return context
+
+
 def build_upstream_transport(
-    upstream: UpstreamSettings, verify: str | bool = True
+    upstream: UpstreamSettings, verify: ssl.SSLContext | str | bool = True
 ) -> httpx.AsyncHTTPTransport:
     """Build the provider's outgoing connection transport.
 
     Args:
         upstream: outgoing connection settings (IPv4 binding, pool limits).
-        verify: upstream certificate verification -- a path to a CA bundle
-            or ``True`` for the system's trusted roots.
+        verify: upstream certificate verification -- a path to a CA bundle,
+            ``True`` for the system's trusted roots, or a prebuilt
+            ``ssl.SSLContext`` (see ``build_upstream_verify``).
 
     Returns:
         A transport with the configured pool limits; bound to IPv4 when

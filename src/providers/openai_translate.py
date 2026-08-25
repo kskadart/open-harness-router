@@ -44,7 +44,7 @@ from log import get_logger
 from models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest, ClaudeTool
 from providers.base import ClientChannel, ProviderResult
 from routing.schema import ProviderCfg
-from services.http_transport import build_upstream_transport
+from services.http_transport import build_upstream_transport, build_upstream_verify
 from services.reasoning_cache import ReasoningCache
 from services.token_estimator import estimate_from_claude_request
 from settings import UpstreamSettings
@@ -202,7 +202,7 @@ class OpenAITranslateProvider:
             write=60.0,
             pool=10.0,
         )
-        verify: str | bool = str(ca_bundle_path) if ca_bundle_path else True
+        verify = build_upstream_verify(ca_bundle_path, cfg.tls_verify_hostname)
         self._http_client = httpx.AsyncClient(
             timeout=timeout, transport=build_upstream_transport(upstream, verify)
         )

@@ -11,6 +11,7 @@ proxy-ca/
 # hosts -- not published. The repository example is routing.example.yaml,
 # see ROUTER_CONFIG_PATH in .env
 routing.yaml
+routing.yaml.bak-*
 # Local CA bundles for upstream providers -- personal, not published; the
 # certs/ directory itself is tracked via certs/.gitkeep
 certs/*.pem
