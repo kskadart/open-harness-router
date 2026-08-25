@@ -11,12 +11,14 @@ bundle actually reaching the provider's transport.
 
 from __future__ import annotations
 
+import ssl
 from pathlib import Path
 
 import pytest
 
 from errors import ConfigError
 from providers.factory import build_provider
+from providers.openai_translate import OpenAITranslateProvider
 from providers.passthrough import PassthroughProvider
 from routing.schema import ProviderCfg
 from settings import Settings
@@ -136,5 +138,67 @@ async def test_build_provider_passthrough_ca_bundle_is_wired_into_the_transport(
         assert ca_certs[0]["subject"] == (
             (("commonName", "open-harness-router-test-ca"),),
         )
+    finally:
+        await provider.aclose()
+
+
+async def test_build_provider_passthrough_tls_verify_hostname_false_wired_into_transport(
+    monkeypatch: pytest.MonkeyPatch, _settings_env: None
+) -> None:
+    """tls_verify_hostname=false reaches the passthrough transport's SSL context.
+
+    The context must skip only the hostname match: check_hostname is off
+    while verify_mode stays CERT_REQUIRED, and the chain is still verified
+    against the configured bundle (one CA entry, same as the ca_bundle
+    wiring test above).
+    """
+    monkeypatch.setenv("MOONSHOT_API_KEY", "moonshot-secret")
+    settings = Settings()
+    cfg = ProviderCfg(
+        type="passthrough",
+        base_url="https://gateway.internal.example",
+        forward_client_auth=False,
+        api_key_env="MOONSHOT_API_KEY",
+        ca_bundle="test_ca.pem",
+        tls_verify_hostname=False,
+    )
+
+    provider = build_provider("moonshot", cfg, settings)
+    try:
+        assert isinstance(provider, PassthroughProvider)
+        ssl_context = provider._client._transport._pool._ssl_context  # type: ignore[attr-defined]
+        assert ssl_context.check_hostname is False
+        assert ssl_context.verify_mode == ssl.CERT_REQUIRED
+        assert len(ssl_context.get_ca_certs()) == 1
+    finally:
+        await provider.aclose()
+
+
+async def test_build_provider_openai_translate_tls_verify_hostname_false_wired_into_transport(
+    monkeypatch: pytest.MonkeyPatch, _settings_env: None
+) -> None:
+    """tls_verify_hostname=false reaches the openai-translate transport's SSL context too.
+
+    Same invariant as the passthrough test above, for the second call site
+    of build_upstream_verify (the dedicated httpx client under AsyncOpenAI).
+    """
+    monkeypatch.setenv("GATEWAY_API_KEY", "gateway-secret")
+    settings = Settings()
+    cfg = ProviderCfg(
+        type="openai-translate",
+        base_url="https://gateway.internal.example/v1",
+        api_key_env="GATEWAY_API_KEY",
+        max_tokens_limit=65536,
+        ca_bundle="test_ca.pem",
+        tls_verify_hostname=False,
+    )
+
+    provider = build_provider("gateway", cfg, settings)
+    try:
+        assert isinstance(provider, OpenAITranslateProvider)
+        ssl_context = provider._http_client._transport._pool._ssl_context  # type: ignore[attr-defined]
+        assert ssl_context.check_hostname is False
+        assert ssl_context.verify_mode == ssl.CERT_REQUIRED
+        assert len(ssl_context.get_ca_certs()) == 1
     finally:
         await provider.aclose()

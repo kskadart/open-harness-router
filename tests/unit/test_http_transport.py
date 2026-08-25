@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
-from services.http_transport import build_upstream_transport
+import ssl
+from pathlib import Path
+
+from services.http_transport import build_upstream_transport, build_upstream_verify
 from settings import UpstreamSettings
+
+_TEST_CA = Path(__file__).resolve().parents[1] / "fixtures" / "certs" / "test_ca.pem"
 
 
 def _pool(transport: object) -> object:
@@ -47,3 +52,40 @@ def test_pool_limits_come_from_settings() -> None:
     assert pool._max_connections == 42  # type: ignore[attr-defined]
     assert pool._max_keepalive_connections == 7  # type: ignore[attr-defined]
     assert pool._keepalive_expiry == 12.5  # type: ignore[attr-defined]
+
+
+def test_build_upstream_verify_default_without_bundle_is_true() -> None:
+    """tls_verify_hostname=true without a bundle -> True (system trust roots)."""
+    assert build_upstream_verify(None, tls_verify_hostname=True) is True
+
+
+def test_build_upstream_verify_default_with_bundle_is_the_bundle_path() -> None:
+    """tls_verify_hostname=true with a bundle -> the bundle path (pre-existing behavior)."""
+    assert build_upstream_verify(_TEST_CA, tls_verify_hostname=True) == str(_TEST_CA)
+
+
+def test_build_upstream_verify_hostname_off_keeps_chain_verification() -> None:
+    """tls_verify_hostname=false skips ONLY the hostname match, never the chain.
+
+    check_hostname is off while verify_mode stays CERT_REQUIRED -- the whole
+    point of the option is that it must never degrade into verify=False.
+    """
+    context = build_upstream_verify(None, tls_verify_hostname=False)
+
+    assert isinstance(context, ssl.SSLContext)
+    assert context.check_hostname is False
+    assert context.verify_mode == ssl.CERT_REQUIRED
+
+
+def test_build_upstream_verify_hostname_off_loads_the_ca_bundle() -> None:
+    """tls_verify_hostname=false with a bundle verifies the chain against that bundle."""
+    context = build_upstream_verify(_TEST_CA, tls_verify_hostname=False)
+
+    assert isinstance(context, ssl.SSLContext)
+    assert context.check_hostname is False
+    assert context.verify_mode == ssl.CERT_REQUIRED
+    ca_certs = context.get_ca_certs()
+    # A single entry confirms the custom bundle replaced the system trust
+    # store rather than merely being consulted alongside it.
+    assert len(ca_certs) == 1
+    assert ca_certs[0]["subject"] == ((("commonName", "open-harness-router-test-ca"),),)

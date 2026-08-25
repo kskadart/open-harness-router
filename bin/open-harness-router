@@ -1,0 +1,6 @@
+#!/bin/sh
+# Dedicated launcher so the macOS Background-Items entry is named after the
+# service, not "python"; exec replaces the shell so launchd still supervises
+# the server process itself (no intermediate parent, same PID).
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+exec "$ROOT/.venv/bin/python" -m entrypoint "$@"

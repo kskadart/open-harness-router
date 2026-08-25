@@ -518,3 +518,18 @@ def test_openai_translate_extra_headers_other_names_are_accepted() -> None:
     assert cfg.providers["openai_compatible"].extra_headers == {
         "User-Agent": "open-harness-router/0.1"
     }
+
+
+def test_tls_verify_hostname_defaults_to_true() -> None:
+    """tls_verify_hostname defaults to true -- full verification including the hostname."""
+    cfg = RoutingConfig.model_validate(_clone_valid())
+    assert cfg.providers["anthropic"].tls_verify_hostname is True
+    assert cfg.providers["openai_compatible"].tls_verify_hostname is True
+
+
+def test_tls_verify_hostname_false_parsed_when_set() -> None:
+    """tls_verify_hostname=false parses (internal dev gateway with a misissued leaf cert)."""
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["tls_verify_hostname"] = False  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.providers["openai_compatible"].tls_verify_hostname is False
