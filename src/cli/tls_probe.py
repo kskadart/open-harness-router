@@ -105,24 +105,30 @@ class Verdict(IntEnum):
 
 _VERDICT_HINTS: Mapping[Verdict, str] = {
     Verdict.CHAIN_OK_HOSTNAME_OK: (
-        "chain and host name verify with this trust store: keep tls_verify_hostname "
-        "at its default (true)"
+        "chain and host name verify with this trust store: nothing to fix -- give the "
+        "provider this ca_bundle and keep tls_verify_hostname at its default (true)"
     ),
     Verdict.BUNDLE_UNUSABLE: (
-        "the --cafile bundle could not be loaded, no handshake was attempted: check "
-        "that the file holds PEM CERTIFICATE blocks (openssl x509 -in FILE -noout -subject)"
+        "the --cafile bundle could not be loaded, so no handshake was attempted and "
+        "nothing about the host was learnt: check that the file holds PEM CERTIFICATE "
+        "blocks (openssl x509 -in FILE -noout -subject), rebuild it with the 'cat ... > "
+        "certs/<provider>_ca.pem' command 'tls_probe match' prints, then re-run this probe"
     ),
     Verdict.CHAIN_OK_HOSTNAME_MISMATCH: (
         "chain verifies, leaf SAN does not cover the host: the only case for "
-        "tls_verify_hostname: false (add a dated comment with the SAN and the "
-        "condition for removing the flag)"
+        "tls_verify_hostname: false (add a dated comment with the SAN above and the "
+        "condition for removing the flag), then re-run this probe to confirm"
     ),
     Verdict.CHAIN_FAIL: (
-        "chain does not verify with this trust store: wrong or incomplete CA "
-        "certificates for this host -- do not proceed"
+        "chain does not verify with this trust store: the CA certificates for this host "
+        "are wrong or incomplete -- do not add the provider; ask the gateway owner for "
+        "the full chain, rebuild the bundle with 'tls_probe match' and re-run this probe"
     ),
     Verdict.CONNECT_FAIL: (
-        "no TLS session: check DNS, VPN, port and firewall with curl -v first"
+        "no TLS session was established, so nothing was verified and no verdict about "
+        "the certificates is possible yet: reach the host first -- check DNS, the port "
+        "and the firewall with 'curl -v https://HOST:PORT', and, for an internal "
+        "gateway, that the VPN is connected -- then re-run this probe"
     ),
 }
 
@@ -348,12 +354,20 @@ def run_match(
             certificates = load_certificates(cert_path)
         except (OSError, UnicodeDecodeError, ValueError) as input_error:
             print(
-                f"ERROR: cannot read certificates from {cert_path}: {input_error}",
+                f"ERROR: cannot read certificates from {cert_path}: {input_error}; "
+                "pass the PEM file the working cURL used with --cacert, or export the "
+                "chain with 'openssl s_client -showcerts -connect HOST:443 </dev/null'",
                 file=sys.stderr,
             )
             return EXIT_MATCH_ERROR
         if not certificates:
-            print(f"ERROR: no CERTIFICATE block in {cert_path}", file=sys.stderr)
+            print(
+                f"ERROR: no CERTIFICATE block in {cert_path}: the file holds no "
+                "'-----BEGIN CERTIFICATE-----' section (a private key or a DER file?); "
+                f"convert DER with 'openssl x509 -inform der -in {cert_path} -out "
+                f"{cert_path}.pem' and pass the .pem",
+                file=sys.stderr,
+            )
             return EXIT_MATCH_ERROR
         if is_inside_directory(cert_path, proxy_ca_dir):
             print(
@@ -372,7 +386,12 @@ def run_match(
     try:
         bundles = bundle_fingerprints(certs_dir)
     except (OSError, UnicodeDecodeError, ValueError) as bundle_error:
-        print(f"ERROR: cannot read the bundles in {certs_dir}/: {bundle_error}", file=sys.stderr)
+        print(
+            f"ERROR: cannot read the bundles in {certs_dir}/: {bundle_error}; run this "
+            "command from the repository root, or point --certs-dir at the directory "
+            "ca_bundle values resolve against (ROUTER_CERTS_DIR)",
+            file=sys.stderr,
+        )
         return EXIT_MATCH_ERROR
     inventory = ", ".join(f"{name} ({len(prints)})" for name, prints in bundles.items())
     print(f"bundles in {certs_dir}/: {inventory or '<none>'}")

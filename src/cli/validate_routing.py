@@ -19,7 +19,8 @@ Exit codes:
 * 0 -- the config builds and every expectation holds;
 * 1 -- the config does not build: ``build_runtime`` exits with the same
   ``open-harness-router: ...`` message the service would write to its
-  err.log;
+  err.log, preceded by :data:`BUILD_FAILURE_FRAMING` saying that this
+  command changed nothing and restarted nothing;
 * 3 -- ``--expect-provider`` is not among the built providers, or an alias
   resolved to a different provider / upstream model than expected.
 
@@ -44,6 +45,15 @@ EXIT_ROUTE_MISMATCH = 3
 ROUTES_MARKER = "=== ROUTES ==="
 ALIASES_MARKER = "=== ALIASES ==="
 MISMATCHES_MARKER = "=== MISMATCHES ==="
+
+# Printed before ``build_runtime`` lets its own ``open-harness-router: ...``
+# message out: without it the message reads as if the running service had
+# just died, when in fact this command opens no socket and restarts nothing.
+BUILD_FAILURE_FRAMING = (
+    "cli.validate_routing: the configuration does NOT build -- this is the same error the "
+    "service would log at startup; nothing was restarted and the running router still "
+    "serves its previous configuration. The router's own message follows:"
+)
 
 _ALIAS_SEPARATOR = "="
 
@@ -204,10 +214,17 @@ def main(argv: list[str] | None = None) -> int:
 
     Raises:
         SystemExit: from ``build_runtime`` when settings or the routing
-            configuration do not build (exit status 1 with the message).
+            configuration do not build (exit status 1 with the message),
+            preceded by :data:`BUILD_FAILURE_FRAMING` on stderr.
     """
     args = _build_parser().parse_args(argv)
-    _settings, registry = build_runtime()
+    try:
+        _settings, registry = build_runtime()
+    except SystemExit:
+        # ``sys.exit(message)`` prints on interpreter exit, so the framing
+        # written here lands above the router's own message.
+        print(BUILD_FAILURE_FRAMING, file=sys.stderr)
+        raise
     try:
         report = describe_registry(registry)
         alias_report, mismatches = check_aliases(registry, args.aliases, args.expect_provider)
