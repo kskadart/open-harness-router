@@ -40,6 +40,6 @@ async def count_tokens(
         provider=decision.provider.name,
     )
     result = await decision.provider.count_tokens(
-        raw_body, http_request.headers, decision.upstream_model
+        raw_body, http_request.headers, decision.upstream_model, decision.limits
     )
     return to_fastapi_response(result)

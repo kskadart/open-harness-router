@@ -642,11 +642,11 @@ class MitmHttpSession:
         headers = client_headers_mapping(request.headers)
         if path == _COUNT_TOKENS_PATH:
             result = await decision.provider.count_tokens(
-                raw_body, headers, decision.upstream_model
+                raw_body, headers, decision.upstream_model, decision.limits
             )
         else:
             result = await decision.provider.handle_messages(
-                raw_body, headers, self._channel, decision.upstream_model
+                raw_body, headers, self._channel, decision.upstream_model, decision.limits
             )
         return await self._send_result(result)
 

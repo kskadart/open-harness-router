@@ -28,6 +28,7 @@ from proxy.server import ForwardProxyServer
 from proxy.session import next_event
 from proxy.tls import build_leaf_tls_context
 from routing.registry import ProviderRegistry
+from routing.schema import ProviderCfg, RouteLimits
 from settings import Settings
 
 _TIMEOUT_S = 5.0
@@ -42,6 +43,7 @@ class StubProvider:
     """Stub provider that returns a fixed response for ``/v1/messages``."""
 
     name = "stub"
+    cfg = ProviderCfg(type="passthrough", base_url="https://upstream.test")
 
     async def handle_messages(
         self,
@@ -49,6 +51,7 @@ class StubProvider:
         client_headers: Mapping[str, str],
         client_channel: ClientChannel,
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
         """Return a fixed response instead of calling a real model."""
         return ProviderResult(
@@ -62,6 +65,7 @@ class StubProvider:
         raw_body: bytes,
         client_headers: Mapping[str, str],
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
         """Return a fixed token count estimate."""
         return ProviderResult(status_code=200, headers={}, body=b"{}")
