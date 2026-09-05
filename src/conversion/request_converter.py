@@ -54,24 +54,10 @@ def convert_claude_to_openai(  # noqa: PLR0912, PLR0915
     openai_messages: list[dict[str, Any]] = []
 
     if claude_request.system:
-        system_text = ""
-        if isinstance(claude_request.system, str):
-            system_text = claude_request.system
-        elif isinstance(claude_request.system, list):
-            text_parts = []
-            for block in claude_request.system:
-                if hasattr(block, "type") and block.type == Constants.CONTENT_TEXT:
-                    text_parts.append(block.text)
-                elif (
-                    isinstance(block, dict)
-                    and block.get("type") == Constants.CONTENT_TEXT
-                ):
-                    text_parts.append(block.get("text", ""))
-            system_text = "\n\n".join(text_parts)
-
-        if system_text.strip():
+        system_text = extract_claude_system_text(claude_request.system)
+        if system_text:
             openai_messages.append(
-                {"role": Constants.ROLE_SYSTEM, "content": system_text.strip()}
+                {"role": Constants.ROLE_SYSTEM, "content": system_text}
             )
 
     # System text that could not be merged backward and is waiting for the
@@ -384,24 +370,28 @@ def parse_tool_result_content(content: Any) -> str:  # noqa: PLR0911, PLR0912
 
     if isinstance(content, list):
         result_parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == Constants.CONTENT_TEXT:
-                result_parts.append(item.get("text", ""))
-            elif isinstance(item, str):
-                result_parts.append(item)
-            elif isinstance(item, dict):
-                if "text" in item:
-                    result_parts.append(item.get("text", ""))
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == Constants.CONTENT_TEXT:
+                result_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                result_parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == Constants.CONTENT_IMAGE:
+                    result_parts.append(describe_omitted_image(block))
+                elif "text" in block:
+                    result_parts.append(block.get("text", ""))
                 else:
                     try:
-                        result_parts.append(json.dumps(item, ensure_ascii=False))
+                        result_parts.append(json.dumps(block, ensure_ascii=False))
                     except (TypeError, ValueError):
-                        result_parts.append(str(item))
+                        result_parts.append(str(block))
         return "\n".join(result_parts).strip()
 
     if isinstance(content, dict):
         if content.get("type") == Constants.CONTENT_TEXT:
             return content.get("text", "")
+        if content.get("type") == Constants.CONTENT_IMAGE:
+            return describe_omitted_image(content)
         try:
             return json.dumps(content, ensure_ascii=False)
         except (TypeError, ValueError):
@@ -411,6 +401,25 @@ def parse_tool_result_content(content: Any) -> str:  # noqa: PLR0911, PLR0912
         return str(content)
     except Exception:
         return "Unparseable content"
+
+
+def describe_omitted_image(block: dict[str, Any]) -> str:
+    """Summarize an image block nested in a tool result.
+
+    An OpenAI ``tool`` message carries text only, so an image serialized
+    into it cannot be rendered upstream while its base64 payload still
+    spends the context it costs -- for a screenshot that is most of the
+    window. Only the media type is worth forwarding.
+
+    Args:
+        block: raw Anthropic ``image`` block from ``tool_result`` content.
+
+    Returns:
+        Short note naming the media type when the source carries one.
+    """
+    source = block.get("source")
+    media_type = source.get("media_type") if isinstance(source, dict) else None
+    return f"[image omitted: {media_type}]" if media_type else "[image omitted]"
 
 
 def extract_claude_system_text(content: str | list[Any]) -> str:
@@ -568,7 +577,13 @@ def convert_claude_messages_to_input(
         elif msg.role == Constants.ROLE_SYSTEM:
             # A positional system role inside messages is kept in place:
             # moving it into instructions would break the ordering of
-            # instructions relative to user/assistant.
+            # instructions relative to user/assistant. It also keeps the
+            # system role, where the Chat Completions converter reshapes the
+            # same message into user text: /v1/responses is OpenAI's own
+            # endpoint and accepts a system item at any position, so there is
+            # no chat template to placate. Reshape here too the day a
+            # responses-flavor endpoint fronts an open-weight model whose
+            # template rejects a trailing system turn.
             system_text = extract_claude_system_text(msg.content)
             if system_text:
                 items.append(

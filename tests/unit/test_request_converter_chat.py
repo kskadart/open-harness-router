@@ -1,15 +1,18 @@
-"""Unit tests for mapping ``tool_choice`` when converting Anthropic -> Chat Completions.
+"""Unit tests for converting an Anthropic request -> OpenAI Chat Completions.
 
-The two protocols' ``tool_choice`` value sets do not match: Anthropic
+Most of the file pins message shaping, where the wire shape Claude Code
+produces meets what an open-model chat template accepts: a ``system`` role
+embedded in ``messages`` (often as the LAST element, after a tool_result)
+is folded into a user turn, because templates such as DeepSeek's answer a
+trailing system message with an immediate EOS and reject two adjacent user
+turns with a 400; text and images sent next to a ``tool_result`` (the retry
+nudge, system-reminders) are forwarded as their own user turn instead of
+being dropped; and an image nested inside a ``tool_result`` is reduced to a
+placeholder, since an OpenAI ``tool`` message cannot render it.
+
+The rest covers ``tool_choice``, whose value sets do not match: Anthropic
 distinguishes ``auto`` (the model decides whether to call) from ``any`` (a
 call is required), which OpenAI expresses as ``auto`` and ``required``.
-
-The message-shaping tests pin the wire shape Claude Code produces: a
-``system`` role embedded in ``messages`` (often as the LAST element, after a
-tool_result) is sent as user text, because open-model chat templates such as
-DeepSeek's answer a trailing system message with an immediate EOS; and text
-blocks next to a ``tool_result`` (the retry nudge, system-reminders) are
-forwarded instead of dropped.
 """
 
 from __future__ import annotations
@@ -171,6 +174,21 @@ def test_top_level_system_field_still_maps_to_system_message() -> None:
         {"role": "system", "content": "You are terse."},
         {"role": "user", "content": "Hello"},
     ]
+
+
+def test_array_form_top_level_system_joins_its_blocks_into_one_system_message() -> None:
+    """Claude Code sends the top-level system as text blocks; they join with a blank line."""
+    request = _build_request(
+        system=[
+            {"type": "text", "text": "You are terse."},
+            {"type": "text", "text": "Never apologize."},
+        ]
+    )
+    result = _convert(request)
+    assert result["messages"][0] == {
+        "role": "system",
+        "content": "You are terse.\n\nNever apologize.",
+    }
 
 
 def test_leading_system_message_in_messages_is_user_even_after_top_level_system() -> None:
@@ -377,3 +395,48 @@ def test_tool_result_message_with_blank_text_and_image_still_forwards_the_image(
         "text",
         "image_url",
     ]
+
+
+_TOOL_IMAGE_BASE64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQ"
+    "AAAABJRU5ErkJggg=="
+)
+
+
+def test_image_nested_in_a_tool_result_becomes_a_placeholder_without_the_payload() -> None:
+    """An image inside a tool_result reaches the tool message as a note, not as base64."""
+    messages = _tool_cycle_messages()
+    messages[2]["content"][0]["content"] = [
+        {"type": "text", "text": "screenshot taken"},
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/png",
+                "data": _TOOL_IMAGE_BASE64,
+            },
+        },
+    ]
+    result = _convert(_build_request(messages=messages))
+    assert result["messages"][2] == {
+        "role": "tool",
+        "tool_call_id": "toolu_01",
+        "content": "screenshot taken\n[image omitted: image/png]",
+    }
+    assert _TOOL_IMAGE_BASE64 not in str(result)
+
+
+def test_tool_result_whose_whole_content_is_an_image_becomes_a_placeholder() -> None:
+    """The same holds when the tool_result content is a single image block, not a list."""
+    messages = _tool_cycle_messages()
+    messages[2]["content"][0]["content"] = {
+        "type": "image",
+        "source": {
+            "type": "base64",
+            "media_type": "image/jpeg",
+            "data": _TOOL_IMAGE_BASE64,
+        },
+    }
+    result = _convert(_build_request(messages=messages))
+    assert result["messages"][2]["content"] == "[image omitted: image/jpeg]"
+    assert _TOOL_IMAGE_BASE64 not in str(result)
