@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from cli.validate_routing import (
+    BUILD_FAILURE_FRAMING,
     EXIT_OK,
     EXIT_ROUTE_MISMATCH,
     MISMATCHES_MARKER,
@@ -176,6 +177,41 @@ def test_main_unset_key_env_exits_with_the_factory_message(
         main(["--expect-provider", _BROKEN_PROVIDER])
 
     assert f"env '{_UNSET_KEY_ENV}' with API key is not set" in str(exc_info.value.code)
+
+
+def test_main_build_failure_is_framed_before_the_routers_own_message(
+    _env: None,
+    monkeypatch: pytest.MonkeyPatch,
+    unset_key_routing_yaml: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The startup error is announced as offline, so it does not read as an outage.
+
+    ``build_runtime`` writes the very message the service would log while
+    crash-looping; without the framing an operator cannot tell that this
+    command opened no socket and restarted nothing.
+    """
+    monkeypatch.setenv("ROUTER_CONFIG_PATH", str(unset_key_routing_yaml))
+
+    with pytest.raises(SystemExit):
+        main(["--expect-provider", _BROKEN_PROVIDER])
+
+    framing = capsys.readouterr().err
+    assert BUILD_FAILURE_FRAMING in framing
+    assert "nothing was restarted" in BUILD_FAILURE_FRAMING
+    assert "still serves its previous configuration" in BUILD_FAILURE_FRAMING
+
+
+def test_main_successful_run_prints_no_build_failure_framing(
+    _env: None, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A configuration that builds never mentions a failure."""
+    exit_code = main([])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_OK
+    assert BUILD_FAILURE_FRAMING not in captured.err
+    assert BUILD_FAILURE_FRAMING not in captured.out
 
 
 def test_main_exact_rule_shadowed_by_earlier_contains_rule_exits_non_zero(

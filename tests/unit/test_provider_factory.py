@@ -60,6 +60,27 @@ def test_build_provider_raises_config_error_when_own_key_env_var_missing(
         build_provider("moonshot", _own_key_cfg(), settings)
 
 
+def test_build_provider_missing_key_message_names_the_edit_that_fixes_it(
+    monkeypatch: pytest.MonkeyPatch, _settings_env: None
+) -> None:
+    """This error stops the service from starting, so it carries the exact fix.
+
+    It reaches the operator through the service's err.log and through
+    ``cli.validate_routing``, in both cases without any surrounding
+    explanation -- the message alone has to say what to add and where.
+    """
+    monkeypatch.delenv("MOONSHOT_API_KEY", raising=False)
+    settings = Settings()
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_provider("moonshot", _own_key_cfg(), settings)
+
+    message = str(exc_info.value)
+    assert "add MOONSHOT_API_KEY=<value> to .env in the repository root" in message
+    assert "then re-run" in message
+    assert "\n" not in message
+
+
 async def test_build_provider_resolves_own_key_when_env_var_set(
     monkeypatch: pytest.MonkeyPatch, _settings_env: None
 ) -> None:
@@ -109,6 +130,30 @@ def test_build_provider_passthrough_ca_bundle_missing_raises_config_error(
 
     with pytest.raises(ConfigError, match="CA bundle not found"):
         build_provider("moonshot", cfg, settings)
+
+
+def test_build_provider_missing_ca_bundle_message_names_the_path_and_the_fix(
+    monkeypatch: pytest.MonkeyPatch, _settings_env: None
+) -> None:
+    """The message says where the file was expected and which command creates it.
+
+    ``ca_bundle`` is a bare file name resolved against ``certs_dir``, so an
+    operator reading only "not found" cannot tell whether the file, the
+    name or ROUTER_CERTS_DIR is wrong.
+    """
+    monkeypatch.setenv("MOONSHOT_API_KEY", "moonshot-secret")
+    settings = Settings()
+    cfg = _own_key_cfg(ca_bundle="does_not_exist.pem")
+
+    with pytest.raises(ConfigError) as exc_info:
+        build_provider("moonshot", cfg, settings)
+
+    message = str(exc_info.value)
+    assert str(_FIXTURES_CERTS_DIR / "does_not_exist.pem") in message
+    assert "resolved against certs_dir" in message
+    assert "ROUTER_CERTS_DIR" in message
+    assert "cli.tls_probe match" in message
+    assert "\n" not in message
 
 
 async def test_build_provider_passthrough_ca_bundle_is_wired_into_the_transport(

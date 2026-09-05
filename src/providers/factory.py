@@ -31,13 +31,24 @@ def _resolve_ca_bundle(name: str, cfg: ProviderCfg, settings: Settings) -> Path 
         The resolved path, or None if ``ca_bundle`` is not set.
 
     Raises:
-        ConfigError: the configured bundle file does not exist.
+        ConfigError: the configured bundle file does not exist. The message
+            names the resolved path, the directory it was resolved against
+            and the command that prints the ``cat`` line creating it --
+            this error stops the service from starting, so it has to be
+            fixable from the message alone.
     """
     if not cfg.ca_bundle:
         return None
     ca_path = settings.routing.certs_dir / cfg.ca_bundle
     if not ca_path.exists():
-        raise ConfigError(f"provider '{name}': CA bundle not found: {ca_path}")
+        raise ConfigError(
+            f"provider '{name}': CA bundle not found: {ca_path} "
+            f"(ca_bundle '{cfg.ca_bundle}' is resolved against certs_dir "
+            f"'{settings.routing.certs_dir}', from ROUTER_CERTS_DIR); create it with the "
+            f"'cat ... > {ca_path}' command that "
+            f"'PYTHONPATH=src .venv/bin/python -m cli.tls_probe match CERT.pem "
+            f"--provider {name}' prints, or fix ca_bundle in routing.yaml"
+        )
     return ca_path
 
 
@@ -62,12 +73,14 @@ def _resolve_required_api_key(name: str, cfg: ProviderCfg, settings: Settings) -
 
     Raises:
         ConfigError: the environment variable named by ``cfg.api_key_env``
-            is unset or empty.
+            is unset or empty. The message carries the exact edit that
+            fixes it, because this error stops the service from starting.
     """
     api_key = settings.secrets.resolve(cast(str, cfg.api_key_env))
     if api_key is None:
         raise ConfigError(
-            f"provider '{name}': env '{cfg.api_key_env}' with API key is not set"
+            f"provider '{name}': env '{cfg.api_key_env}' with API key is not set; "
+            f"add {cfg.api_key_env}=<value> to .env in the repository root, then re-run"
         )
     return api_key
 

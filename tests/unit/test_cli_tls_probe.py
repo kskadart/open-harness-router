@@ -550,6 +550,8 @@ def test_run_match_input_without_certificate_block_returns_2(
     captured = capsys.readouterr()
     assert exit_code == EXIT_MATCH_ERROR
     assert f"no CERTIFICATE block in {empty_input}" in captured.err
+    # A private key or a DER file is the usual cause, and both are fixable.
+    assert "openssl x509 -inform der" in captured.err
 
 
 def test_run_match_missing_input_file_returns_2_without_traceback(
@@ -563,6 +565,7 @@ def test_run_match_missing_input_file_returns_2_without_traceback(
     captured = capsys.readouterr()
     assert exit_code == EXIT_MATCH_ERROR
     assert f"cannot read certificates from {missing_input}" in captured.err
+    assert "openssl s_client -showcerts" in captured.err
 
 
 def test_run_match_malformed_input_pem_returns_2_without_traceback(
@@ -590,6 +593,7 @@ def test_run_match_malformed_bundle_in_certs_dir_returns_2_without_traceback(
     captured = capsys.readouterr()
     assert exit_code == EXIT_MATCH_ERROR
     assert f"cannot read the bundles in {certs_dir}" in captured.err
+    assert "--certs-dir" in captured.err
 
 
 def test_main_match_subcommand_forwards_directories_to_run_match(
@@ -753,7 +757,7 @@ def test_probe_host_nothing_listening_returns_verdict_13(
     assert result.verdict is Verdict.CONNECT_FAIL
     assert exit_code == Verdict.CONNECT_FAIL
     assert "verdict: CONNECT_FAIL" in captured.out
-    assert "check DNS, VPN, port" in captured.out
+    assert "no TLS session was established" in captured.out
 
 
 def test_probe_host_cafile_without_certificate_returns_verdict_2(
@@ -778,4 +782,32 @@ def test_probe_host_cafile_without_certificate_returns_verdict_2(
     assert exit_code == Verdict.BUNDLE_UNUSABLE
     assert "verdict: BUNDLE_UNUSABLE" in captured.out
     assert str(empty_bundle) in captured.out
-    assert "check DNS, VPN, port" not in captured.out
+    assert "no TLS session was established" not in captured.out
+
+
+def test_connect_fail_hint_names_the_vpn_without_blaming_the_probe(
+    probe_certificates: _ProbeCertificates, closed_port: int, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An unreachable internal gateway is usually a VPN, not a certificate problem.
+
+    The hint has to say that nothing was verified yet -- otherwise a plain
+    "no TLS session" reads as a verdict about the certificates -- and it
+    has to name the next command.
+    """
+    main(
+        [
+            "probe",
+            "--host",
+            _PROBE_HOST,
+            "--port",
+            str(closed_port),
+            "--cafile",
+            str(probe_certificates.ca_bundle),
+        ]
+    )
+
+    hint = capsys.readouterr().out
+    assert "nothing was verified" in hint
+    assert "the VPN is connected" in hint
+    assert "curl -v https://HOST:PORT" in hint
+    assert "re-run this probe" in hint

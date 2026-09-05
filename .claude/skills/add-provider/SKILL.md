@@ -1,6 +1,6 @@
 ---
 name: add-provider
-description: "Add an LLM provider and model aliases to open-harness-router from a cURL example plus optional CA certificate files: parse the curl, verify the TLS chain and the upstream, determine max_tokens_limit and context_window, write the routing.yaml provider block and exact-match alias rules, store the key in .env, validate offline, restart the launchd service with health check and rollback, run end-to-end tests. Also covers adding one more model to an existing provider."
+description: "Add an LLM provider and model aliases to open-harness-router from a cURL example plus optional CA certificate files: parse the curl, verify the TLS chain and the upstream, determine max_tokens_limit and context_window, write the routing.yaml provider block and exact-match alias rules, store the key in .env, validate offline, restart the service with health check and rollback (launchd on macOS, systemd on Linux), run end-to-end tests. Also covers adding one more model to an existing provider."
 argument-hint: "<curl command> [cert.pem ...] [provider=<name>] [alias-prefix=<pfx->] [models=<upstream-id>[,...]]"
 disable-model-invocation: true
 ---
@@ -9,8 +9,8 @@ disable-model-invocation: true
 
 Turn a working cURL example (plus optional CA certificate files) into a
 provider block and exact-match alias rules in `routing.yaml`, with the key in
-`.env`, offline validation, a supervised restart of the launchd service and
-end-to-end checks through the router. Also covers "one more model on an
+`.env`, offline validation, a supervised restart of the service (launchd on
+macOS, systemd on Linux) and end-to-end checks through the router. Also covers "one more model on an
 existing provider". All commands run from the repository root.
 
 ## Read this first
@@ -25,6 +25,11 @@ existing provider". All commands run from the repository root.
   e2e. Never restart before step 8 passes.
 - Only the top-level session restarts the router (step 9), in ONE Bash call,
   while no subagent is running. Subagents never restart it.
+- The restart step begins with `uname -s`, BEFORE any command that could
+  fail: `Darwin` takes the launchd script (step 9a), anything else the
+  ready-to-paste systemd block (step 9b). The router itself runs on Linux
+  just as well -- only the restart helper is launchd-specific -- so a
+  non-macOS machine is a different command, not a problem.
 - The API key from the user's cURL is written exactly once, by the single
   append in step 3. It never appears in YAML, skill files, reports,
   subagent prompts or any other command.
@@ -335,6 +340,18 @@ message the service would die with.
 
 ### 9. Restart -- top-level session only, one command
 
+Determine the platform FIRST -- the restart command differs and only one of
+the two exists on any given machine:
+
+```sh
+uname -s
+```
+
+`Darwin` -> step 9a (the launchd script). Anything else (`Linux`) -> step 9b
+(systemd). Both restart the same router; only the supervisor differs.
+
+#### 9a. macOS -- the launchd script
+
 ```sh
 bash .claude/skills/add-provider/scripts/restart_router.sh \
   --expect-provider <provider> --routing-backup routing.yaml.bak-<TS>
@@ -359,9 +376,48 @@ read `FAIL: not healthy with the new config -- <reason>` and
 `DOWN: still unhealthy after the rollback -- <reason>` where `<reason>` is
 the budget or the startup error. Forbidden alternatives: `nohup`, `uv`
 wrappers, `make run`, a manual `python -m entrypoint` (second process on
-8787/8788), `bootout`/`bootstrap` (plist edits only). Not macOS: the script
-exits 64; use `systemctl --user restart open-harness-router.service` and
-poll `/health` (`README.md:431-467`).
+8787/8788), `bootout`/`bootstrap` (plist edits only).
+
+#### 9b. Linux -- systemd
+
+Do NOT run the script here: it drives `launchctl`, so on a non-Darwin
+machine it restarts nothing and exits 64 -- printing this same recipe, with
+the health URL and the budget it would have used filled in. Nothing is wrong
+with the router: it runs under systemd just as well (`README.md:431-467`).
+Run this instead, as ONE Bash call, with YOUR unit name in `UNIT`:
+
+```sh
+UNIT=open-harness-router.service   # YOUR unit name (README, "Linux (systemd)")
+HEALTH=http://127.0.0.1:8787/health
+systemctl --user restart "$UNIT" || { echo "FAIL: systemctl --user restart $UNIT failed; read 'systemctl --user status $UNIT'" >&2; exit 2; }
+started=$(date +%s)
+while :; do
+  code=$(curl -sS -m 3 -o /dev/null -w '%{http_code}' "$HEALTH" 2>/dev/null)
+  waited=$(($(date +%s) - started))
+  if [ "$code" = "200" ]; then echo "OK: healthy with the new config after ${waited}s"; curl -sS -m 3 "$HEALTH"; break; fi
+  if [ "$waited" -ge 40 ]; then
+    echo "FAIL: no HTTP 200 from $HEALTH within 40s (last status: ${code:-none}); read 'journalctl --user -u $UNIT -n 50', restore your routing.yaml backup, restart again" >&2
+    exit 2
+  fi
+  sleep 1
+done
+```
+
+`OK:` = the new configuration is live, go to step 10. `FAIL:` = it is not:
+this path has NO automatic rollback, so restore the backup by hand and run
+the block again:
+
+```sh
+cp -p routing.yaml.bak-<TS> routing.yaml
+PYTHONPATH=src .venv/bin/python -m cli.validate_routing
+```
+
+The budget is the same 40 s as 9a, but the block is deliberately short and
+leaves out two of the script's checks. It does not compare pids, so a
+draining OLD process answering `/health` would pass -- add
+`systemctl --user show -p MainPID --value "$UNIT"` before and after when
+that matters. And it does not verify `--expect-provider`: read the provider
+list in the `/health` body it prints on success.
 
 ### 10. End-to-end through the router, for EVERY alias
 
@@ -432,7 +488,8 @@ compaction; the variable applies to unknown ids only.
 - smoke and e2e results (status, stop_reason, event counts);
 - files touched; rollback:
   `cp -p routing.yaml.bak-<TS> routing.yaml && bash .claude/skills/add-provider/scripts/restart_router.sh`
-  and only THEN `sed -i '' '/^<PROVIDER>_KEY=/d' .env`.
+  (on Linux: the same `cp`, then the step 9b block) and only THEN
+  `sed -i '' '/^<PROVIDER>_KEY=/d' .env`.
 
 ## Troubleshooting
 
@@ -445,8 +502,8 @@ compaction; the variable applies to unknown ids only.
 | timeout, no response | network or the gateway itself: a direct `curl -v` to the host first, then VPN |
 | curl `(60) unable to get local issuer certificate` | wrong CA bundle for this host |
 | curl `(60) no alternative certificate subject name matches` | host-name mismatch: probe exit 11 territory |
-| `open-harness-router: provider 'x': env 'X_KEY' with API key is not set` | `.env` line missing or misspelled; fix before the restart |
-| `open-harness-router: provider 'x': CA bundle not found` | `ca_bundle` is relative to `certs_dir` (`certs/`) |
+| `open-harness-router: provider 'x': env 'X_KEY' with API key is not set` | `.env` line missing or misspelled; the message names the exact line to add. Fix before the restart |
+| `open-harness-router: provider 'x': CA bundle not found` | `ca_bundle` is relative to `certs_dir` (`certs/`, from `ROUTER_CERTS_DIR`); the message names the resolved path and the `cli.tls_probe match` command that prints the `cat` line creating it |
 | Claude Code talks to api.anthropic.com despite `ANTHROPIC_BASE_URL` | OAuth credentials win; isolate `CLAUDE_CONFIG_DIR` for that session |
 | e2e: empty `content`, `stop_reason: max_tokens` | `max_tokens_limit` too low for a reasoning model (step 6a); raise it on THAT model's rule, not on the provider shared with the others |
 | e2e: 400 on long prompts | `max_tokens_limit` above the upstream ceiling for this model (step 6a); lower it on the model's rule |
