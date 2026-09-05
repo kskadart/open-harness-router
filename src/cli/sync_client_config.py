@@ -114,11 +114,41 @@ def build_model_options(config: RoutingConfig) -> list[dict[str, str]]:
             disabled by this same settings file, so the router's pre-flight
             would be the only guard -- and there would be none).
     """
+    return _collect_model_options(config)[0]
+
+
+def _collect_model_options(
+    config: RoutingConfig,
+) -> tuple[list[dict[str, str]], int, list[str]]:
+    """Build the picker rows, counting why each skipped rule contributed none.
+
+    One pass over the rules so the caller can explain a zero-model run
+    without re-classifying them. A rule that yields no row is either served
+    by a passthrough provider (its body is forwarded verbatim and the native
+    ``claude-*`` ids are already in the client's picker) or is a pattern
+    rule lacking ``client_models``; the two counts keep those causes apart.
+
+    Args:
+        config: the validated routing configuration.
+
+    Returns:
+        A triple of (options, passthrough_count, skipped): the picker rows
+        (one per offered model), the number of rules served by a
+        passthrough provider, and the match descriptions of pattern rules
+        skipped for naming no ids.
+
+    Raises:
+        ConfigError: every rule that could have contributed rows was
+            skipped, so the picker would be empty; or an offered model has
+            no effective ``context_window``.
+    """
     options: list[dict[str, str]] = []
     skipped: list[str] = []
+    passthrough_count = 0
     for rule in config.rules:
         provider = config.providers[rule.provider]
         if provider.type != "openai-translate":
+            passthrough_count += 1
             continue
         model_ids = advertised_model_ids(rule)
         if not model_ids:
@@ -157,7 +187,38 @@ def build_model_options(config: RoutingConfig) -> list[dict[str, str]]:
             "Add 'client_models' with the exact ids clients may send for at "
             "least one of them"
         )
-    return options
+    return options, passthrough_count, skipped
+
+
+def _zero_model_explanation(passthrough_count: int, skipped: list[str]) -> str:
+    """Explain a zero-model run, naming both causes so the empty picker reads clearly.
+
+    A rule contributes no row either because it is served by a passthrough
+    provider (the body is forwarded byte-for-byte and the native ``claude-*``
+    ids are already in the client's picker) or because it is a pattern rule
+    that names no ``client_models`` and was skipped with a warning. Counting
+    both keeps the single line accurate: it never claims "every rule is
+    passthrough" when a pattern rule was just reported as skipped.
+
+    Args:
+        passthrough_count: rules served by a passthrough provider.
+        skipped: match descriptions of pattern rules skipped for naming no ids.
+
+    Returns:
+        The sentence to print right after the ``0 models`` figure.
+    """
+    if not skipped:
+        cause = (
+            "every rule serves a passthrough provider whose native model "
+            "ids the client already lists"
+        )
+    else:
+        cause = (
+            f"{passthrough_count} rules serve a passthrough provider and "
+            f"{len(skipped)} pattern rules were skipped for naming no "
+            "'client_models'"
+        )
+    return f"{cause}; there is nothing to add to the picker"
 
 
 def read_settings(path: Path) -> tuple[str, dict[str, Any]]:
@@ -370,12 +431,20 @@ def main(argv: list[str] | None = None) -> int:
     settings_path: Path = args.settings_path
     try:
         config = load_routing_config(Settings().routing.config_path)
-        options = build_model_options(config)
+        options, passthrough_count, skipped = _collect_model_options(config)
         current, existing = read_settings(settings_path)
         wanted = render_settings(build_settings_document(existing, options))
+        zero_model = (
+            f" -- {_zero_model_explanation(passthrough_count, skipped)}"
+            if not options
+            else ""
+        )
 
         if current == wanted:
-            print(f"OK: {settings_path} is in sync ({len(options)} models)")
+            print(
+                f"OK: {settings_path} is in sync ({len(options)} models)"
+                f"{zero_model}"
+            )
             return EXIT_OK
         if args.check:
             print(_diff(current, wanted, settings_path), file=sys.stderr)
@@ -393,7 +462,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"open-harness-router: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
 
-    print(f"WROTE {settings_path} ({len(options)} models)")
+    print(f"WROTE {settings_path} ({len(options)} models){zero_model}")
     return EXIT_OK
 
 

@@ -90,6 +90,23 @@ _FLEET_ROUTING: dict[str, Any] = {
     "default": {"provider": "anthropic"},
 }
 
+# A routing file shaped like the shipped example: only a passthrough
+# provider, so every rule is skipped for the picker -- native ``claude-*``
+# ids are already known to the client. The run writes zero models.
+_PASSTHROUGH_ROUTING: dict[str, Any] = {
+    "version": 1,
+    "providers": {
+        "anthropic": {
+            "type": "passthrough",
+            "base_url": "https://api.anthropic.com",
+        },
+    },
+    "rules": [
+        {"match": {"type": "prefix", "value": "claude-"}, "provider": "anthropic"},
+    ],
+    "default": {"provider": "anthropic"},
+}
+
 _EXPECTED_OPTIONS: list[dict[str, str]] = [
     {
         "model": "vendor/GLM-Test",
@@ -121,6 +138,15 @@ def _clone_routing() -> dict[str, Any]:
         A fresh mapping equal to ``_FLEET_ROUTING``.
     """
     return yaml.safe_load(yaml.safe_dump(_FLEET_ROUTING))
+
+
+def _clone_passthrough_routing() -> dict[str, Any]:
+    """Deep copy of the all-passthrough routing fixture.
+
+    Returns:
+        A fresh mapping equal to ``_PASSTHROUGH_ROUTING``.
+    """
+    return yaml.safe_load(yaml.safe_dump(_PASSTHROUGH_ROUTING))
 
 
 def _first_matching_rule(config: RoutingConfig, model: str) -> RoutingRule | None:
@@ -471,6 +497,63 @@ def test_main_leaves_no_temporary_file_behind(
     main(["--settings-path", str(settings_path)])
 
     assert [entry.name for entry in settings_path.parent.iterdir() if ".tmp" in entry.name] == []
+
+
+def test_main_zero_models_from_passthrough_only_explains_why(
+    write_routing: Callable[[dict[str, Any]], Path],
+    settings_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A run that writes 0 rows says WHY, so the empty result reads as expected.
+
+    With only a passthrough provider on a fresh clone the picker is
+    intentionally empty: the native ``claude-*`` ids are already listed by
+    the client. The newcomer must be told that this is the design, not a
+    failure -- the explanation sits right next to the ``0 models`` figure.
+    """
+    write_routing(_clone_passthrough_routing())
+
+    exit_code = main(["--settings-path", str(settings_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_OK
+    assert "0 models" in captured.out
+    assert (
+        "every rule serves a passthrough provider whose native model ids "
+        "the client already lists" in captured.out
+    )
+
+
+def test_main_check_zero_models_from_passthrough_only_explains_why(
+    write_routing: Callable[[dict[str, Any]], Path],
+    settings_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The ``--check`` in-sync line carries the same zero-model explanation."""
+    write_routing(_clone_passthrough_routing())
+    assert main(["--settings-path", str(settings_path)]) == EXIT_OK
+    capsys.readouterr()
+
+    exit_code = main(["--settings-path", str(settings_path), "--check"])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_OK
+    assert "0 models" in captured.out
+    assert (
+        "every rule serves a passthrough provider whose native model ids "
+        "the client already lists" in captured.out
+    )
+
+
+def test_main_with_listed_models_does_not_print_the_zero_model_explanation(
+    fleet_routing: Path, settings_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Once at least one model is listed there is nothing to explain."""
+    exit_code = main(["--settings-path", str(settings_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_OK
+    assert "passthrough provider" not in captured.out
 
 
 def test_default_settings_path_is_a_dedicated_file_in_the_user_claude_directory() -> None:
