@@ -10,9 +10,13 @@ fleet model or a third-party vendor billed on its own key.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+from const import CONTEXT_WINDOW_RESERVE_TOKENS, MIN_USEFUL_COMPLETION_TOKENS
+from routing.matcher import match_model
 
 ProviderType = Literal["passthrough", "openai-translate"]
 MatchType = Literal["exact", "prefix", "contains", "regex"]
@@ -34,11 +38,115 @@ class MatchRule(BaseModel):
 
 
 class RoutingRule(BaseModel):
-    """A routing rule: match -> provider (+ model substitution)."""
+    """A routing rule: match -> provider (+ model substitution and limits).
+
+    ``client_models`` lists the exact model ids a client may send for this
+    rule -- the rows the ``/model`` picker offers and the values that go
+    into an agent's ``model:`` frontmatter. It exists because a
+    ``prefix``/``contains``/``regex`` match value is a pattern, not a usable
+    model id: a rule matching ``prefix: "gpt-"`` cannot advertise itself as
+    ``gpt-``, which would reach the upstream verbatim and come back a 404.
+    An ``exact`` rule needs no list -- its match value already is the id,
+    and is checked as one. Empty by default;
+    ``RoutingConfig._validate_client_models`` checks that every advertised
+    id really lands on this rule under first-match-wins.
+
+    ``max_tokens_limit`` and ``context_window`` override the provider's own
+    values for the models this rule serves; ``None`` (the default) keeps the
+    provider's. One gateway usually hosts several models whose limits differ
+    -- one clamps an oversized completion budget, the next answers HTTP 500;
+    one is served on a 223K window, the next on a 1M one. Without the
+    override each of them needs its own provider block duplicating the same
+    ``base_url``, ``api_key_env``, ``ca_bundle`` and ``extra_headers``. Both
+    are rejected on a rule pointing at ``passthrough`` (no conversion, no
+    pre-flight -- ``RoutingConfig._validate_rule_limits``), which also holds
+    the provider's own invariant for the EFFECTIVE pair.
+    """
 
     match: MatchRule
     provider: str
     upstream_model: str | None = None
+    max_tokens_limit: int | None = None
+    context_window: int | None = None
+    client_models: list[str] = Field(default_factory=list)
+
+
+def advertised_model_ids(rule: RoutingRule) -> list[str]:
+    """Return the model ids a client may send for one rule.
+
+    The single source of truth for what a rule offers: the validator checks
+    exactly the ids ``cli.sync_client_config`` writes into the picker.
+
+    Args:
+        rule: the routing rule.
+
+    Returns:
+        The rule's ``client_models``, or the match value of an ``exact``
+        rule when the list is empty; an empty list for a
+        ``prefix``/``contains``/``regex`` rule that names no ids -- its
+        match value is a pattern and cannot be sent as a model id.
+    """
+    if rule.client_models:
+        return list(rule.client_models)
+    return [rule.match.value] if rule.match.type == "exact" else []
+
+
+def minimum_context_window(max_tokens_limit: int) -> int:
+    """Return the smallest window the pre-flight can serve a request under.
+
+    The guard in ``providers.openai_translate`` subtracts
+    ``CONTEXT_WINDOW_RESERVE_TOKENS`` from the window and rejects a request
+    that cannot still carry ``MIN_USEFUL_COMPLETION_TOKENS``, so a window
+    merely larger than the completion cap would reject every request. This
+    check uses the same floor as the guard, so a configuration that starts
+    can serve at least one request.
+
+    Args:
+        max_tokens_limit: the effective cap on the completion budget.
+
+    Returns:
+        The value ``context_window`` must exceed.
+    """
+    return max_tokens_limit + CONTEXT_WINDOW_RESERVE_TOKENS + MIN_USEFUL_COMPLETION_TOKENS
+
+
+@dataclass(frozen=True, slots=True)
+class RouteLimits:
+    """The token limits one resolved route runs under.
+
+    Carried from ``ProviderRegistry.resolve`` to the provider instead of two
+    loose ints: a provider serves several rules, so neither number can be
+    read off ``self.cfg`` at request time any more.
+
+    Attributes:
+        max_tokens_limit: the effective cap on the outgoing completion
+            budget; ``None`` only for ``passthrough`` (no conversion).
+        context_window: the effective total window, or ``None`` when
+            neither the rule nor the provider declares one (no pre-flight).
+    """
+
+    max_tokens_limit: int | None
+    context_window: int | None
+
+    @classmethod
+    def resolve(cls, provider: ProviderCfg, rule: RoutingRule | None) -> RouteLimits:
+        """Fold a rule's overrides onto the provider's defaults.
+
+        Args:
+            provider: configuration of the provider the route lands on.
+            rule: the matched rule, or ``None`` for the default route.
+
+        Returns:
+            The limits this route's requests are built and checked against.
+        """
+        if rule is None:
+            return cls(provider.max_tokens_limit, provider.context_window)
+        return cls(
+            provider.max_tokens_limit
+            if rule.max_tokens_limit is None
+            else rule.max_tokens_limit,
+            provider.context_window if rule.context_window is None else rule.context_window,
+        )
 
 
 class ProviderCfg(BaseModel):
@@ -56,7 +164,28 @@ class ProviderCfg(BaseModel):
     ``openai-translate``: there's intentionally no default, so a forgotten
     value fails at startup instead of silently truncating responses. Not
     applicable to ``passthrough`` (byte-for-byte forwarding without
-    conversion) and stays ``None`` there.
+    conversion) and stays ``None`` there. Serves as the default for every
+    rule on this provider; a rule may override it for its own models
+    (``RoutingRule.max_tokens_limit``).
+
+    ``context_window`` -- the upstream model's total context size in
+    tokens (prompt plus completion). When set on an ``openai-translate``
+    provider, the converted request is estimated before dispatch: a prompt
+    that leaves less than ``MIN_USEFUL_COMPLETION_TOKENS`` of the window
+    (minus ``CONTEXT_WINDOW_RESERVE_TOKENS``) is rejected with an Anthropic-shaped
+    ``invalid_request_error`` carrying ``capability_rejected:
+    prompt_too_long``, otherwise the completion budget is clamped so the
+    two fit. Schema-optional, but required in practice for any model the
+    client can pick: ``cli.sync_client_config`` disables the client's own
+    window enforcement, so this pre-flight is the only guard left. Must
+    exceed ``max_tokens_limit`` plus ``CONTEXT_WINDOW_RESERVE_TOKENS`` plus
+    ``MIN_USEFUL_COMPLETION_TOKENS`` (``minimum_context_window``) -- a window the
+    completion cap, the reserve and the minimum completion together can
+    fill leaves no room for any prompt. Not applicable to ``passthrough`` (no
+    conversion, no estimate): an explicit value there is a startup error.
+    Like ``max_tokens_limit``, it is the default for every rule on this
+    provider and may be overridden per rule
+    (``RoutingRule.context_window``).
 
     ``tools_max`` -- the cap on the ``tools`` array size for openai-translate
     providers. OpenAI's hard limit is 128 elements; over that, extra MCP
@@ -127,6 +256,7 @@ class ProviderCfg(BaseModel):
     token_param: TokenParam = "max_tokens"
     drop_params: list[str] = Field(default_factory=list)
     max_tokens_limit: int | None = None
+    context_window: int | None = None
     tools_max: int = 0
     api_flavor: ApiFlavor = "chat"
     reasoning_effort: ReasoningEffort = "medium"
@@ -193,6 +323,52 @@ class ProviderCfg(BaseModel):
             raise ValueError(
                 "provider type='openai-translate' requires 'max_tokens_limit' "
                 "(omitted value silently caps responses; passthrough is exempt)"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_context_window(self) -> ProviderCfg:
+        """Reject ``context_window`` where it has no effect or cannot hold a prompt.
+
+        The pre-flight estimate only runs on ``openai-translate``
+        (``providers/openai_translate.py``); passthrough forwards the body
+        byte-for-byte and never sees a token count, so an explicit value
+        there is the same "configured value that quietly does nothing"
+        trap ``_validate_passthrough_auth`` eliminates. ``model_fields_set``
+        distinguishes an explicit value from the ``None`` default. A window
+        not greater than ``max_tokens_limit`` would reject every request
+        (the completion cap alone fills it), so it is a startup error too.
+
+        Returns:
+            The validated configuration.
+
+        Raises:
+            ValueError: ``context_window`` explicitly set on a
+                non-openai-translate provider, or not greater than
+                ``max_tokens_limit``.
+        """
+        if "context_window" not in self.model_fields_set:
+            return self
+        if self.type != "openai-translate":
+            raise ValueError(
+                "context_window only applies to openai-translate providers; "
+                f"remove it (type='{self.type}' forwards the request "
+                "byte-for-byte and never estimates tokens)"
+            )
+        if (
+            self.context_window is not None
+            and self.max_tokens_limit is not None
+            and self.context_window <= minimum_context_window(self.max_tokens_limit)
+        ):
+            raise ValueError(
+                "context_window must be greater than max_tokens_limit plus the "
+                "pre-flight reserve plus the minimum completion budget (got "
+                f"context_window={self.context_window}, "
+                f"max_tokens_limit={self.max_tokens_limit}, "
+                f"reserve={CONTEXT_WINDOW_RESERVE_TOKENS}, "
+                f"minimum useful completion={MIN_USEFUL_COMPLETION_TOKENS}); the three "
+                "together would fill the window and every prompt would be "
+                "rejected"
             )
         return self
 
@@ -412,4 +588,117 @@ class RoutingConfig(BaseModel):
                 "back to a fleet model or a third-party vendor billed on "
                 "its own key)"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_rule_limits(self) -> RoutingConfig:
+        """Check the per-rule limit overrides against their provider.
+
+        Runs after ``_validate_references``, which has already rejected a
+        rule naming an unknown provider. Two invariants, both startup
+        errors for the same reason the provider-level ones are: a value
+        that quietly does nothing, or a pair no request can satisfy, is
+        only visible at runtime as a route that always fails.
+
+        Returns:
+            The validated configuration.
+
+        Raises:
+            ValueError: an override on a rule pointing at a passthrough
+                provider, or an effective ``context_window`` not greater
+                than the effective ``max_tokens_limit``.
+        """
+        for position, rule in enumerate(self.rules):
+            provider = self.providers[rule.provider]
+            overridden = [
+                name
+                for name in ("max_tokens_limit", "context_window")
+                if getattr(rule, name) is not None
+            ]
+            if overridden and provider.type == "passthrough":
+                raise ValueError(
+                    f"rule #{position + 1} ('{rule.match.value}') -> provider "
+                    f"'{rule.provider}': {overridden} not supported on "
+                    "passthrough (the request body is forwarded byte-for-byte, "
+                    "so neither the completion cap nor the context pre-flight "
+                    "ever runs and the value would quietly do nothing); drop "
+                    "the override or route to an openai-translate provider"
+                )
+            limits = RouteLimits.resolve(provider, rule)
+            if (
+                limits.context_window is not None
+                and limits.max_tokens_limit is not None
+                and limits.context_window
+                <= minimum_context_window(limits.max_tokens_limit)
+            ):
+                raise ValueError(
+                    f"rule #{position + 1} ('{rule.match.value}') -> provider "
+                    f"'{rule.provider}': effective context_window must be "
+                    "greater than effective max_tokens_limit plus the "
+                    "pre-flight reserve plus the minimum completion budget "
+                    f"(got context_window={limits.context_window}, "
+                    f"max_tokens_limit={limits.max_tokens_limit}, "
+                    f"reserve={CONTEXT_WINDOW_RESERVE_TOKENS}, "
+                    f"minimum useful completion={MIN_USEFUL_COMPLETION_TOKENS}, rule "
+                    "overrides folded onto the provider's values); the three "
+                    "together would fill the window and every prompt would be "
+                    "rejected"
+                )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_client_models(self) -> RoutingConfig:
+        """Check that every advertised model id really lands on its own rule.
+
+        Lives on ``RoutingConfig`` rather than ``RoutingRule`` because the
+        answer depends on rule ORDER: resolution is first-match-wins
+        (``routing/registry.py``), so an id an earlier rule also matches
+        never reaches the rule that advertises it. Both failure modes are
+        silent at runtime -- the client picks the row and the request lands
+        on another provider, or on the default route -- so they are startup
+        errors instead.
+
+        Returns:
+            The validated configuration.
+
+        Raises:
+            ValueError: an id listed by more than one rule, an id its own
+                rule's match does not accept, or an id captured by an
+                earlier rule.
+        """
+        owner_of: dict[str, int] = {}
+        for position, rule in enumerate(self.rules):
+            for model in advertised_model_ids(rule):
+                if model in owner_of:
+                    raise ValueError(
+                        f"model id '{model}' is listed by rule "
+                        f"#{owner_of[model] + 1} and rule #{position + 1}; a "
+                        "model id belongs to exactly one rule"
+                    )
+                owner_of[model] = position
+                if not match_model(rule.match, model):
+                    raise ValueError(
+                        f"rule #{position + 1} ({rule.match.type} "
+                        f"'{rule.match.value}') offers model id "
+                        f"'{model}', which its own match does not accept; the "
+                        "client would be offered a model this rule never "
+                        "receives"
+                    )
+                shadow = next(
+                    (
+                        earlier
+                        for earlier in range(position)
+                        if match_model(self.rules[earlier].match, model)
+                    ),
+                    None,
+                )
+                if shadow is not None:
+                    raise ValueError(
+                        f"model id '{model}' of rule "
+                        f"#{position + 1} is captured by the earlier rule "
+                        f"#{shadow + 1} ({self.rules[shadow].match.type} "
+                        f"'{self.rules[shadow].match.value}'); first match "
+                        f"wins, so the request never reaches rule "
+                        f"#{position + 1}"
+                    )
         return self

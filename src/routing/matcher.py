@@ -3,8 +3,14 @@
 from __future__ import annotations
 
 import re
+from typing import TYPE_CHECKING
 
-from routing.schema import MatchRule
+if TYPE_CHECKING:
+    # Import guard, not a style choice: ``routing.schema`` calls
+    # ``match_model`` from its own validators, and a runtime import here
+    # would close the cycle. ``MatchRule`` is used only as an annotation,
+    # deferred by ``from __future__ import annotations``.
+    from routing.schema import MatchRule
 
 
 def match_model(rule: MatchRule, model: str) -> bool:

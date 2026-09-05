@@ -6,6 +6,10 @@ bundle via a dedicated ``httpx.AsyncClient``. The incoming Claude request is
 parsed by a pydantic model and translated to one of two OpenAI endpoints
 based on ``cfg.api_flavor``: ``chat`` -> /v1/chat/completions,
 ``responses`` -> /v1/responses.
+
+Upstream failures before the stream starts and on the non-streaming path
+are rendered with ``ProviderError.error_type``; mid-stream ``event: error``
+frames keep the status-derived type from ``anthropic_error_type_for_status``.
 """
 
 from __future__ import annotations
@@ -31,7 +35,15 @@ from openai.types.chat import ChatCompletionChunk
 from openai.types.responses import ResponseStreamEvent
 from pydantic import BaseModel, SecretStr, ValidationError
 
-from const import CLAUDE_BUILTIN_TOOL_NAMES, DROPPED_TOOLS_LOG_SAMPLE, UPSTREAM_MAX_RETRIES
+from const import (
+    CLAUDE_BUILTIN_TOOL_NAMES,
+    CONTEXT_WINDOW_RESERVE_TOKENS,
+    DROPPED_TOOLS_LOG_SAMPLE,
+    MIN_COMPLETION_TOKENS,
+    MIN_USEFUL_COMPLETION_TOKENS,
+    UPSTREAM_MAX_RETRIES,
+    Constants,
+)
 from conversion.request_converter import convert_claude_to_openai, convert_claude_to_responses
 from conversion.response_converter import (
     convert_openai_streaming_to_claude_with_cancellation,
@@ -43,10 +55,10 @@ from errors import ProviderError, anthropic_error_body
 from log import get_logger
 from models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest, ClaudeTool
 from providers.base import ClientChannel, ProviderResult
-from routing.schema import ProviderCfg
+from routing.schema import ProviderCfg, RouteLimits
 from services.http_transport import build_upstream_transport, build_upstream_verify
 from services.reasoning_cache import ReasoningCache
-from services.token_estimator import estimate_from_claude_request
+from services.token_estimator import estimate_openai_request_tokens
 from settings import UpstreamSettings
 
 logger = get_logger(__name__)
@@ -57,6 +69,23 @@ logger = get_logger(__name__)
 _TRANSIENT_401_MARKER = "insufficient permissions"
 _MAX_STREAM_401_RETRIES = 2  # 2 extra attempts (3 total)
 _STREAM_401_RETRY_DELAY_S = 0.3
+
+# Upstream 400 texts that mean the prompt overflowed the model's context
+# window (OpenAI, vLLM/SGLang-style gateways, DeepSeek, Anthropic-shaped
+# wrappers). Matched case-insensitively on BadRequestError only, BEFORE
+# ``classify_error``, so the client gets the Anthropic-shaped
+# invalid_request_error with the stable token Claude Code parses. "too
+# many tokens" is deliberately absent: it also appears in 429 texts.
+_CONTEXT_LENGTH_ERROR_MARKERS: tuple[str, ...] = (
+    "maximum context length",
+    "context length exceeded",
+    "context_length_exceeded",
+    "prompt is too long",
+    "exceeds the model's maximum context",
+)
+# Stable token from the Claude Code gateway protocol: its recovery path
+# (retry with a smaller max_tokens, then compact) keys on this substring.
+_PROMPT_TOO_LONG_TOKEN = "capability_rejected: prompt_too_long"
 
 
 def apply_param_compat(
@@ -425,6 +454,12 @@ class OpenAITranslateProvider:
     def _to_provider_error(self, exc: APIError) -> ProviderError:
         """Map an OpenAI upstream error into a ProviderError.
 
+        A ``BadRequestError`` whose text names a context-length overflow
+        (``_CONTEXT_LENGTH_ERROR_MARKERS``) is remapped before
+        ``classify_error`` into ``invalid_request_error`` with the
+        ``capability_rejected: prompt_too_long`` token; other statuses are
+        never remapped, so a 429 mentioning tokens keeps its meaning.
+
         Args:
             exc: OpenAI SDK exception.
 
@@ -432,6 +467,14 @@ class OpenAITranslateProvider:
             ProviderError with an appropriate status code and a readable
             message.
         """
+        if isinstance(exc, BadRequestError) and any(
+            marker in exc.message.lower() for marker in _CONTEXT_LENGTH_ERROR_MARKERS
+        ):
+            return ProviderError(
+                message=f"prompt is too long: {exc.message} ({_PROMPT_TOO_LONG_TOKEN})",
+                status_code=400,
+                error_type="invalid_request_error",
+            )
         detail = self.classify_error(str(exc))
         if isinstance(exc, AuthenticationError):
             return ProviderError(message=detail, status_code=401)
@@ -483,6 +526,7 @@ class OpenAITranslateProvider:
         client_headers: Mapping[str, str],
         client_channel: ClientChannel,
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
         """Translate ``/v1/messages`` into OpenAI and return an Anthropic response."""
         try:
@@ -493,35 +537,15 @@ class OpenAITranslateProvider:
             )
 
         request_id = str(uuid.uuid4())
-
-        # Tools array truncated to the openai upstream limit (128 for
-        # OpenAI). Applied BEFORE conversion: works with ClaudeTool models
-        # (the .name field); the logic does not touch the passthrough
-        # provider (byte-for-byte forwarding).
-        if self.cfg.tools_max > 0 and parsed.tools is not None:
-            parsed.tools = cap_tools(parsed.tools, self.cfg.tools_max, self.name)
-
         is_responses = self.cfg.api_flavor == "responses"
-        # The schema validator guarantees that openai-translate sets
-        # max_tokens_limit. The cast is warranted: OpenAITranslateProvider is
-        # only constructed for openai-translate.
-        max_tokens_limit = cast(int, self.cfg.max_tokens_limit)
-        if is_responses:
-            openai_request = convert_claude_to_responses(
-                parsed,
-                upstream_model if upstream_model is not None else parsed.model,
-                max_tokens_limit=max_tokens_limit,
-                reasoning_effort_fallback=self.cfg.reasoning_effort,
-                reasoning_cache=self._reasoning_cache,
-            )
-        else:
-            openai_request = convert_claude_to_openai(
-                parsed, upstream_model, max_tokens_limit=max_tokens_limit
-            )
-        apply_param_compat(openai_request, self.cfg)
+        openai_request = self._build_openai_request(parsed, upstream_model, limits)
+
+        if limits.context_window is not None:
+            rejected = self._enforce_context_window(openai_request, limits.context_window)
+            if rejected is not None:
+                return rejected
 
         if parsed.stream:
-            openai_request["stream"] = True
             if not is_responses:
                 # stream_options is a chat-completions-only parameter (usage
                 # is read from it there). The Responses API rejects it as an
@@ -551,7 +575,7 @@ class OpenAITranslateProvider:
                     detail=exc.message,
                 )
                 return _json_result(
-                    exc.status_code, anthropic_error_body("api_error", exc.message)
+                    exc.status_code, anthropic_error_body(exc.error_type, exc.message)
                 )
 
             stream = self.create_chat_completion_stream(
@@ -596,7 +620,7 @@ class OpenAITranslateProvider:
                 detail=exc.message,
             )
             return _json_result(
-                exc.status_code, anthropic_error_body("api_error", exc.message)
+                exc.status_code, anthropic_error_body(exc.error_type, exc.message)
             )
         claude_response = (
             convert_responses_to_claude_response(
@@ -605,22 +629,181 @@ class OpenAITranslateProvider:
             if is_responses
             else convert_openai_to_claude_response(openai_response, parsed)
         )
+        # An upstream that closes the turn with no text and no tool call
+        # (DeepSeek on a chat array ending in a system message) is otherwise
+        # indistinguishable from a normal end_turn in the log. Text that is
+        # only whitespace counts as none: the client sees a blank turn.
+        if not any(
+            block["type"] == Constants.CONTENT_TOOL_USE
+            or (block["type"] == Constants.CONTENT_TEXT and block["text"].strip())
+            for block in claude_response["content"]
+        ):
+            logger.warning(
+                "empty_completion",
+                provider=self.name,
+                model=parsed.model,
+                upstream_model=openai_request["model"],
+                stream=False,
+                finish_reason=(
+                    openai_response.get("status")
+                    if is_responses
+                    else openai_response["choices"][0].get("finish_reason")
+                ),
+            )
         return _json_result(200, claude_response)
+
+    def _build_openai_request(
+        self,
+        parsed: ClaudeMessagesRequest,
+        upstream_model: str | None,
+        limits: RouteLimits,
+    ) -> dict[str, Any]:
+        """Translate a parsed Claude request into the upstream wire body.
+
+        Shared by ``handle_messages`` and ``count_tokens`` so the token
+        estimate is computed on exactly the payload that would be sent:
+        tools capped to ``cfg.tools_max``, converted for ``cfg.api_flavor``,
+        parameter names adapted by ``apply_param_compat``, and an explicit
+        ``stream`` bool.
+
+        Args:
+            parsed: validated Anthropic ``/v1/messages`` request; its
+                ``tools`` list is replaced in place when capped.
+            upstream_model: upstream model name from the routing rule, or
+                ``None`` to keep ``parsed.model``.
+            limits: the route's effective token limits.
+
+        Returns:
+            OpenAI request dict (Chat Completions or Responses).
+        """
+        # Tools array truncated to the openai upstream limit (128 for
+        # OpenAI). Applied BEFORE conversion: works with ClaudeTool models
+        # (the .name field); the logic does not touch the passthrough
+        # provider (byte-for-byte forwarding).
+        if self.cfg.tools_max > 0 and parsed.tools is not None:
+            parsed.tools = cap_tools(parsed.tools, self.cfg.tools_max, self.name)
+
+        # The schema validator guarantees that openai-translate sets
+        # max_tokens_limit, and a rule override is an int too, so the
+        # effective value is never None. The cast is warranted:
+        # OpenAITranslateProvider is only constructed for openai-translate.
+        max_tokens_limit = cast(int, limits.max_tokens_limit)
+        if self.cfg.api_flavor == "responses":
+            openai_request = convert_claude_to_responses(
+                parsed,
+                upstream_model if upstream_model is not None else parsed.model,
+                max_tokens_limit=max_tokens_limit,
+                reasoning_effort_fallback=self.cfg.reasoning_effort,
+                reasoning_cache=self._reasoning_cache,
+            )
+        else:
+            openai_request = convert_claude_to_openai(
+                parsed, upstream_model, max_tokens_limit=max_tokens_limit
+            )
+        apply_param_compat(openai_request, self.cfg)
+
+        # Always an explicit bool: some OpenAI-compatible gateways answer 400
+        # to a body whose ``stream`` is missing or ``null``, and the SDK
+        # serializes a ``None`` kwarg as ``null`` instead of dropping it.
+        openai_request["stream"] = bool(parsed.stream)
+        return openai_request
+
+    def _enforce_context_window(
+        self, openai_request: dict[str, Any], context_window: int
+    ) -> ProviderResult | None:
+        """Reject or clamp the request so prompt plus completion fits the window.
+
+        Runs on the converted wire body before any upstream call, for the
+        streaming and non-streaming paths alike. The budget is the window
+        minus ``CONTEXT_WINDOW_RESERVE_TOKENS``; a prompt that leaves less
+        than ``MIN_USEFUL_COMPLETION_TOKENS`` of it is rejected with the
+        Anthropic-shaped ``invalid_request_error`` carrying the stable
+        ``capability_rejected: prompt_too_long`` token (Claude Code then
+        retries with a smaller ``max_tokens`` and compacts when nothing
+        fits); otherwise the completion budget is lowered to what remains.
+        The floor is the USEFUL one, not the converters'
+        ``MIN_COMPLETION_TOKENS``: a reasoning upstream handed the thousand
+        tokens a nearly full window leaves burns them on reasoning and
+        returns empty content with ``stop_reason: max_tokens``, which the
+        client cannot act on -- unlike ``prompt_too_long``, which makes it
+        compact. This is also the only protection for upstreams that answer
+        an overflow with a retried 500 instead of a context-length 400
+        (MiniMax-M3).
+
+        Args:
+            openai_request: converted wire body; its token-limit key is
+                lowered in place when clamped.
+            context_window: the route's effective ``context_window`` (the
+                rule's override, or the provider's own value).
+
+        Returns:
+            The 400 ProviderResult for the client, or ``None`` when the
+            request may proceed.
+        """
+        budget = context_window - CONTEXT_WINDOW_RESERVE_TOKENS
+        estimate = estimate_openai_request_tokens(openai_request)
+        model = openai_request.get("model")
+        if estimate + MIN_USEFUL_COMPLETION_TOKENS > budget:
+            logger.warning(
+                "context_window_reject",
+                provider=self.name,
+                model=model,
+                estimate=estimate,
+                context_window=context_window,
+            )
+            message = (
+                f"prompt is too long: {estimate} tokens > "
+                f"{budget - MIN_USEFUL_COMPLETION_TOKENS} maximum "
+                f"({_PROMPT_TOO_LONG_TOKEN})"
+            )
+            return _json_result(400, anthropic_error_body("invalid_request_error", message))
+
+        # The Responses converter writes max_output_tokens directly, while
+        # apply_param_compat renames the chat converter's max_tokens to
+        # cfg.token_param -- so the key differs per flavor.
+        token_key = (
+            "max_output_tokens" if self.cfg.api_flavor == "responses" else self.cfg.token_param
+        )
+        requested = openai_request[token_key]
+        clamped = min(requested, budget - estimate)
+        if clamped != requested:
+            openai_request[token_key] = clamped
+            logger.info(
+                "context_window_clamp",
+                provider=self.name,
+                model=model,
+                estimate=estimate,
+                requested=requested,
+                clamped=clamped,
+            )
+        return None
 
     async def count_tokens(
         self,
         raw_body: bytes,
         client_headers: Mapping[str, str],
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
-        """Estimate the input token count locally (the upstream has no count_tokens)."""
+        """Estimate the input token count locally (the upstream has no count_tokens).
+
+        The count request is wrapped into a ``ClaudeMessagesRequest`` with
+        the minimum completion budget and pushed through the same builder
+        as ``handle_messages``, so the number reflects the converted wire
+        payload (capped tools, tool definitions, tool-call arguments)
+        rather than the raw Anthropic text.
+        """
         try:
             parsed = ClaudeTokenCountRequest.model_validate_json(raw_body)
         except ValidationError as exc:
             return _json_result(
                 400, anthropic_error_body("invalid_request_error", str(exc))
             )
-        return _json_result(200, {"input_tokens": estimate_from_claude_request(parsed)})
+        messages_request = ClaudeMessagesRequest(
+            max_tokens=MIN_COMPLETION_TOKENS, **parsed.model_dump()
+        )
+        openai_request = self._build_openai_request(messages_request, upstream_model, limits)
+        return _json_result(200, {"input_tokens": estimate_openai_request_tokens(openai_request)})
 
     async def aclose(self) -> None:
         """Close the OpenAI and httpx clients."""
