@@ -134,6 +134,28 @@ cp routing.example.yaml routing.yaml    # personal provider registry, not commit
   `ca_bundle`. Удалите `ca_bundle` у любого passthrough-провайдера, который
   на самом деле не стоит за приватным CA.
 
+Три новых проверки на уровне правил могут сломать существующий конфиг при
+старте, если правило перестало их удовлетворять. Каждая ошибка называет
+нарушившее правило и способ починки; как и выше, одно плохое правило
+блокирует роутер целиком:
+
+- Каждый идентификатор модели, который объявляет правило, — записи
+  `client_models` и, для `exact`-правила, его собственное значение match —
+  теперь проверяется по правилам, расположенным выше. `exact`-правило, чей id уже
+  захватывает более раннее `prefix`/`contains`/`regex`-правило, раньше
+  загружалось молча и никогда не срабатывало; теперь это ошибка при старте,
+  называющая оба правила. То же самое для id, указанного в двух правилах.
+  Перенесите exact-правило выше более широкого либо удалите его.
+- Поля `max_tokens_limit` и `context_window` на уровне правила теперь
+  разрешены только у правил, указывающих на `openai-translate`-провайдера; у
+  `passthrough`-правила это ошибка при старте, как уже было с
+  `upstream_model`.
+- `context_window`, если задан, должен превышать `max_tokens_limit` плюс
+  `CONTEXT_WINDOW_RESERVE_TOKENS` (512) плюс `MIN_USEFUL_COMPLETION_TOKENS`
+  (4096); меньшее окно — ошибка при старте, потому что ни один запрос
+  никогда не смог бы в него уместиться. Затрагиваются только конфиги, в
+  которых задано новое поле.
+
 Обязательная переменная: `ROUTER_CONFIG_PATH` (путь к `routing.yaml`).
 Секреты провайдеров задаются через переменные окружения, имена которых
 объявлены в `routing.yaml` (`api_key_env`).
@@ -392,7 +414,7 @@ tail -f ~/Library/Logs/open-harness-router.log | jq 'select(.event == "startup")
 
 ```json
 {"match_type": "prefix", "match_value": "claude-", "provider": "anthropic"}
-{"match_type": "exact", "match_value": "ag-GLM-5.2-FP8", "provider": "openai_compatible", "upstream_model": "zai-org/GLM-5.2-FP8", "max_tokens_limit": 65536, "context_window": 206650}
+{"match_type": "contains", "match_value": "GLM", "provider": "openai_compatible", "upstream_model": "zai-org/GLM-5.2-FP8", "max_tokens_limit": 65536, "context_window": 206650}
 {"match_type": "default", "provider": "anthropic"}
 ```
 
@@ -684,7 +706,20 @@ LaunchAgent уровня пользователя (без `sudo`, стартуе
 - `StandardOutPath` / `StandardErrorPath` — stdout и stderr идут в разные
   файлы.
 
-Управление (актуальный синтаксис `bootstrap`/`bootout`, домен `gui/<uid>`
+Сначала сохраните приведённый выше plist в
+`~/Library/LaunchAgents/<your label>.plist`, заменив метку-заглушку
+`com.example.open-harness-router` и путь `/path/to/...` до программы на
+реальные значения. Затем включите LaunchAgent:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.open-harness-router.plist
+```
+
+Поместите ту же метку в файл `.launchd-label` в корне репозитория (одна
+строка, игнорируется git): по этой метке скрипт перезапуска скилла
+add-provider ищет сервис.
+
+Для управления (актуальный синтаксис `bootstrap`/`bootout`, домен `gui/<uid>`
 пользовательской сессии):
 
 ```bash
@@ -812,7 +847,7 @@ launchd, systemd и `docker stop` останавливают процесс од
 ```bash
 env -u ANTHROPIC_API_KEY \
   ANTHROPIC_BASE_URL=http://127.0.0.1:8787 \
-  CLAUDE_CODE_SUBAGENT_MODEL=ag-GLM-5.2-FP8 \
+  CLAUDE_CODE_SUBAGENT_MODEL=zai-org/GLM-5.2-FP8 \
   claude
 ```
 
@@ -821,7 +856,9 @@ env -u ANTHROPIC_API_KEY \
 (например, GLM через шаблон корпоративного шлюза, см. «Конфигурация» —
 провайдера и правило нужно раскомментировать). Для управления по каждому
 агенту вместо глобальной переменной можно задать `model:` во frontmatter
-отдельных агентов в `.claude/agents/*.md`.
+отдельных агентов в `.claude/agents/*.md`. Этот каталог и его файлы — ваша
+собственная конфигурация Claude Code, а не часть этого репозитория: создайте
+её самостоятельно, если её ещё нет.
 
 Ограничение самого CLI: пока `ANTHROPIC_BASE_URL` не указывает на
 `api.anthropic.com`, Remote Control недоступен (по состоянию на v2.1.196).
