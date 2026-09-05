@@ -6,14 +6,6 @@ bundle via a dedicated ``httpx.AsyncClient``. The incoming Claude request is
 parsed by a pydantic model and translated to one of two OpenAI endpoints
 based on ``cfg.api_flavor``: ``chat`` -> /v1/chat/completions,
 ``responses`` -> /v1/responses.
-
-Upstream failures are rendered with ``ProviderError.error_type`` wherever
-they surface -- before the stream starts, on the non-streaming path, and in
-the mid-stream ``event: error`` frame ``conversion.response_converter``
-emits -- so a context-length 400 remapped to ``invalid_request_error``
-reaches the client as one on every path. Only an error the router never
-classified (a raw SDK ``APIError`` mid-stream, passthrough proxying) falls
-back to the status-derived type from ``anthropic_error_type_for_status``.
 """
 
 from __future__ import annotations
@@ -79,7 +71,7 @@ _STREAM_401_RETRY_DELAY_S = 0.3
 # wrappers). Matched case-insensitively on BadRequestError only, BEFORE
 # ``classify_error``, so the client gets the Anthropic-shaped
 # invalid_request_error with the stable token Claude Code parses. "too
-# many tokens" is deliberately absent: it also appears in 429 texts.
+# many tokens" is absent: it also appears in 429 texts.
 _CONTEXT_LENGTH_ERROR_MARKERS: tuple[str, ...] = (
     "maximum context length",
     "context length exceeded",
@@ -142,11 +134,8 @@ def cap_tools(
         tools: array of tools from the Claude request (or None).
         tools_max: maximum number of elements; 0 = no limit.
         provider_name: provider name for logging.
-        log_dropped: whether a truncation is worth a warning. ``False`` on
-            the ``count_tokens`` path: that call sends nothing upstream, so
-            no tool is really lost, and Claude Code issues one count per
-            turn -- the warning would say the same thing on every one of
-            them and drown the entry that reports a real request.
+        log_dropped: whether a truncation is worth a warning; ``False`` for
+            ``count_tokens``, which sends nothing upstream.
 
     Returns:
         Truncated tools array (or the original, or None).
@@ -680,13 +669,10 @@ class OpenAITranslateProvider:
         ``stream`` bool.
 
         Args:
-            parsed: validated Anthropic ``/v1/messages`` request; its
-                ``tools`` list is replaced in place when capped.
-            upstream_model: upstream model name from the routing rule, or
-                ``None`` to keep ``parsed.model``.
+            parsed: validated Anthropic request; its ``tools`` are capped in place.
+            upstream_model: upstream model name, or ``None`` to keep ``parsed.model``.
             limits: the route's effective token limits.
-            log_dropped_tools: whether a tools-array truncation is worth a
-                warning; ``False`` for the counting path (see ``cap_tools``).
+            log_dropped_tools: whether a tools cap is worth a warning (see ``cap_tools``).
 
         Returns:
             OpenAI request dict (Chat Completions or Responses).
@@ -738,14 +724,6 @@ class OpenAITranslateProvider:
         ``capability_rejected: prompt_too_long`` token (Claude Code then
         retries with a smaller ``max_tokens`` and compacts when nothing
         fits); otherwise the completion budget is lowered to what remains.
-        The floor is the USEFUL one, not the converters'
-        ``MIN_COMPLETION_TOKENS``: a reasoning upstream handed the thousand
-        tokens a nearly full window leaves burns them on reasoning and
-        returns empty content with ``stop_reason: max_tokens``, which the
-        client cannot act on -- unlike ``prompt_too_long``, which makes it
-        compact. This is also the only protection for upstreams that answer
-        an overflow with a retried 500 instead of a context-length 400
-        (MiniMax-M3).
 
         Args:
             openai_request: converted wire body; its token-limit key is
@@ -760,6 +738,8 @@ class OpenAITranslateProvider:
         budget = context_window - CONTEXT_WINDOW_RESERVE_TOKENS
         estimate = estimate_openai_request_tokens(openai_request)
         model = openai_request.get("model")
+        # The only protection for upstreams that answer an overflow with a
+        # retried 500 instead of a context-length 400 (MiniMax-M3).
         if estimate + MIN_USEFUL_COMPLETION_TOKENS > budget:
             logger.warning(
                 "context_window_reject",

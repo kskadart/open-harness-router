@@ -26,7 +26,7 @@ from cli.sync_client_config import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
     EXIT_OUT_OF_SYNC,
-    build_model_options,
+    collect_model_options,
     main,
 )
 from routing.config_loader import load_routing_config
@@ -131,6 +131,12 @@ _EXPECTED_OPTIONS: list[dict[str, str]] = [
 ]
 
 
+_PASSTHROUGH_ONLY_CAUSE = (
+    "every rule serves a passthrough provider whose native model ids "
+    "the client already lists"
+)
+
+
 def _clone_routing() -> dict[str, Any]:
     """Deep copy of the fleet routing fixture for mutation in tests.
 
@@ -192,20 +198,20 @@ def settings_path(tmp_path: Path) -> Path:
     return tmp_path / "open-harness-router.settings.json"
 
 
-def test_build_model_options_lists_client_models_and_exact_values_in_rule_order(
+def test_collect_model_options_lists_client_models_and_exact_values_in_rule_order(
     fleet_routing: Path,
 ) -> None:
     """Rows come from client_models, or an exact rule's own value, in rule order."""
-    options = build_model_options(load_routing_config(fleet_routing))
+    options = collect_model_options(load_routing_config(fleet_routing))[0]
 
     assert options == _EXPECTED_OPTIONS
 
 
-def test_build_model_options_skips_rules_serving_a_passthrough_provider(
+def test_collect_model_options_skips_rules_serving_a_passthrough_provider(
     fleet_routing: Path,
 ) -> None:
     """The native ``claude-`` rule contributes no row: passthrough has no window."""
-    options = build_model_options(load_routing_config(fleet_routing))
+    options = collect_model_options(load_routing_config(fleet_routing))[0]
 
     assert all(not option["model"].startswith("claude-") for option in options)
 
@@ -215,7 +221,7 @@ def test_every_emitted_model_routes_back_to_the_rule_that_emitted_it(
 ) -> None:
     """First match wins, so each offered id must reach its own rule, not an earlier one."""
     config = load_routing_config(fleet_routing)
-    options = build_model_options(config)
+    options = collect_model_options(config)[0]
 
     for option in options:
         model = option["model"]
@@ -242,7 +248,7 @@ def test_every_emitted_model_is_a_declared_id_never_a_match_pattern(
         rule.match.value for rule in config.rules if rule.match.type != "exact"
     }
 
-    offered = {option["model"] for option in build_model_options(config)}
+    offered = {option["model"] for option in collect_model_options(config)[0]}
 
     assert offered.isdisjoint(pattern_values)
 
@@ -259,7 +265,7 @@ def test_every_emitted_model_reaches_the_upstream_as_a_rewritten_or_verbatim_id(
     """
     config = load_routing_config(fleet_routing)
 
-    for option in build_model_options(config):
+    for option in collect_model_options(config)[0]:
         rule = _first_matching_rule(config, option["model"])
         assert rule is not None
         upstream_model = rule.upstream_model or option["model"]
@@ -499,61 +505,34 @@ def test_main_leaves_no_temporary_file_behind(
     assert [entry.name for entry in settings_path.parent.iterdir() if ".tmp" in entry.name] == []
 
 
-def test_main_zero_models_from_passthrough_only_explains_why(
+@pytest.mark.parametrize(
+    ("clone_routing", "runs", "explained"),
+    [
+        pytest.param(_clone_passthrough_routing, ([],), True, id="write_line"),
+        pytest.param(_clone_passthrough_routing, ([], ["--check"]), True, id="check_line"),
+        pytest.param(_clone_routing, ([],), False, id="models_listed"),
+    ],
+)
+def test_main_explains_a_zero_model_run_next_to_the_figure(
     write_routing: Callable[[dict[str, Any]], Path],
     settings_path: Path,
     capsys: pytest.CaptureFixture[str],
+    clone_routing: Callable[[], dict[str, Any]],
+    runs: tuple[list[str], ...],
+    explained: bool,
 ) -> None:
-    """A run that writes 0 rows says WHY, so the empty result reads as expected.
-
-    With only a passthrough provider on a fresh clone the picker is
-    intentionally empty: the native ``claude-*`` ids are already listed by
-    the client. The newcomer must be told that this is the design, not a
-    failure -- the explanation sits right next to the ``0 models`` figure.
-    """
-    write_routing(_clone_passthrough_routing())
-
-    exit_code = main(["--settings-path", str(settings_path)])
-
-    captured = capsys.readouterr()
-    assert exit_code == EXIT_OK
-    assert "0 models" in captured.out
-    assert (
-        "every rule serves a passthrough provider whose native model ids "
-        "the client already lists" in captured.out
-    )
-
-
-def test_main_check_zero_models_from_passthrough_only_explains_why(
-    write_routing: Callable[[dict[str, Any]], Path],
-    settings_path: Path,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """The ``--check`` in-sync line carries the same zero-model explanation."""
-    write_routing(_clone_passthrough_routing())
-    assert main(["--settings-path", str(settings_path)]) == EXIT_OK
+    """A run that lists no model says why, on the WROTE line and the --check line alike."""
+    write_routing(clone_routing())
+    for extra_args in runs[:-1]:
+        assert main(["--settings-path", str(settings_path), *extra_args]) == EXIT_OK
     capsys.readouterr()
 
-    exit_code = main(["--settings-path", str(settings_path), "--check"])
+    exit_code = main(["--settings-path", str(settings_path), *runs[-1]])
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_OK
-    assert "0 models" in captured.out
-    assert (
-        "every rule serves a passthrough provider whose native model ids "
-        "the client already lists" in captured.out
-    )
-
-
-def test_main_with_listed_models_does_not_print_the_zero_model_explanation(
-    fleet_routing: Path, settings_path: Path, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """Once at least one model is listed there is nothing to explain."""
-    exit_code = main(["--settings-path", str(settings_path)])
-
-    captured = capsys.readouterr()
-    assert exit_code == EXIT_OK
-    assert "passthrough provider" not in captured.out
+    assert ("0 models" in captured.out) is explained
+    assert (_PASSTHROUGH_ONLY_CAUSE in captured.out) is explained
 
 
 def test_default_settings_path_is_a_dedicated_file_in_the_user_claude_directory() -> None:
@@ -562,7 +541,7 @@ def test_default_settings_path_is_a_dedicated_file_in_the_user_claude_directory(
     assert DEFAULT_SETTINGS_PATH.name == "open-harness-router.settings.json"
 
 
-def test_build_model_options_shows_per_rule_limits_when_two_rules_share_one_provider(
+def test_collect_model_options_shows_per_rule_limits_when_two_rules_share_one_provider(
     write_routing: Callable[[dict[str, Any]], Path],
 ) -> None:
     """One gateway, two models: each row carries the numbers its own rule resolves to.
@@ -577,7 +556,7 @@ def test_build_model_options_shows_per_rule_limits_when_two_rules_share_one_prov
     raw["rules"][2]["context_window"] = 223680
     routing_path = write_routing(raw)
 
-    options = build_model_options(load_routing_config(routing_path))
+    options = collect_model_options(load_routing_config(routing_path))[0]
 
     assert [option["description"] for option in options[:2]] == [
         "fleet_chat -- window 206650, max output 65536",
@@ -585,7 +564,7 @@ def test_build_model_options_shows_per_rule_limits_when_two_rules_share_one_prov
     ]
 
 
-def test_build_model_options_accepts_a_rule_window_where_the_provider_declares_none(
+def test_collect_model_options_accepts_a_rule_window_where_the_provider_declares_none(
     write_routing: Callable[[dict[str, Any]], Path],
 ) -> None:
     """The guard is the EFFECTIVE window: a rule may supply the one the provider lacks."""
@@ -594,7 +573,7 @@ def test_build_model_options_accepts_a_rule_window_where_the_provider_declares_n
     raw["rules"][1]["context_window"] = 206650
     routing_path = write_routing(raw)
 
-    options = build_model_options(load_routing_config(routing_path))
+    options = collect_model_options(load_routing_config(routing_path))[0]
 
     assert options[0]["description"] == "fleet_chat -- window 206650, max output 65536"
 

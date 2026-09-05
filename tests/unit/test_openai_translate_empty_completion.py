@@ -1,18 +1,4 @@
-"""Wire tests for the ``empty_completion`` warning of the openai-translate provider.
-
-An upstream that closes the turn with no text and no tool calls
-(DeepSeek-V4-Flash answering a chat array that ends in a system message)
-used to leave no trace in the router log: the client saw an empty assistant
-turn and nothing else. The provider logs a ``warning`` event
-``empty_completion`` on the non-streaming path, and the stream converters
-log it before ``message_stop`` on the streaming path. Upstream bodies are
-served by pytest-httpx on top of a real ``AsyncOpenAI`` (same pattern as
-``test_openai_translate_stream_flag``); log events are captured with a
-recorder substituted for the provider module logger, for the reason given in
-``test_openai_translate_context_window`` (a cached structlog chain makes
-``capture_logs`` order-dependent). The stream converters receive that same
-module logger as an argument, so the recorder sees their events too.
-"""
+"""Wire tests for the ``empty_completion`` warning of the openai-translate provider."""
 
 from __future__ import annotations
 
@@ -177,6 +163,19 @@ def _output_text_item(text: str) -> dict[str, Any]:
     }
 
 
+def _output_text_delta(text: str) -> dict[str, Any]:
+    """A Responses ``output_text`` delta event carrying the given text."""
+    return {
+        "type": "response.output_text.delta",
+        "sequence_number": 1,
+        "item_id": "msg_test",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": text,
+        "logprobs": [],
+    }
+
+
 def _chat_sse(*deltas: dict[str, Any], finish_reason: str = "stop") -> str:
     """A Chat Completions SSE body: the given deltas, a finish chunk, a usage chunk, [DONE]."""
 
@@ -241,7 +240,7 @@ def _assert_single_warning(provider_log: _LogRecorder, *, stream: bool, finish_r
     assert events[0]["finish_reason"] == finish_reason
 
 
-@pytest.mark.parametrize("content", ["", None])
+@pytest.mark.parametrize("content", ["", None, "  \n  "])
 async def test_non_streaming_chat_completion_without_text_or_tool_calls_logs_warning(
     httpx_mock: HTTPXMock, provider_log: _LogRecorder, content: str | None
 ) -> None:
@@ -296,13 +295,14 @@ async def test_non_streaming_chat_completion_cut_by_length_reports_its_finish_re
     _assert_single_warning(provider_log, stream=False, finish_reason="length")
 
 
-async def test_non_streaming_responses_completion_with_empty_text_logs_warning(
-    httpx_mock: HTTPXMock, provider_log: _LogRecorder
+@pytest.mark.parametrize("text", ["", "  \n  "])
+async def test_non_streaming_responses_completion_without_visible_text_logs_warning(
+    httpx_mock: HTTPXMock, provider_log: _LogRecorder, text: str
 ) -> None:
-    """Responses flavor: an empty output_text is logged; finish_reason carries the status."""
+    """Responses flavor: text no one can read is logged; finish_reason carries the status."""
     httpx_mock.add_response(
         url=_BASE_URL + _ENDPOINT_PATH["responses"],
-        json=_responses_body([_output_text_item("")]),
+        json=_responses_body([_output_text_item(text)]),
     )
 
     await _handle(_provider("responses"), _claude_body())
@@ -324,14 +324,24 @@ async def test_non_streaming_responses_completion_with_text_does_not_log_warning
     assert provider_log.named("empty_completion") == []
 
 
-async def test_streaming_chat_completion_without_text_or_tool_calls_logs_warning(
-    httpx_mock: HTTPXMock, provider_log: _LogRecorder
+@pytest.mark.parametrize(
+    "deltas",
+    [
+        pytest.param(({"role": "assistant", "content": ""},), id="empty_role_delta"),
+        pytest.param(
+            ({"role": "assistant", "content": " "}, {"content": "\n"}),
+            id="whitespace_deltas",
+        ),
+    ],
+)
+async def test_streaming_chat_completion_without_visible_text_logs_warning(
+    httpx_mock: HTTPXMock, provider_log: _LogRecorder, deltas: tuple[dict[str, Any], ...]
 ) -> None:
-    """A stream of an empty role delta and an immediate stop is logged as empty_completion."""
+    """A stream that stops without readable text is logged as empty_completion."""
     httpx_mock.add_response(
         url=_BASE_URL + _ENDPOINT_PATH["chat"],
         headers={"content-type": "text/event-stream"},
-        text=_chat_sse({"role": "assistant", "content": ""}),
+        text=_chat_sse(*deltas),
     )
 
     await _handle(_provider("chat"), _claude_body(stream=True))
@@ -373,14 +383,17 @@ async def test_streaming_chat_completion_with_tool_call_does_not_log_warning(
     assert provider_log.events == []
 
 
-async def test_streaming_responses_completion_without_output_logs_warning(
-    httpx_mock: HTTPXMock, provider_log: _LogRecorder
+@pytest.mark.parametrize("text", [None, "  "])
+async def test_streaming_responses_completion_without_visible_output_logs_warning(
+    httpx_mock: HTTPXMock, provider_log: _LogRecorder, text: str | None
 ) -> None:
-    """Responses flavor: a stream that completes with no output items is logged."""
+    """Responses flavor: a stream completing with no output item, or a blank one, is logged."""
+    events = () if text is None else (_output_text_delta(text),)
+    output = [] if text is None else [_output_text_item(text)]
     httpx_mock.add_response(
         url=_BASE_URL + _ENDPOINT_PATH["responses"],
         headers={"content-type": "text/event-stream"},
-        text=_responses_sse(final=_responses_body([])),
+        text=_responses_sse(*events, final=_responses_body(output)),
     )
 
     await _handle(_provider("responses"), _claude_body(stream=True))
@@ -392,19 +405,12 @@ async def test_streaming_responses_completion_with_text_delta_does_not_log_warni
     httpx_mock: HTTPXMock, provider_log: _LogRecorder
 ) -> None:
     """Responses flavor: a non-empty output_text delta is a real completion."""
-    text_delta = {
-        "type": "response.output_text.delta",
-        "sequence_number": 1,
-        "item_id": "msg_test",
-        "output_index": 0,
-        "content_index": 0,
-        "delta": "Hi",
-        "logprobs": [],
-    }
     httpx_mock.add_response(
         url=_BASE_URL + _ENDPOINT_PATH["responses"],
         headers={"content-type": "text/event-stream"},
-        text=_responses_sse(text_delta, final=_responses_body([_output_text_item("Hi")])),
+        text=_responses_sse(
+            _output_text_delta("Hi"), final=_responses_body([_output_text_item("Hi")])
+        ),
     )
 
     await _handle(_provider("responses"), _claude_body(stream=True))
@@ -511,69 +517,3 @@ async def test_streaming_responses_upstream_abort_does_not_log_empty_completion(
 
     assert provider_log.named("empty_completion") == []
     assert len(provider_log.named(_ABORT_EVENT)) == 1
-
-
-async def test_non_streaming_chat_completion_with_whitespace_only_text_logs_warning(
-    httpx_mock: HTTPXMock, provider_log: _LogRecorder
-) -> None:
-    """Whitespace is not content: the client sees a blank turn just the same."""
-    httpx_mock.add_response(
-        url=_BASE_URL + _ENDPOINT_PATH["chat"], json=_chat_completion_body("  \n  ")
-    )
-
-    await _handle(_provider("chat"), _claude_body())
-
-    _assert_single_warning(provider_log, stream=False, finish_reason="stop")
-
-
-async def test_non_streaming_responses_completion_with_whitespace_only_text_logs_warning(
-    httpx_mock: HTTPXMock, provider_log: _LogRecorder
-) -> None:
-    """Responses flavor: a whitespace-only output_text is an empty completion."""
-    httpx_mock.add_response(
-        url=_BASE_URL + _ENDPOINT_PATH["responses"],
-        json=_responses_body([_output_text_item("  \n  ")]),
-    )
-
-    await _handle(_provider("responses"), _claude_body())
-
-    _assert_single_warning(provider_log, stream=False, finish_reason="completed")
-
-
-async def test_streaming_chat_completion_with_whitespace_only_deltas_logs_warning(
-    httpx_mock: HTTPXMock, provider_log: _LogRecorder
-) -> None:
-    """A stream of whitespace deltas carries no answer either."""
-    httpx_mock.add_response(
-        url=_BASE_URL + _ENDPOINT_PATH["chat"],
-        headers={"content-type": "text/event-stream"},
-        text=_chat_sse({"role": "assistant", "content": " "}, {"content": "\n"}),
-    )
-
-    await _handle(_provider("chat"), _claude_body(stream=True))
-
-    _assert_single_warning(provider_log, stream=True, finish_reason="stop")
-
-
-async def test_streaming_responses_completion_with_whitespace_only_delta_logs_warning(
-    httpx_mock: HTTPXMock, provider_log: _LogRecorder
-) -> None:
-    """Responses flavor: a whitespace-only output_text delta is an empty completion."""
-    text_delta = {
-        "type": "response.output_text.delta",
-        "sequence_number": 1,
-        "item_id": "msg_test",
-        "output_index": 0,
-        "content_index": 0,
-        "delta": "  ",
-        "logprobs": [],
-    }
-    httpx_mock.add_response(
-        url=_BASE_URL + _ENDPOINT_PATH["responses"],
-        headers={"content-type": "text/event-stream"},
-        text=_responses_sse(text_delta, final=_responses_body([_output_text_item("  ")])),
-    )
-
-    await _handle(_provider("responses"), _claude_body(stream=True))
-
-    _assert_single_warning(provider_log, stream=True, finish_reason="completed")

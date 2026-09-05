@@ -28,12 +28,8 @@ class UpstreamError(Exception):
     Args:
         message: human-readable description.
         status_code: HTTP status returned to the client.
-        error_type: error type in Anthropic format. ``None`` derives it
-            from the status (``anthropic_error_type_for_status``), so every
-            renderer -- the JSON body, the SSE error event, the proxy's
-            failure path -- reports the same type for one error, and only a
-            classification the status cannot express (a context-length 400
-            remapped to ``invalid_request_error``) has to be spelled out.
+        error_type: error type in Anthropic format; ``None`` derives it
+            from the status (``anthropic_error_type_for_status``).
     """
 
     def __init__(
@@ -114,12 +110,8 @@ def stream_error_event(
     Args:
         status_code: HTTP status of the upstream error.
         message: human-readable message.
-        error_type: the Anthropic error type to render, when the caller
-            already knows it -- a ``ProviderError`` carries the one its
-            classification produced, and a context-length 400 remapped to
-            ``invalid_request_error`` must not degrade into the
-            ``api_error`` the status alone maps to. ``None`` derives the
-            type from the status, which is all a byte-for-byte proxy has.
+        error_type: the Anthropic error type the caller already knows;
+            ``None`` derives it from the status.
 
     Returns:
         An SSE string ``event: error\\ndata: {...}\\n\\n``.

@@ -1,55 +1,21 @@
 """Generate the Claude Code settings file that lists the router's fleet models.
 
-Run from the repository root -- ``.env`` and ``ROUTER_CONFIG_PATH`` are
-resolved relative to the working directory, exactly as under the launchd
-service (``settings.RoutingSettings``)::
+Run from the repository root: ``.env`` and ``ROUTER_CONFIG_PATH`` resolve
+relative to the working directory, as under the launchd service
+(``settings.RoutingSettings``)::
 
     PYTHONPATH=src .venv/bin/python -m cli.sync_client_config \\
         [--settings-path FILE] [--check]
 
     make sync-client-config
 
-Why this file exists: Claude Code's ``/model`` picker only discovers ids
-containing ``claude``/``anthropic``, so every fleet model the router serves
-is invisible to it. ``modelPicker.options`` (CLI v2.1.242+) lists arbitrary
-ids, but is read only from managed settings, ``--settings`` and user
-settings -- and ``~/.claude/settings.json`` is rewritten by the CLI itself
-during a session (``/model``, ``/effort``), so it is the wrong target. The
-generated file is a dedicated one, wired into the session with
-``claude --settings <file>``.
-
-The same file carries ``env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT
-= "1"``: Claude Code's proactive compaction assumes its own built-in window
-for an unrecognised model id, which has nothing to do with the real window
-of the deployment behind the router. Disabling it makes the router's
-``context_window`` pre-flight the only guard, so a model is offered only
-when its rule or its provider declares one. Recognised ``claude-*`` ids are
-unaffected -- the variable applies to unknown ids alone.
-
-Rows come from ``RoutingRule.client_models``, or from the match value of an
-``exact`` rule (``routing.schema.advertised_model_ids``); a non-exact rule
-with neither is skipped with a warning, because its match value is a
-pattern and not a model id -- one such rule must not cost every other model
-its picker row. Rules serving a ``passthrough`` provider are skipped too:
-the body is forwarded byte-for-byte, there is no window to publish and
-native ``claude-*`` ids are already in the picker.
-Each row's window and output cap are the EFFECTIVE ones for that rule --
-``RoutingRule.max_tokens_limit``/``context_window`` where set, the
-provider's values otherwise -- so two models sharing one gateway advertise
-their own limits.
-
-Only the routing configuration is loaded (``load_routing_config``), never
-``main.build_runtime``: listing models needs no provider keys, no CA
-bundles and no HTTP clients.
+See README, "Model picker and client settings".
 
 Exit codes:
 
 * 0 -- the settings file was written, or already matched;
-* 1 -- the routing configuration or the settings file cannot be used
-  (unparsable JSON, a directory or unreadable target, a model with no
-  effective ``context_window``, every rule skipped so that no model can be
-  listed at all, or the write itself failing); nothing is written, and a
-  failed write leaves the previous version in place;
+* 1 -- the routing configuration or the settings file cannot be used;
+  nothing is written and the previous version stays in place;
 * 3 -- ``--check`` only: the file is out of sync; the difference is printed
   and nothing is written.
 """
@@ -88,54 +54,21 @@ _MODEL_PICKER_KEY = "modelPicker"
 _OPTIONS_KEY = "options"
 
 
-def build_model_options(config: RoutingConfig) -> list[dict[str, str]]:
-    """Build the ``modelPicker.options`` rows for every routable fleet model.
-
-    Rows follow rule order, which is also resolution order, so the picker
-    reads like the routing table. A ``prefix``/``contains``/``regex`` rule
-    that names no ``client_models`` cannot be turned into rows -- its match
-    value is a pattern, not a model id -- so it is reported on stderr and
-    skipped; the other models keep their rows.
-
-    Args:
-        config: the validated routing configuration.
-
-    Returns:
-        One row per offered model: ``model``, ``label`` and a
-        ``description`` naming the provider and the EFFECTIVE window and
-        output cap of that model's own rule (the rule's overrides folded
-        onto the provider's values), so two models on one gateway show
-        their own numbers rather than a shared default.
-
-    Raises:
-        ConfigError: every rule that could have contributed rows was
-            skipped, so the picker would be empty; or an offered model has
-            no effective ``context_window`` (the client's own compaction is
-            disabled by this same settings file, so the router's pre-flight
-            would be the only guard -- and there would be none).
-    """
-    return _collect_model_options(config)[0]
-
-
-def _collect_model_options(
+def collect_model_options(
     config: RoutingConfig,
 ) -> tuple[list[dict[str, str]], int, list[str]]:
     """Build the picker rows, counting why each skipped rule contributed none.
 
-    One pass over the rules so the caller can explain a zero-model run
-    without re-classifying them. A rule that yields no row is either served
-    by a passthrough provider (its body is forwarded verbatim and the native
-    ``claude-*`` ids are already in the client's picker) or is a pattern
-    rule lacking ``client_models``; the two counts keep those causes apart.
+    Rows follow rule order, which is also resolution order, and carry the
+    EFFECTIVE window and output cap of their own rule.
 
     Args:
         config: the validated routing configuration.
 
     Returns:
-        A triple of (options, passthrough_count, skipped): the picker rows
-        (one per offered model), the number of rules served by a
-        passthrough provider, and the match descriptions of pattern rules
-        skipped for naming no ids.
+        A triple of (options, passthrough_count, skipped): the picker rows,
+        the number of rules served by a passthrough provider, and the match
+        descriptions of pattern rules skipped for naming no ids.
 
     Raises:
         ConfigError: every rule that could have contributed rows was
@@ -165,13 +98,9 @@ def _collect_model_options(
         limits = RouteLimits.resolve(provider, rule)
         if limits.context_window is None:
             raise ConfigError(
-                f"provider '{rule.provider}' serves {model_ids} but neither "
-                "the rule nor the provider declares a 'context_window'; the "
-                "generated settings file disables the client's compaction "
-                "for unknown model ids, so the router pre-flight is the only "
-                "guard left. Measure the deployment's window and set it on "
-                "the rule (per model) or on the provider (as its default), "
-                "or drop these models from 'client_models'"
+                f"provider '{rule.provider}' serves {model_ids} without a "
+                "context_window; the picker disables client-side compaction, "
+                "so set it on the rule or the provider"
             )
         description = (
             f"{rule.provider} -- window {limits.context_window}, "
@@ -190,37 +119,6 @@ def _collect_model_options(
     return options, passthrough_count, skipped
 
 
-def _zero_model_explanation(passthrough_count: int, skipped: list[str]) -> str:
-    """Explain a zero-model run, naming both causes so the empty picker reads clearly.
-
-    A rule contributes no row either because it is served by a passthrough
-    provider (the body is forwarded byte-for-byte and the native ``claude-*``
-    ids are already in the client's picker) or because it is a pattern rule
-    that names no ``client_models`` and was skipped with a warning. Counting
-    both keeps the single line accurate: it never claims "every rule is
-    passthrough" when a pattern rule was just reported as skipped.
-
-    Args:
-        passthrough_count: rules served by a passthrough provider.
-        skipped: match descriptions of pattern rules skipped for naming no ids.
-
-    Returns:
-        The sentence to print right after the ``0 models`` figure.
-    """
-    if not skipped:
-        cause = (
-            "every rule serves a passthrough provider whose native model "
-            "ids the client already lists"
-        )
-    else:
-        cause = (
-            f"{passthrough_count} rules serve a passthrough provider and "
-            f"{len(skipped)} pattern rules were skipped for naming no "
-            "'client_models'"
-        )
-    return f"{cause}; there is nothing to add to the picker"
-
-
 def read_settings(path: Path) -> tuple[str, dict[str, Any]]:
     """Read the settings file as raw text and as a parsed object.
 
@@ -232,9 +130,9 @@ def read_settings(path: Path) -> tuple[str, dict[str, Any]]:
         not exist yet.
 
     Raises:
-        ConfigError: the target is a directory, the file is not parsable
-            JSON, or it is not a JSON object -- overwriting any of those
-            would destroy something this command does not own.
+        ConfigError: the target is a directory, or its content is not a JSON
+            object -- overwriting either would destroy a file this command
+            does not own.
     """
     if path.is_dir():
         raise ConfigError(
@@ -248,9 +146,8 @@ def read_settings(path: Path) -> tuple[str, dict[str, Any]]:
         parsed = json.loads(text)
     except json.JSONDecodeError as exc:
         raise ConfigError(
-            f"settings file {path} is not valid JSON ({exc}); fix or remove "
-            "it -- refusing to overwrite a file that may hold hand-written "
-            "settings"
+            f"{path} is not valid JSON ({exc}); fix it or "
+            f"'mv {path} {path}.bak' and re-run"
         ) from exc
     if not isinstance(parsed, dict):
         raise ConfigError(f"settings file {path} must hold a JSON object")
@@ -268,7 +165,7 @@ def build_settings_document(
 
     Args:
         existing: the parsed settings file (empty for a new file).
-        options: the picker rows from :func:`build_model_options`.
+        options: the picker rows from :func:`collect_model_options`.
 
     Returns:
         The document to write.
@@ -299,29 +196,15 @@ def render_settings(document: dict[str, Any]) -> str:
 
 
 def write_settings(path: Path, text: str) -> None:
-    """Write the settings file atomically, through any symlink on the way.
-
-    The temporary file is created in the target directory so ``os.replace``
-    stays within one filesystem and the reader either sees the previous
-    version or the new one, never a half-written file. The path is resolved
-    first: ``os.replace`` on a symlink would replace the LINK with a regular
-    file, silently detaching the operator's real settings file.
-
-    An existing target keeps its permissions: ``tempfile`` creates the
-    replacement 0600, so without copying the mode over a regeneration would
-    silently tighten a file the operator may have made group-readable. A
-    failed write leaves nothing behind -- the temporary file is removed and
-    the previous version stays in place.
-
-    Args:
-        path: the settings file.
-        text: the rendered document.
+    """Write the settings file atomically; a failed write keeps the previous version.
 
     Raises:
         OSError: the temporary file cannot be written or moved into place.
     """
+    # os.replace on a symlink would replace the link
     target = path.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
+    # tempfile creates 0600; keep the operator's mode
     existing_mode = target.stat().st_mode & 0o777 if target.exists() else None
     # SIM115: the handle is closed by the ``with`` below; it is created
     # outside it so a failure after creation can still remove the file.
@@ -346,18 +229,7 @@ def write_settings(path: Path, text: str) -> None:
 
 
 def _object_section(document: dict[str, Any], key: str) -> dict[str, Any]:
-    """Return a copy of a top-level object section, creating it when absent.
-
-    Args:
-        document: the parsed settings file.
-        key: the section name.
-
-    Returns:
-        A mutable copy of the section.
-
-    Raises:
-        ConfigError: the key exists but does not hold an object.
-    """
+    """Return a mutable copy of a top-level object section, creating it when absent."""
     section = document.get(key, {})
     if not isinstance(section, dict):
         raise ConfigError(
@@ -368,16 +240,7 @@ def _object_section(document: dict[str, Any], key: str) -> dict[str, Any]:
 
 
 def _diff(current: str, wanted: str, path: Path) -> str:
-    """Render the difference between the file on disk and the wanted content.
-
-    Args:
-        current: the file's current text (empty when it does not exist).
-        wanted: the text this command would write.
-        path: the settings file, used for the diff headers.
-
-    Returns:
-        A unified diff without a trailing newline.
-    """
+    """Render the difference between the file on disk and the wanted content."""
     return "".join(
         difflib.unified_diff(
             current.splitlines(keepends=True),
@@ -389,11 +252,7 @@ def _diff(current: str, wanted: str, path: Path) -> str:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the command-line parser.
-
-    Returns:
-        The configured parser.
-    """
+    """Build the command-line parser."""
     parser = argparse.ArgumentParser(
         prog="cli.sync_client_config",
         description=(
@@ -431,14 +290,17 @@ def main(argv: list[str] | None = None) -> int:
     settings_path: Path = args.settings_path
     try:
         config = load_routing_config(Settings().routing.config_path)
-        options, passthrough_count, skipped = _collect_model_options(config)
+        options, passthrough_count, skipped = collect_model_options(config)
         current, existing = read_settings(settings_path)
         wanted = render_settings(build_settings_document(existing, options))
-        zero_model = (
-            f" -- {_zero_model_explanation(passthrough_count, skipped)}"
-            if not options
-            else ""
+        cause = (
+            f"{passthrough_count} rules serve a passthrough provider and "
+            f"{len(skipped)} pattern rules were skipped for naming no 'client_models'"
+            if skipped
+            else "every rule serves a passthrough provider whose native model "
+            "ids the client already lists"
         )
+        zero_model = "" if options else f" -- {cause}; there is nothing to add to the picker"
 
         if current == wanted:
             print(

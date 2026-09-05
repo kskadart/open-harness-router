@@ -225,7 +225,7 @@ providers:
   #   max_tokens_limit: 128000
   #   # api_flavor stays "chat": tools and reasoning coexist on
   #   # /v1/chat/completions, unlike the GPT-5.6 family above, so no
-  #   # Responses detour. reasoning_effort is deliberately left unset -- the
+  #   # Responses detour. reasoning_effort is left unset -- the
   #   # accepted values are per-model (grok-4.6 low..xhigh, grok-4.5
   #   # low..high, older models answer 400 for the parameter itself), and
   #   # this router only sends it on api_flavor: responses anyway.
@@ -264,43 +264,17 @@ providers:
 # Rules: top to bottom, first match wins.
 #
 # client_models (optional) lists the exact model ids a client may send for a
-# rule: the rows `make sync-client-config` writes into the /model picker and
-# the values that go into an agent's `model:` frontmatter. A
-# prefix/contains/regex match value is a PATTERN, not a model id -- sending
-# "gpt-" or "GLM" upstream verbatim is a vendor 404 -- so a rule of those
-# types can only be advertised through client_models. An exact rule needs no
-# list: its own match value is the id. Every entry is validated at startup to
-# match its own rule and to be reachable under first-match-wins (an id an
-# earlier rule also matches is a startup error).
+# rule -- the rows `make sync-client-config` writes into the /model picker. A
+# prefix/contains/regex match value is a PATTERN, not a model id, so only
+# client_models can advertise such a rule; an exact rule needs no list. Every
+# entry is checked at startup against its own rule and first-match-wins.
 #
-# max_tokens_limit and context_window (optional) override the provider's own
-# values for the models this rule serves; unset = the provider's value. This
-# is how ONE gateway serves SEVERAL models whose limits differ: keep a single
-# provider block with the shared base_url / api_key_env / ca_bundle /
-# extra_headers, give it the CONSERVATIVE pair as its default (so a model
-# added later is guarded before anyone probes it), and raise the numbers on
-# the rule of each model that was actually measured -- instead of copying the
-# provider block once per model. Both are startup errors on a rule pointing
-# at a passthrough provider (the body is forwarded byte-for-byte, so neither
-# the cap nor the pre-flight ever runs), and the EFFECTIVE pair must keep the
+# max_tokens_limit and context_window (optional) override the provider's values
+# for the models this rule serves (unset = the provider's), so one gateway block
+# serves several models whose limits differ. Both are startup errors on a rule
+# pointing at a passthrough provider, and the EFFECTIVE pair must keep the
 # provider's invariant: context_window greater than max_tokens_limit plus the
-# pre-flight reserve (512) plus the minimum useful completion budget (4096). Example
-# of the two-model shape:
-#   # provider: the gateway, with the safe defaults of its tightest model
-#   # gateway:
-#   #   type: openai-translate
-#   #   base_url: https://<gateway-host>/v1
-#   #   api_key_env: GATEWAY_KEY
-#   #   max_tokens_limit: 32000        # tightest model's cap
-#   #   context_window: 223680         # tightest model's window
-#   # - match: {type: exact, value: "gw-tight-model"}   # keeps the defaults
-#   #   provider: gateway
-#   #   upstream_model: <vendor>/<tight-model>
-#   # - match: {type: exact, value: "gw-wide-model"}    # probed, so raised
-#   #   provider: gateway
-#   #   upstream_model: <vendor>/<wide-model>
-#   #   max_tokens_limit: 65536
-#   #   context_window: 1048576
+# pre-flight reserve (512) plus the minimum useful completion budget (4096).
 rules:
   - match: {type: prefix, value: "claude-"}
     provider: anthropic
@@ -312,7 +286,7 @@ rules:
   #   provider: openai_compatible
   #   upstream_model: zai-org/GLM-5.2-FP8
   #   client_models: ["zai-org/GLM-5.2-FP8"]
-  # The "gpt-" prefix deliberately also covers OpenAI's codex models
+  # The "gpt-" prefix also covers OpenAI's codex models
   # (gpt-5-codex, gpt-5.1-codex, gpt-5.1-codex-mini, gpt-5.3-codex etc.):
   # same api.openai.com upstream with the same Responses API contract (only
   # /v1/responses, Chat Completions is not supported for codex models), no

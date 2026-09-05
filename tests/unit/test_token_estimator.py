@@ -9,7 +9,7 @@ token, 2 characters of an encrypted reasoning blob per token, 4 tokens per
 message, 8 per tool definition, 1600 per image, rounded up.
 
 The CJK and reasoning cases assert a band rather than an exact number: both
-rates are deliberately generous (the estimate must not fall below the real
+rates are generous (the estimate must not fall below the real
 count), so the tests pin the direction and the order of magnitude, leaving
 the rates themselves free to be re-calibrated.
 """

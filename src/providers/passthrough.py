@@ -363,14 +363,7 @@ class PassthroughProvider:
         upstream_model: str | None,
         limits: RouteLimits,
     ) -> ProviderResult:
-        """Proxy ``/v1/messages`` to the Anthropic-compatible upstream.
-
-        ``upstream_model`` and ``limits`` are ignored here: the body is
-        forwarded byte-for-byte, so there is no ``model`` field to rewrite
-        and no converted payload to cap or estimate. The schema rejects both
-        on a rule pointing at a passthrough provider, so neither can carry a
-        value an operator expected to take effect.
-        """
+        """Proxy /v1/messages; upstream_model and limits do not apply (verbatim body)."""
         return await self._proxy(_MESSAGES_PATH, raw_body, client_headers, client_channel)
 
     async def count_tokens(
@@ -380,12 +373,7 @@ class PassthroughProvider:
         upstream_model: str | None,
         limits: RouteLimits,
     ) -> ProviderResult:
-        """Proxy ``/v1/messages/count_tokens`` to the upstream's own endpoint.
-
-        ``upstream_model`` and ``limits`` are ignored for the same reason as
-        in ``handle_messages``: the count comes from the vendor, over the
-        body the client sent.
-        """
+        """Proxy ``/v1/messages/count_tokens`` to the upstream's own endpoint."""
         fwd = self._build_headers(client_headers)
         return await self._proxy_unary(_COUNT_TOKENS_PATH, raw_body, fwd)
 

@@ -1,30 +1,13 @@
 """Heuristic input-token estimate for OpenAI-compatible upstreams.
 
-Most OpenAI-compatible upstreams have no native count_tokens (the corporate
-gateway answers 404 on ``/tokenize``), so the router estimates over the
-CONVERTED wire payload -- the same dict that goes to /v1/chat/completions or
-/v1/responses -- and uses one heuristic for both ``count_tokens`` and the
-pre-flight context-window guard in ``providers.openai_translate``. For the
-passthrough provider (Anthropic) no estimate is needed: the request is
-proxied to the native ``/v1/messages/count_tokens``.
+Most have no native count_tokens, so the router estimates over the CONVERTED
+wire payload -- the dict sent to /v1/chat/completions or /v1/responses -- for
+both ``count_tokens`` and the context-window guard in
+``providers.openai_translate``; passthrough proxies the native endpoint.
 
-A character heuristic instead of a tokenizer: the fleet mixes tokenizers
-(MiniMax, DeepSeek, GLM, GPT), none of which ships with the router, and the
-guard only needs a safe upper bound. The divisors were calibrated on
-2026-09-04 through the live router against ``usage.input_tokens`` of
-MiniMax-M3 and DeepSeek-V4-Flash on three ~6000-character bodies (English
-prose; Python code plus six tool definitions; Russian prose): the estimate
-was above the measured count on all six samples, estimate/measured ratios
-1.10-1.33.
-
-Under-counting is the harmful direction -- it lets an oversized request
-through to an upstream that answers with a context-length 400 or, worse, a
-retried 500 -- so the two buckets the calibration could not cover are
-deliberately generous: CJK text (the samples were Latin and Cyrillic only,
-and CJK tokenizes far denser than Cyrillic) and the ``encrypted_content``
-of restored reasoning items (opaque, but counted through its length rather
-than skipped -- the upstream decrypts those items into the same context
-window the prompt lives in).
+Divisors calibrated 2026-09-04 against live ``usage.input_tokens``;
+over-counted on all samples (ratio 1.10-1.33). Under-counting is the harmful
+direction: it lets an oversized request reach the upstream.
 """
 
 from __future__ import annotations
@@ -34,10 +17,8 @@ import math
 import re
 from dataclasses import dataclass
 
-# Calibration of 2026-09-04 (module docstring): 3.5/2.0 kept every sample
-# over-estimated, so they were not lowered further. The non-ASCII divisor
-# was measured on Cyrillic and applies to every script except the CJK
-# ranges below, which are denser by a factor of two.
+# The non-ASCII divisor was measured on Cyrillic and applies to every script
+# except the CJK ranges below, which are denser by a factor of two.
 _ASCII_CHARS_PER_TOKEN = 3.5
 _NON_ASCII_CHARS_PER_TOKEN = 2.0
 # CJK characters cost about one token each on the fleet's tokenizers
@@ -55,14 +36,9 @@ _CJK_PATTERN = re.compile(
     "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\uff00-\uffef"
     "\U00020000-\U0002fa1f]"
 )
-# Characters of ``encrypted_content`` per token of the reasoning it stands
-# for. The blob is opaque, so the ratio is derived rather than measured:
-# it is base64 (4 characters per 3 ciphertext bytes) over an AEAD
-# ciphertext whose length tracks the plaintext reasoning trace, which at
-# the ASCII rate would be ~4.7 blob characters per token; if the upstream
-# compresses before encrypting (not observable from here), typical ~2x text
-# compression puts it near ~2.3. The value sits below both, so the estimate
-# errs high either way -- the direction this module requires.
+# Characters of ``encrypted_content`` per token of the reasoning it stands for:
+# base64 over an AEAD ciphertext; 2.0 sits below every plausible ratio, so the
+# estimate errs high.
 _REASONING_CHARS_PER_TOKEN = 2.0
 # Framing per message or input item (role, separators) and per tool
 # definition (the upstream renders the schema into its tool prompt).

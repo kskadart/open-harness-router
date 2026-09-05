@@ -41,26 +41,11 @@ class RoutingRule(BaseModel):
     """A routing rule: match -> provider (+ model substitution and limits).
 
     ``client_models`` lists the exact model ids a client may send for this
-    rule -- the rows the ``/model`` picker offers and the values that go
-    into an agent's ``model:`` frontmatter. It exists because a
-    ``prefix``/``contains``/``regex`` match value is a pattern, not a usable
-    model id: a rule matching ``prefix: "gpt-"`` cannot advertise itself as
-    ``gpt-``, which would reach the upstream verbatim and come back a 404.
-    An ``exact`` rule needs no list -- its match value already is the id,
-    and is checked as one. Empty by default;
-    ``RoutingConfig._validate_client_models`` checks that every advertised
-    id really lands on this rule under first-match-wins.
-
-    ``max_tokens_limit`` and ``context_window`` override the provider's own
-    values for the models this rule serves; ``None`` (the default) keeps the
-    provider's. One gateway usually hosts several models whose limits differ
-    -- one clamps an oversized completion budget, the next answers HTTP 500;
-    one is served on a 223K window, the next on a 1M one. Without the
-    override each of them needs its own provider block duplicating the same
-    ``base_url``, ``api_key_env``, ``ca_bundle`` and ``extra_headers``. Both
-    are rejected on a rule pointing at ``passthrough`` (no conversion, no
-    pre-flight -- ``RoutingConfig._validate_rule_limits``), which also holds
-    the provider's own invariant for the EFFECTIVE pair.
+    rule; an ``exact`` rule falls back to its own match value.
+    ``max_tokens_limit`` and ``context_window`` override the provider's
+    values for the models this rule serves; ``None`` keeps the provider's,
+    and both are rejected on a rule pointing at ``passthrough``. Checked by
+    ``RoutingConfig._validate_client_models`` and ``_validate_rule_limits``.
     """
 
     match: MatchRule
@@ -108,6 +93,16 @@ def minimum_context_window(max_tokens_limit: int) -> int:
         The value ``context_window`` must exceed.
     """
     return max_tokens_limit + CONTEXT_WINDOW_RESERVE_TOKENS + MIN_USEFUL_COMPLETION_TOKENS
+
+
+def _window_too_small_message(context_window: int, max_tokens_limit: int) -> str:
+    """Describe a window the completion cap, the reserve and the floor together fill."""
+    return (
+        "context_window must be greater than max_tokens_limit plus the pre-flight "
+        f"reserve plus the minimum completion budget (got context_window={context_window}, "
+        f"max_tokens_limit={max_tokens_limit}, reserve={CONTEXT_WINDOW_RESERVE_TOKENS}, "
+        f"minimum useful completion={MIN_USEFUL_COMPLETION_TOKENS})"
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -168,24 +163,10 @@ class ProviderCfg(BaseModel):
     rule on this provider; a rule may override it for its own models
     (``RoutingRule.max_tokens_limit``).
 
-    ``context_window`` -- the upstream model's total context size in
-    tokens (prompt plus completion). When set on an ``openai-translate``
-    provider, the converted request is estimated before dispatch: a prompt
-    that leaves less than ``MIN_USEFUL_COMPLETION_TOKENS`` of the window
-    (minus ``CONTEXT_WINDOW_RESERVE_TOKENS``) is rejected with an Anthropic-shaped
-    ``invalid_request_error`` carrying ``capability_rejected:
-    prompt_too_long``, otherwise the completion budget is clamped so the
-    two fit. Schema-optional, but required in practice for any model the
-    client can pick: ``cli.sync_client_config`` disables the client's own
-    window enforcement, so this pre-flight is the only guard left. Must
-    exceed ``max_tokens_limit`` plus ``CONTEXT_WINDOW_RESERVE_TOKENS`` plus
-    ``MIN_USEFUL_COMPLETION_TOKENS`` (``minimum_context_window``) -- a window the
-    completion cap, the reserve and the minimum completion together can
-    fill leaves no room for any prompt. Not applicable to ``passthrough`` (no
-    conversion, no estimate): an explicit value there is a startup error.
-    Like ``max_tokens_limit``, it is the default for every rule on this
-    provider and may be overridden per rule
-    (``RoutingRule.context_window``).
+    ``context_window`` -- the upstream model's total context (prompt plus
+    completion), for ``openai-translate`` only: it drives the pre-flight
+    estimate. Must exceed ``minimum_context_window(max_tokens_limit)``; a
+    rule may override it. See README, "Context window and token counting".
 
     ``tools_max`` -- the cap on the ``tools`` array size for openai-translate
     providers. OpenAI's hard limit is 128 elements; over that, extra MCP
@@ -330,47 +311,24 @@ class ProviderCfg(BaseModel):
     def _validate_context_window(self) -> ProviderCfg:
         """Reject ``context_window`` where it has no effect or cannot hold a prompt.
 
-        The pre-flight estimate only runs on ``openai-translate``
-        (``providers/openai_translate.py``); passthrough forwards the body
-        byte-for-byte and never sees a token count, so a value there is the
-        same "configured value that quietly does nothing" trap
-        ``_validate_passthrough_auth`` eliminates. Only a non-null value is
-        an error: an explicit ``context_window: null`` says "this provider
-        has no window", which is exactly what passthrough means, and
-        rejecting it would punish an operator for spelling out the default.
-        A window not greater than ``max_tokens_limit`` would reject every
-        request (the completion cap alone fills it), so it is a startup
-        error too.
-
-        Returns:
-            The validated configuration.
-
         Raises:
             ValueError: a non-null ``context_window`` on a
-                non-openai-translate provider, or one not greater than
-                ``max_tokens_limit``.
+                non-openai-translate provider, or one below
+                ``minimum_context_window``.
         """
         if self.context_window is None:
             return self
         if self.type != "openai-translate":
             raise ValueError(
                 "context_window only applies to openai-translate providers; "
-                f"remove it (type='{self.type}' forwards the request "
-                "byte-for-byte and never estimates tokens)"
+                f"remove it from type='{self.type}'"
             )
         if (
             self.max_tokens_limit is not None
             and self.context_window <= minimum_context_window(self.max_tokens_limit)
         ):
             raise ValueError(
-                "context_window must be greater than max_tokens_limit plus the "
-                "pre-flight reserve plus the minimum completion budget (got "
-                f"context_window={self.context_window}, "
-                f"max_tokens_limit={self.max_tokens_limit}, "
-                f"reserve={CONTEXT_WINDOW_RESERVE_TOKENS}, "
-                f"minimum useful completion={MIN_USEFUL_COMPLETION_TOKENS}); the three "
-                "together would fill the window and every prompt would be "
-                "rejected"
+                _window_too_small_message(self.context_window, self.max_tokens_limit)
             )
         return self
 
@@ -596,19 +554,10 @@ class RoutingConfig(BaseModel):
     def _validate_rule_limits(self) -> RoutingConfig:
         """Check the per-rule limit overrides against their provider.
 
-        Runs after ``_validate_references``, which has already rejected a
-        rule naming an unknown provider. Two invariants, both startup
-        errors for the same reason the provider-level ones are: a value
-        that quietly does nothing, or a pair no request can satisfy, is
-        only visible at runtime as a route that always fails.
-
-        Returns:
-            The validated configuration.
-
         Raises:
             ValueError: an override on a rule pointing at a passthrough
-                provider, or an effective ``context_window`` not greater
-                than the effective ``max_tokens_limit``.
+                provider, or an effective pair below
+                ``minimum_context_window``.
         """
         for position, rule in enumerate(self.rules):
             provider = self.providers[rule.provider]
@@ -621,10 +570,8 @@ class RoutingConfig(BaseModel):
                 raise ValueError(
                     f"rule #{position + 1} ('{rule.match.value}') -> provider "
                     f"'{rule.provider}': {overridden} not supported on "
-                    "passthrough (the request body is forwarded byte-for-byte, "
-                    "so neither the completion cap nor the context pre-flight "
-                    "ever runs and the value would quietly do nothing); drop "
-                    "the override or route to an openai-translate provider"
+                    "passthrough; drop the override or route to an "
+                    "openai-translate provider"
                 )
             limits = RouteLimits.resolve(provider, rule)
             if (
@@ -635,16 +582,10 @@ class RoutingConfig(BaseModel):
             ):
                 raise ValueError(
                     f"rule #{position + 1} ('{rule.match.value}') -> provider "
-                    f"'{rule.provider}': effective context_window must be "
-                    "greater than effective max_tokens_limit plus the "
-                    "pre-flight reserve plus the minimum completion budget "
-                    f"(got context_window={limits.context_window}, "
-                    f"max_tokens_limit={limits.max_tokens_limit}, "
-                    f"reserve={CONTEXT_WINDOW_RESERVE_TOKENS}, "
-                    f"minimum useful completion={MIN_USEFUL_COMPLETION_TOKENS}, rule "
-                    "overrides folded onto the provider's values); the three "
-                    "together would fill the window and every prompt would be "
-                    "rejected"
+                    f"'{rule.provider}': effective "
+                    + _window_too_small_message(
+                        limits.context_window, limits.max_tokens_limit
+                    )
                 )
         return self
 

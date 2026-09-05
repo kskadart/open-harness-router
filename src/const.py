@@ -112,15 +112,8 @@ CONTEXT_WINDOW_RESERVE_TOKENS: int = 512
 # converters apply to the client's ``max_tokens``.
 MIN_COMPLETION_TOKENS: int = 100
 
-# Smallest completion budget worth sending to a reasoning upstream, and the
-# floor the context-window pre-flight rejects below. Measured behaviour: a
-# reasoning model handed the ~1000 tokens a nearly full window leaves spends
-# them on reasoning and answers with empty ``content`` and ``stop_reason:
-# max_tokens`` -- a wasted round trip the client cannot act on. Rejecting
-# with ``prompt_too_long`` instead is what makes Claude Code compact and
-# retry. Deliberately far above ``MIN_COMPLETION_TOKENS``: that one only
-# bounds what the converters put on the wire, this one decides whether the
-# request is worth sending at all.
+# Floor for the context pre-flight: below this a reasoning upstream burns the
+# budget on reasoning and returns empty content, which the client cannot act on.
 MIN_USEFUL_COMPLETION_TOKENS: int = 4096
 
 

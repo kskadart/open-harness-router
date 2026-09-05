@@ -1,21 +1,4 @@
-"""Tests for context-window awareness of the openai-translate provider.
-
-Covers the pre-flight guard in ``handle_messages`` (reject when the prompt
-alone overflows the window, clamp the completion budget otherwise) on the
-non-streaming AND the streaming path, the estimator-backed ``count_tokens``
-with its silent tools cap, and the remap of upstream context-length 400s to
-the Anthropic-shaped ``invalid_request_error`` carrying the stable
-``capability_rejected: prompt_too_long`` token. Wire bodies are captured
-with pytest-httpx on top of a real ``AsyncOpenAI`` (same pattern as
-``test_openai_translate_stream_flag``).
-
-Log events are asserted through a recorder substituted for the provider
-module's logger rather than ``structlog.testing.capture_logs``: once an
-earlier test has run ``setup_logging()`` (``cache_logger_on_first_use``),
-the module-level lazy logger proxy keeps its cached processor chain and a
-later ``capture_logs`` sees nothing, so the assertions would depend on
-test order.
-"""
+"""Tests for context-window awareness of the openai-translate provider."""
 
 from __future__ import annotations
 
@@ -136,7 +119,14 @@ class _ConnectedChannel:
 
 
 class _LogRecorder:
-    """Stand-in for the provider module logger that records structlog-style events."""
+    """Stand-in for the provider module logger that records structlog-style events.
+
+    Used instead of ``structlog.testing.capture_logs``: once an earlier test
+    has run ``setup_logging()`` (``cache_logger_on_first_use``), the
+    module-level lazy logger proxy keeps its cached processor chain and a
+    later ``capture_logs`` sees nothing, so assertions would depend on test
+    order.
+    """
 
     def __init__(self) -> None:
         self.events: list[dict[str, Any]] = []
@@ -625,13 +615,7 @@ async def test_handle_messages_rule_without_overrides_keeps_the_provider_limits(
 
 
 async def test_count_tokens_with_a_rule_override_estimates_the_same_converted_prompt() -> None:
-    """``count_tokens`` runs the builder under the route's effective limits.
-
-    The estimate covers the prompt only -- the completion budget is not part
-    of the wire payload's token cost -- so the number is the one the
-    provider's own limits produce; what the override must not do is change
-    the payload the estimate is taken over.
-    """
+    """``count_tokens`` estimates the same prompt whether or not the rule overrides limits."""
     count_body: dict[str, Any] = {
         "model": "claude-sonnet-4",
         "messages": [{"role": "user", "content": "List the files in src."}],
