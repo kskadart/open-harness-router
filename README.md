@@ -128,6 +128,25 @@ whole router, not just itself):
   it happened to carry a stray `ca_bundle`. Remove `ca_bundle` from any
   passthrough provider that doesn't actually sit behind a private CA.
 
+Three new rule-level validators can break an existing config at startup
+when a rule no longer satisfies them. Each error names the offending rule
+and how to fix it; as above, one bad rule blocks the whole router:
+
+- Every model id a rule advertises -- its `client_models` entries and, for
+  an `exact` rule, its own match value -- is now checked against the rules
+  above it. An `exact` rule whose id an earlier
+  `prefix`/`contains`/`regex` rule already captures used to load silently
+  and never match; it is now a startup error naming both rules. Same for an
+  id listed in two rules. Move the exact rule above the broader one, or
+  delete it.
+- Rule-level `max_tokens_limit` and `context_window` are now only allowed
+  on rules that point at an `openai-translate` provider; on a `passthrough`
+  rule they are a startup error, like `upstream_model` already was.
+- `context_window`, where set, must exceed `max_tokens_limit` plus
+  `CONTEXT_WINDOW_RESERVE_TOKENS` (512) plus `MIN_USEFUL_COMPLETION_TOKENS`
+  (4096); a smaller window is a startup error because no request could ever
+  fit. Only configs that set the new field are affected.
+
 Required variable: `ROUTER_CONFIG_PATH` (path to `routing.yaml`).
 Provider secrets are set via environment variables whose names are declared in
 `routing.yaml` (`api_key_env`).
@@ -371,7 +390,7 @@ tail -f ~/Library/Logs/open-harness-router.log | jq 'select(.event == "startup")
 
 ```json
 {"match_type": "prefix", "match_value": "claude-", "provider": "anthropic"}
-{"match_type": "exact", "match_value": "ag-GLM-5.2-FP8", "provider": "openai_compatible", "upstream_model": "zai-org/GLM-5.2-FP8", "max_tokens_limit": 65536, "context_window": 206650}
+{"match_type": "contains", "match_value": "GLM", "provider": "openai_compatible", "upstream_model": "zai-org/GLM-5.2-FP8", "max_tokens_limit": 65536, "context_window": 206650}
 {"match_type": "default", "provider": "anthropic"}
 ```
 
@@ -655,7 +674,19 @@ Key fields:
 - `StandardOutPath` / `StandardErrorPath` -- stdout and stderr go to separate
   files.
 
-Management (current `bootstrap`/`bootout` syntax, the `gui/<uid>` domain of
+First save the plist above to `~/Library/LaunchAgents/<your label>.plist`,
+replacing the placeholder `com.example.open-harness-router` label and the
+`/path/to/...` program path with the real values. Then open the LaunchAgent:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.open-harness-router.plist
+```
+
+Put the same label into a `.launchd-label` file at the repository root (one
+line, gitignored): the add-provider skill's restart script looks the service up
+by that label.
+
+For management (current `bootstrap`/`bootout` syntax, the `gui/<uid>` domain of
 the user session):
 
 ```bash
@@ -783,7 +814,7 @@ OAuth). Billing runs against the subscription, no per-token charges.
 ```bash
 env -u ANTHROPIC_API_KEY \
   ANTHROPIC_BASE_URL=http://127.0.0.1:8787 \
-  CLAUDE_CODE_SUBAGENT_MODEL=ag-GLM-5.2-FP8 \
+  CLAUDE_CODE_SUBAGENT_MODEL=zai-org/GLM-5.2-FP8 \
   claude
 ```
 
@@ -792,7 +823,9 @@ Anthropic via the subscription), subagents run on the model from
 `CLAUDE_CODE_SUBAGENT_MODEL` (e.g. GLM via the corporate-gateway template,
 see "Configuration" -- the provider and rule need to be uncommented). For
 per-agent control, instead of the global variable you can set `model:` in
-the frontmatter of individual agents under `.claude/agents/*.md`.
+the frontmatter of individual agents under `.claude/agents/*.md`. That directory
+and its files are your own Claude Code configuration, not part of this
+repository -- create them yourself if they don't exist yet.
 
 A limitation of the CLI itself: as long as `ANTHROPIC_BASE_URL` doesn't point
 at `api.anthropic.com`, Remote Control is unavailable (as of v2.1.196). This
