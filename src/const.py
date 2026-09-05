@@ -101,6 +101,28 @@ UPSTREAM_REQUEST_FAILED_MESSAGE: str = "Upstream request failed. Retry the reque
 UPSTREAM_REQUEST_TIMEOUT_MESSAGE: str = "Upstream request timed out. Retry the request."
 UPSTREAM_STREAM_INTERRUPTED_MESSAGE: str = "Upstream stream interrupted. Retry the request."
 
+# Context-window guard for openai-translate providers that set
+# ``context_window``. The reserve absorbs what the character heuristic in
+# ``services.token_estimator`` cannot see (chat-template tokens, tool-call
+# framing, upstream-side additions), so the effective budget is
+# ``context_window - CONTEXT_WINDOW_RESERVE_TOKENS``.
+CONTEXT_WINDOW_RESERVE_TOKENS: int = 512
+
+# Smallest completion budget the router asks an upstream for: the floor the
+# converters apply to the client's ``max_tokens``.
+MIN_COMPLETION_TOKENS: int = 100
+
+# Smallest completion budget worth sending to a reasoning upstream, and the
+# floor the context-window pre-flight rejects below. Measured behaviour: a
+# reasoning model handed the ~1000 tokens a nearly full window leaves spends
+# them on reasoning and answers with empty ``content`` and ``stop_reason:
+# max_tokens`` -- a wasted round trip the client cannot act on. Rejecting
+# with ``prompt_too_long`` instead is what makes Claude Code compact and
+# retry. Deliberately far above ``MIN_COMPLETION_TOKENS``: that one only
+# bounds what the converters put on the wire, this one decides whether the
+# request is worth sending at all.
+MIN_USEFUL_COMPLETION_TOKENS: int = 4096
+
 
 class Constants:
     """String constants for the Anthropic/OpenAI protocols."""

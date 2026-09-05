@@ -491,3 +491,18 @@ def test_assistant_text_and_reasoning_both_precede_the_function_call() -> None:
         "function_call",
         "function_call_output",
     ]
+
+
+def test_trailing_system_role_message_after_tool_result_stays_system_in_input() -> None:
+    """The Responses converter keeps a closing system message as-is (the chat flavor does not)."""
+    request = _build_request(
+        messages=[*_tool_cycle_messages(), {"role": "system", "content": "be brief"}]
+    )
+    result = _convert(request)
+    assert [item.get("type") or item["role"] for item in result["input"]] == [
+        "user",
+        "function_call",
+        "function_call_output",
+        "system",
+    ]
+    assert result["input"][-1] == {"role": "system", "content": "be brief"}
