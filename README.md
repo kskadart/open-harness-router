@@ -263,25 +263,23 @@ make sync-client-config
   with every bundle in `certs/`: it prints `REUSE certs/<name>` (exit 0)
   when one bundle already contains all of them, otherwise the `cat` command
   that would create a new one (exit 10), and exits 2 when an input cannot be
-  read or holds no certificate. It never writes a file itself. stdout
-  carries only `REUSE`, the `cat` command and the certificate inventory;
-  every `WARNING:` line goes to stderr, and when the reused bundle is wider
-  than the input the extra certificates it carries (subject, notAfter,
-  sha256) are named on stderr -- the new provider will trust those too.
-  Neither subcommand uses exit 1 -- that is the status Python gives an
-  uncaught exception, so a crash can never be read as a result.
+  read or holds no certificate. It never writes a file itself. Every
+  `WARNING:` line goes to stderr, including the certificates (subject,
+  notAfter, sha256) a reused bundle carries beyond the input -- the new
+  provider will trust those too. Neither subcommand uses exit 1 -- that is
+  the status Python gives an uncaught exception, so a crash can never be
+  read as a result.
 - `cli.tls_probe probe` performs one TLS handshake with exactly the trust
   store the router would use for that provider (`httpx.create_ssl_context`
   over `build_upstream_verify` in `src/services/http_transport.py`, not a
   default context whose roots depend on the interpreter build), and builds
   it with `trust_env=False` exactly as the router's own transport does, so
-  `SSL_CERT_FILE` and `SSL_CERT_DIR` in the shell cannot move the verdict:
-  the probe has to answer for the trust store the service has, not for the
-  operator's shell. That is what separates a host-name mismatch from a
-  broken chain: `CHAIN_OK_HOSTNAME_OK` (exit 0) needs nothing beyond
-  `ca_bundle`, `BUNDLE_UNUSABLE` (2) means the `--cafile` bundle could not
-  be loaded and no handshake was attempted,
-  `CHAIN_OK_HOSTNAME_MISMATCH` (11) is the only case that justifies
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` in the shell cannot move the verdict.
+  That is what separates a host-name mismatch from a broken chain:
+  `CHAIN_OK_HOSTNAME_OK` (exit 0) needs nothing beyond `ca_bundle`,
+  `BUNDLE_UNUSABLE` (2) means the `--cafile` bundle could not be loaded and
+  no handshake was attempted, `CHAIN_OK_HOSTNAME_MISMATCH` (11) is the only
+  case that justifies
   `tls_verify_hostname: false`, `CHAIN_FAIL` (12) means wrong or incomplete
   certificates, and `CONNECT_FAIL` (13) means there was no TLS session at
   all (DNS, VPN, port, firewall).
@@ -305,13 +303,14 @@ a gitignored `.launchd-label` file at the repository root (its first
 non-blank line) -> the placeholder; without either, a zero-argument run
 exits 65 with a hint naming the file. On timeout -- or on a startup error
 in the error log (`open-harness-router: ...` line or a traceback), still
-only when `--routing-backup` was given -- it copies the backup back over
-`routing.yaml`, restarts again and exits 1 (0 -- healthy on the new config,
-2 -- down, empty `.launchd-label`, or rollback impossible, 64 -- not macOS,
-65 -- the service is not loaded in the user's launchd domain). This restart
-step is launchd-only: on any other OS the script exits with code 64 and a
-systemd hint, so on Linux restart the service by hand and point `OHR_ERR_LOG`
-at your own log.
+only when `--routing-backup` was given -- it keeps the rejected config as
+`routing.yaml.failed-<epoch>`, copies the backup back over `routing.yaml`,
+restarts again and exits 1 (0 -- healthy on the new config, 2 -- bad
+arguments, an empty `.launchd-label`, the service down, or rollback
+impossible, 64 -- not macOS, 65 -- the service is not loaded in the user's
+launchd domain). This restart step is launchd-only: on any other OS the
+script exits with code 64 and a systemd hint, so on Linux restart the
+service by hand and point `OHR_ERR_LOG` at your own log.
 `OHR_HEALTH_TIMEOUT_S` bounds the wait in wall-clock seconds. Only the
 top-level session should run it, and only with no subagents in flight:
 during a Bash call the session itself holds no open stream, but a running
@@ -443,11 +442,7 @@ Fields of an `openai-translate` provider (`ProviderCfg`,
 - `context_window` -- optional, the deployment's total context in tokens
   (prompt plus completion). Must be greater than `max_tokens_limit` plus
   `CONTEXT_WINDOW_RESERVE_TOKENS` (512) plus `MIN_USEFUL_COMPLETION_TOKENS`
-  (4096) -- the same floor the pre-flight uses -- and an explicit value on
-  `passthrough` is a startup error. Unset -- no token estimate and no
-  pre-flight, requests go upstream unchanged. Set -- turns on the overflow
-  guard described in "Context window and token counting" below. Like
-  `max_tokens_limit`, it is a default a rule may override per model.
+  (4096). See "Context window and token counting" below.
 - `drop_params` -- which top-level request parameters to strip before
   sending (only `temperature`, `top_p`, `stop` are allowed); needed when the
   upstream errors out on an unsupported parameter instead of silently
@@ -477,9 +472,8 @@ model's total context size in tokens, prompt plus completion. Optional and
 error (the body is forwarded byte-for-byte and never estimated), and the
 value must be greater than `max_tokens_limit` plus
 `CONTEXT_WINDOW_RESERVE_TOKENS` (512) plus `MIN_USEFUL_COMPLETION_TOKENS`
-(4096) -- otherwise the completion cap alone, with the reserve, fills the
-window and every prompt would be rejected. Unset means no estimate and no
-pre-flight: the request goes upstream exactly as before.
+(4096). Unset means no estimate and no pre-flight: the request goes
+upstream exactly as before.
 
 The number the guard actually uses is the EFFECTIVE one for the resolved
 route: `RoutingRule.context_window` where the matching rule sets it, the
@@ -490,32 +484,22 @@ serve several models with different windows from a single provider block --
 the conservative pair on the provider, the measured one on the rule of each
 model that was probed.
 
-That is safe only while the client still guards the window itself, which is
-a precondition the client configuration below removes.
 `make sync-client-config` writes
 `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` (see "Model picker
-and client settings"), so Claude Code stops compacting proactively against
-its own assumed window for a model id it does not recognise -- which is
-every id the router serves. From then on the router's pre-flight is the
-only guard, and an `openai-translate` model with no effective
-`context_window` (neither on its rule nor on its provider) has no guard at
-all: the oversized prompt goes upstream, and an upstream that answers an
-overflow with an opaque 5xx instead of a context-length 400 is simply
-retried. `cli.sync_client_config` refuses to advertise such a model for
-exactly this reason. While the deployment's
-real window is unknown, measure it before offering the model -- a guessed
-value that is too large protects nothing, one that is too small rejects
-working requests.
+and client settings"), so from then on the router's pre-flight is the only
+guard: an `openai-translate` model with no effective `context_window`
+(neither on its rule nor on its provider) has none at all, which is why
+`cli.sync_client_config` refuses to advertise such a model.
 
 Set it to the deployment's real limit, not the model card's: a serving
 stack such as vLLM caps at its `max_model_len`, which is often lower than
 the architecture allows. Ways to find it: the model's entry in the
 upstream's `/v1/models` (fields such as `max_model_len` or
 `context_length`, when the upstream exposes them), the vendor's
-documentation, or the upstream's own error text on a deliberately
-oversized request (an OpenAI-compatible context-length 400 usually names
-the limit). `/add-provider` (`.claude/skills/add-provider`) walks through
-this as part of its guided procedure.
+documentation, or the upstream's own error text on an oversized test
+request (an OpenAI-compatible context-length 400 usually names the limit).
+`/add-provider` (`.claude/skills/add-provider`) walks through this as part
+of its guided procedure.
 
 `POST /v1/messages/count_tokens` is served per provider type
 (`src/api/count_tokens.py`):
@@ -525,20 +509,9 @@ this as part of its guided procedure.
 - `openai-translate` -- estimated locally
   (`src/services/token_estimator.py`), since most OpenAI-compatible
   upstreams have no count endpoint. The count request goes through the
-  same request builder as `/v1/messages`, so the estimate is taken over
-  the exact converted wire payload -- capped tools, tool definitions,
-  tool-call arguments and tool results included -- for either
-  `api_flavor`; images cost a fixed amount with their base64 data
-  excluded, and cached reasoning items are counted by the length of their
-  encrypted payload at a generous rate. It is a character heuristic (ASCII
-  and non-ASCII characters at different rates, with a separate CJK bucket
-  at one character per token -- CJK symbols and punctuation, Hiragana,
-  Katakana, Han, Hangul and the fullwidth/halfwidth forms CJK input methods
-  produce -- plus per-message and per-tool overheads), not a tokenizer: the
-  fleet mixes tokenizers and the guard only needs a safe upper bound.
-  Calibrated 2026-09-04 against `usage.input_tokens` of two fleet models
-  on three bodies each: the estimate landed 1.10-1.33 times above the real
-  count on every sample, so it over-counts slightly on purpose.
+  same request builder as `/v1/messages`, so it is a character heuristic
+  over the exact converted wire payload, calibrated 2026-09-04 against
+  `usage.input_tokens` of two fleet models to over-count by 1.10-1.33.
 
 Overflow behaviour when `context_window` is set
 (`OpenAITranslateProvider._enforce_context_window`,
@@ -549,11 +522,8 @@ before any upstream call:
   `src/const.py`; the reserve absorbs what the heuristic cannot see --
   chat-template tokens, tool-call framing, upstream-side additions);
 - if the estimated prompt leaves less than `MIN_USEFUL_COMPLETION_TOKENS`
-  (4096, `src/const.py`; the smallest completion budget worth sending to a
-  reasoning upstream -- a smaller one is spent on reasoning and comes back
-  as empty content with `stop_reason: max_tokens`, which the client cannot
-  act on) of that budget, the request is rejected without calling the
-  upstream:
+  (4096, `src/const.py`) of that budget, the request is rejected without
+  calling the upstream:
   HTTP 400 `invalid_request_error` with the message `prompt is too long:
   <N> tokens > <M> maximum (capability_rejected: prompt_too_long)`, and a
   `context_window_reject` log event (`provider`, `model`, `estimate`,
@@ -871,21 +841,17 @@ The command (`src/cli/sync_client_config.py`, also runnable as
 
 - `modelPicker.options` -- one row per offered model, labelled with its
   provider and the effective context window and output cap of that model's
-  own rule (so two models sharing a provider advertise their own limits). The ids come from the rule's
-  `client_models`, or from the match value of an `exact` rule; a
-  `prefix`/`contains`/`regex` rule without `client_models` is skipped with
-  a warning naming the rule, because its match value is a pattern and not a
-  model id (`gpt-` sent upstream verbatim is a vendor 404) -- the run fails
-  only when no model can be listed at all. Rules serving a `passthrough`
-  provider are skipped -- native `claude-*` ids are already in the picker.
+  own rule (so two models sharing a provider advertise their own limits). A
+  `prefix`/`contains`/`regex` rule without `client_models` is skipped with a
+  warning naming the rule, and the run fails only when no model can be
+  listed at all. Rules serving a `passthrough` provider are skipped --
+  native `claude-*` ids are already in the picker.
 - `env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` = `"1"` --
   without it, Claude Code compacts proactively against the window it assumes
   for an unrecognised model id, which has nothing to do with the real window
   of the deployment behind the router. The variable applies to unrecognised
-  ids only, so `claude-*` sessions keep their normal compaction; per-model
-  windows come from `context_window` in `routing.yaml` -- on the rule, or on
-  its provider as the default -- and are enforced by the router's pre-flight
-  (see "Context window and token counting").
+  ids only, so `claude-*` sessions keep their normal compaction (see
+  "Context window and token counting").
 
 Every other key in the file is preserved -- at the top level and inside
 `env`/`modelPicker`, so a hand-set `modelPicker.replaceBuiltInOptions`
@@ -893,9 +859,8 @@ survives a regeneration. The write is atomic (temporary file plus
 `os.replace`), keeps the file's previous permission mode, and leaves the
 previous version intact if the write fails; an unparsable file is a refusal
 rather than an overwrite. `--check` reports whether the file matches
-`routing.yaml` without writing
-anything (exit 3 when it does not), and `--settings-path` targets a different
-file.
+`routing.yaml` without writing anything (exit 3 when it does not), and
+`--settings-path` targets a different file.
 
 Wire the file into the session -- it takes effect in a new session only:
 
