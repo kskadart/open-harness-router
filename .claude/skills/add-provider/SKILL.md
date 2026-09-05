@@ -177,6 +177,8 @@ with probe exit 11 the system curl cannot do chain-only verification: use
 
 ### 6. `max_tokens_limit` and `context_window` (openai-translate only)
 
+see README, "Context window and token counting"
+
 Two numbers PER MODEL: the output cap (6a), then the deployment's total
 window (6b). They live on the provider as its defaults (used by every rule
 that does not override them) and on each rule that needs its own pair -- so
