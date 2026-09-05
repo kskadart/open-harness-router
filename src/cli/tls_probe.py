@@ -17,6 +17,12 @@ Inputs that live under ``proxy-ca/`` (the forward-proxy MITM CA directory,
 ``settings.ProxySettings.ca_dir``) get a warning: copy from there, never
 write there.
 
+A bundle wider than the input is still reused -- that is the point of the
+subcommand -- but every certificate it carries beyond the input is named,
+because the new provider ends up trusting those CAs too. Warnings and
+errors go to stderr, so the ``REUSE``/``cat`` lines on stdout stay
+machine-readable.
+
 ``probe`` performs one TLS handshake with exactly the trust store the
 router would use for the provider: ``httpx.create_ssl_context`` over
 ``services.http_transport.build_upstream_verify``, the same pair every
@@ -46,7 +52,6 @@ verdict:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import re
 import socket
 import ssl
@@ -58,7 +63,7 @@ from pathlib import Path
 
 import httpx
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes
 
 from services.http_transport import build_upstream_verify
 
@@ -171,20 +176,6 @@ def split_pem_certificates(text: str) -> list[str]:
     return _PEM_CERTIFICATE_BLOCK.findall(text)
 
 
-def sha256_fingerprint(der: bytes) -> str:
-    """Format the SHA-256 fingerprint of a DER-encoded certificate.
-
-    Args:
-        der: the certificate in DER encoding.
-
-    Returns:
-        The digest as colon-separated upper-case hex pairs, the way
-        ``openssl x509 -fingerprint -sha256`` prints it.
-    """
-    digest = hashlib.sha256(der).hexdigest().upper()
-    return ":".join(digest[index : index + 2] for index in range(0, len(digest), 2))
-
-
 def summarize_certificate(certificate: x509.Certificate) -> CertificateSummary:
     """Extract fingerprint, names and expiry from a parsed certificate.
 
@@ -199,8 +190,10 @@ def summarize_certificate(certificate: x509.Certificate) -> CertificateSummary:
         dns_names = tuple(san.value.get_values_for_type(x509.DNSName))
     except x509.ExtensionNotFound:
         dns_names = ()
+    # Colon-separated pairs, the way `openssl x509 -fingerprint -sha256` prints it.
+    digest = certificate.fingerprint(hashes.SHA256()).hex().upper()
     return CertificateSummary(
-        fingerprint=sha256_fingerprint(certificate.public_bytes(serialization.Encoding.DER)),
+        fingerprint=":".join(digest[index : index + 2] for index in range(0, len(digest), 2)),
         subject=certificate.subject.rfc4514_string(),
         issuer=certificate.issuer.rfc4514_string(),
         not_after=certificate.not_valid_after_utc.date().isoformat(),
@@ -272,6 +265,26 @@ def find_reusable_bundle(
     return min(candidates, key=lambda name: (len(bundles[name]), name))
 
 
+def extra_certificates(bundle: Path, wanted: frozenset[str]) -> list[CertificateSummary]:
+    """Summarize the certificates a bundle holds beyond the wanted ones.
+
+    Args:
+        bundle: the bundle picked for reuse.
+        wanted: fingerprints of the input certificates.
+
+    Returns:
+        Summaries of the bundle's certificates whose fingerprint is not in
+        ``wanted``, in file order.
+    """
+    return [
+        summary
+        for summary in (
+            summarize_certificate(certificate) for certificate in load_certificates(bundle)
+        )
+        if summary.fingerprint not in wanted
+    ]
+
+
 def is_inside_directory(path: Path, directory: Path) -> bool:
     """Check whether ``path`` lives under ``directory`` (after resolving both).
 
@@ -283,6 +296,30 @@ def is_inside_directory(path: Path, directory: Path) -> bool:
         True when the resolved path is inside the resolved directory.
     """
     return path.resolve().is_relative_to(directory.resolve())
+
+
+def _warn_about_extra_certificates(bundle: Path, wanted: frozenset[str]) -> None:
+    """Name the CAs a reused bundle adds to the provider's trust store.
+
+    Reuse is what the skill asks for, but a bundle that is a strict superset
+    of the input makes the new provider trust CAs it never asked for, and
+    only the operator can decide whether that is acceptable.
+
+    Args:
+        bundle: the bundle picked for reuse.
+        wanted: fingerprints of the input certificates.
+    """
+    extras = extra_certificates(bundle, wanted)
+    if not extras:
+        return
+    print(
+        f"WARNING: {bundle} holds {len(extras)} certificate(s) beyond the input; reusing it "
+        "makes this provider trust them as well:",
+        file=sys.stderr,
+    )
+    for extra in extras:
+        print(f"    subject={extra.subject}  notAfter={extra.not_after}", file=sys.stderr)
+        print(f"    sha256={extra.fingerprint}", file=sys.stderr)
 
 
 def run_match(
@@ -299,7 +336,8 @@ def run_match(
         provider: provider name used in the suggested bundle file name.
 
     Returns:
-        ``EXIT_MATCH_REUSE`` when an existing bundle covers the input,
+        ``EXIT_MATCH_REUSE`` when an existing bundle covers the input (its
+        certificates beyond the input are named on stderr),
         ``EXIT_MATCH_NEW_BUNDLE`` when a new bundle is needed (the command
         is printed, not executed), ``EXIT_MATCH_ERROR`` when an input file
         holds no certificate or cannot be read and parsed.
@@ -321,7 +359,8 @@ def run_match(
             print(
                 f"WARNING: {cert_path} lives under {proxy_ca_dir}/ -- the forward-proxy "
                 "MITM CA directory (settings.ProxySettings.ca_dir): copy from it, never "
-                "write into it or delete its rootCA*.pem"
+                "write into it or delete its rootCA*.pem",
+                file=sys.stderr,
             )
         for certificate in certificates:
             summary = summarize_certificate(certificate)
@@ -339,7 +378,9 @@ def run_match(
     print(f"bundles in {certs_dir}/: {inventory or '<none>'}")
     reusable = find_reusable_bundle(frozenset(wanted), bundles)
     if reusable is not None:
-        print(f"REUSE {certs_dir / reusable}")
+        reused_bundle = certs_dir / reusable
+        print(f"REUSE {reused_bundle}")
+        _warn_about_extra_certificates(reused_bundle, frozenset(wanted))
         return EXIT_MATCH_REUSE
     inputs = " ".join(str(cert_path) for cert_path in cert_paths)
     print(
@@ -395,10 +436,7 @@ def _handshake(host: str, port: int, context: ssl.SSLContext) -> CertificateSumm
         context.wrap_socket(tcp_socket, server_hostname=host) as tls_socket,
     ):
         der = tls_socket.getpeercert(binary_form=True)
-    if der is None:
-        # CERT_REQUIRED guarantees a peer certificate once the handshake
-        # completed; this only narrows the Optional for the type checker.
-        raise ssl.SSLError("handshake completed without a peer certificate")
+    assert der is not None, "CERT_REQUIRED: a completed handshake always has a peer certificate"
     return summarize_certificate(x509.load_der_x509_certificate(der))
 
 

@@ -31,6 +31,7 @@ from cli.tls_probe import (
     Verdict,
     build_probe_context,
     bundle_fingerprints,
+    extra_certificates,
     find_reusable_bundle,
     fingerprint_set,
     load_certificates,
@@ -467,6 +468,44 @@ def test_run_match_inputs_covered_by_bundle_prints_reuse_and_returns_0(
     assert exit_code == EXIT_MATCH_REUSE
     assert f"REUSE {certs_dir / 'pair_bundle.pem'}" in captured.out
     assert "WARNING" not in captured.out
+    assert "WARNING" not in captured.err
+
+
+def test_run_match_reused_bundle_wider_than_the_input_names_the_extra_certificates(
+    certs_dir: Path, second_ca_path: Path, proxy_ca_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reusing a superset bundle widens the provider's trust, so the extras are named."""
+    exit_code = run_match([second_ca_path], certs_dir, proxy_ca_dir, _PROVIDER_NAME)
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_MATCH_REUSE
+    assert f"REUSE {certs_dir / 'pair_bundle.pem'}" in captured.out
+    assert "1 certificate(s) beyond the input" in captured.err
+    assert f"CN={_TEST_CA_COMMON_NAME}" in captured.err
+    assert _SECOND_CA_COMMON_NAME not in captured.err
+
+
+def test_run_match_reused_bundle_equal_to_the_input_reports_no_extra_certificates(
+    certs_dir: Path, proxy_ca_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A bundle holding exactly the input adds no trust, so nothing is flagged."""
+    exit_code = run_match([_TEST_CA_PEM_PATH], certs_dir, proxy_ca_dir, _PROVIDER_NAME)
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_MATCH_REUSE
+    assert f"REUSE {certs_dir / 'single_ca.pem'}" in captured.out
+    assert "beyond the input" not in captured.err
+
+
+def test_extra_certificates_lists_only_what_the_bundle_adds(
+    certs_dir: Path, second_ca_path: Path
+) -> None:
+    """The extras are the bundle's certificates whose fingerprint is not an input."""
+    wanted = fingerprint_set(load_certificates(second_ca_path))
+
+    extras = extra_certificates(certs_dir / "pair_bundle.pem", wanted)
+
+    assert [summary.subject for summary in extras] == [f"CN={_TEST_CA_COMMON_NAME}"]
 
 
 def test_run_match_no_bundle_covers_inputs_prints_cat_command_and_returns_10(
@@ -483,10 +522,10 @@ def test_run_match_no_bundle_covers_inputs_prints_cat_command_and_returns_10(
     assert not new_bundle.exists()
 
 
-def test_run_match_input_under_proxy_ca_dir_prints_warning(
+def test_run_match_input_under_proxy_ca_dir_warns_on_stderr(
     certs_dir: Path, proxy_ca_dir: Path, test_ca_pem: bytes, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """A certificate read from proxy-ca/ still matches but is flagged as a foreign directory."""
+    """The proxy-ca warning stays off stdout, which the skill reads for REUSE/cat lines."""
     foreign_input = proxy_ca_dir / "rt-root.pem"
     foreign_input.write_bytes(test_ca_pem)
 
@@ -494,7 +533,9 @@ def test_run_match_input_under_proxy_ca_dir_prints_warning(
 
     captured = capsys.readouterr()
     assert exit_code == EXIT_MATCH_REUSE
-    assert f"WARNING: {foreign_input} lives under {proxy_ca_dir}/" in captured.out
+    assert f"WARNING: {foreign_input} lives under {proxy_ca_dir}/" in captured.err
+    assert "WARNING" not in captured.out
+    assert f"REUSE {certs_dir / 'single_ca.pem'}" in captured.out
 
 
 def test_run_match_input_without_certificate_block_returns_2(
