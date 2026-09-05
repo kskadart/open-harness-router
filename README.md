@@ -24,6 +24,18 @@ Remote Control working: the CLI disables it under a custom
 while every request is still routed across the fleet -- see the
 "Forward-proxy" section below.
 
+> **Platform support.** The router is developed and used daily on macOS, but
+> the router itself and its CLI helpers (`cli.validate_routing`,
+> `cli.tls_probe`, `cli.sync_client_config`) are plain Python with no
+> platform-specific code: the test suite runs on Ubuntu in CI
+> (`.github/workflows/ci.yml`, `runs-on: ubuntu-latest`) and the README covers
+> running the service under systemd on Linux. What is macOS-only is the
+> add-provider skill's restart step: its `restart_router.sh` talks to launchd
+> and exits with code 64 and a systemd hint on any other OS, and the skill's
+> default log path assumes `~/Library/Logs`. On Linux, restart the service by
+> hand (`systemctl --user restart ...` with your real unit name) and point
+> `OHR_ERR_LOG` at your own log file. Windows is untested.
+
 ## Installation
 
 ```bash
@@ -296,7 +308,10 @@ in the error log (`open-harness-router: ...` line or a traceback), still
 only when `--routing-backup` was given -- it copies the backup back over
 `routing.yaml`, restarts again and exits 1 (0 -- healthy on the new config,
 2 -- down, empty `.launchd-label`, or rollback impossible, 64 -- not macOS,
-65 -- the service is not loaded in the user's launchd domain).
+65 -- the service is not loaded in the user's launchd domain). This restart
+step is launchd-only: on any other OS the script exits with code 64 and a
+systemd hint, so on Linux restart the service by hand and point `OHR_ERR_LOG`
+at your own log.
 `OHR_HEALTH_TIMEOUT_S` bounds the wait in wall-clock seconds. Only the
 top-level session should run it, and only with no subagents in flight:
 during a Bash call the session itself holds no open stream, but a running
