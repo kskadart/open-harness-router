@@ -15,5 +15,11 @@ routing.yaml.bak-*
 # Local CA bundles for upstream providers -- personal, not published; the
 # certs/ directory itself is tracked via certs/.gitkeep
 certs/*.pem
+# Site-local notes for .claude/skills/* (internal gateway hosts, key
+# procedures, model ids) -- personal, not published; the committed template
+# is references/local.example.md next to each skill
+.claude/skills/*/references/local/
 # Internal agent-workflow journal -- not published
 tasks/
+# macOS Finder metadata
+.DS_Store
