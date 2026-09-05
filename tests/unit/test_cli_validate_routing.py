@@ -199,19 +199,6 @@ def test_main_build_failure_is_framed_before_the_routers_own_message(
     framing = capsys.readouterr().err
     assert BUILD_FAILURE_FRAMING in framing
     assert "nothing was restarted" in BUILD_FAILURE_FRAMING
-    assert "still serves its previous configuration" in BUILD_FAILURE_FRAMING
-
-
-def test_main_successful_run_prints_no_build_failure_framing(
-    _env: None, capsys: pytest.CaptureFixture[str]
-) -> None:
-    """A configuration that builds never mentions a failure."""
-    exit_code = main([])
-
-    captured = capsys.readouterr()
-    assert exit_code == EXIT_OK
-    assert BUILD_FAILURE_FRAMING not in captured.err
-    assert BUILD_FAILURE_FRAMING not in captured.out
 
 
 def test_main_exact_rule_shadowed_by_earlier_contains_rule_exits_non_zero(

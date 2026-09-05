@@ -76,8 +76,7 @@ def test_build_provider_missing_key_message_names_the_edit_that_fixes_it(
         build_provider("moonshot", _own_key_cfg(), settings)
 
     message = str(exc_info.value)
-    assert "add MOONSHOT_API_KEY=<value> to .env in the repository root" in message
-    assert "then re-run" in message
+    assert "add MOONSHOT_API_KEY=<value> to .env and re-run" in message
     assert "\n" not in message
 
 
@@ -135,7 +134,7 @@ def test_build_provider_passthrough_ca_bundle_missing_raises_config_error(
 def test_build_provider_missing_ca_bundle_message_names_the_path_and_the_fix(
     monkeypatch: pytest.MonkeyPatch, _settings_env: None
 ) -> None:
-    """The message says where the file was expected and which command creates it.
+    """The message says where the file was expected and what it resolves against.
 
     ``ca_bundle`` is a bare file name resolved against ``certs_dir``, so an
     operator reading only "not found" cannot tell whether the file, the
@@ -150,9 +149,8 @@ def test_build_provider_missing_ca_bundle_message_names_the_path_and_the_fix(
 
     message = str(exc_info.value)
     assert str(_FIXTURES_CERTS_DIR / "does_not_exist.pem") in message
-    assert "resolved against certs_dir" in message
+    assert "resolves against certs_dir" in message
     assert "ROUTER_CERTS_DIR" in message
-    assert "cli.tls_probe match" in message
     assert "\n" not in message
 
 

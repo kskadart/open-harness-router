@@ -1,31 +1,23 @@
 """Offline validation of ``routing.yaml`` along the router's real boot path.
 
 Run from the repository root -- ``.env``, ``ROUTER_CONFIG_PATH`` and
-``certs_dir`` are resolved relative to the working directory, exactly as
-under the launchd service (``settings.RoutingSettings``,
-``settings.SecretsResolver``)::
+``certs_dir`` resolve against the working directory, as under the service::
 
     PYTHONPATH=src .venv/bin/python -m cli.validate_routing \\
         [--expect-provider NAME] [ALIAS[=UPSTREAM_MODEL] ...]
 
-``main.build_runtime`` is the same code the service runs at startup: it
-loads ``.env``, validates the schema, resolves every provider's API key and
-CA bundle and builds the registry -- without opening a listening socket. A
-config that fails here would crash-loop the launchd service
-(``providers/factory.py``, ``main.py``).
+``main.build_runtime`` is the code the service runs at startup: ``.env``,
+schema, every provider's key and CA bundle, the registry -- but no socket.
 
 Exit codes:
 
 * 0 -- the config builds and every expectation holds;
 * 1 -- the config does not build: ``build_runtime`` exits with the same
-  ``open-harness-router: ...`` message the service would write to its
-  err.log, preceded by :data:`BUILD_FAILURE_FRAMING` saying that this
-  command changed nothing and restarted nothing;
+  ``open-harness-router: ...`` message the service would log;
 * 3 -- ``--expect-provider`` is not among the built providers, or an alias
   resolved to a different provider / upstream model than expected.
 
-JSON log lines from ``setup_logging`` may interleave with the output; the
-summary starts at the ``=== ROUTES ===`` marker.
+Log lines may interleave; the summary starts at the ``=== ROUTES ===`` marker.
 """
 
 from __future__ import annotations
@@ -46,13 +38,9 @@ ROUTES_MARKER = "=== ROUTES ==="
 ALIASES_MARKER = "=== ALIASES ==="
 MISMATCHES_MARKER = "=== MISMATCHES ==="
 
-# Printed before ``build_runtime`` lets its own ``open-harness-router: ...``
-# message out: without it the message reads as if the running service had
-# just died, when in fact this command opens no socket and restarts nothing.
 BUILD_FAILURE_FRAMING = (
-    "cli.validate_routing: the configuration does NOT build -- this is the same error the "
-    "service would log at startup; nothing was restarted and the running router still "
-    "serves its previous configuration. The router's own message follows:"
+    "cli.validate_routing: config does NOT build (nothing was restarted). "
+    "Router's message:"
 )
 
 _ALIAS_SEPARATOR = "="
@@ -175,11 +163,7 @@ def check_aliases(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the command-line parser.
-
-    Returns:
-        The configured parser.
-    """
+    """Build the command-line parser."""
     parser = argparse.ArgumentParser(
         prog="cli.validate_routing",
         description=(
@@ -213,9 +197,8 @@ def main(argv: list[str] | None = None) -> int:
         The process exit code (see the module docstring).
 
     Raises:
-        SystemExit: from ``build_runtime`` when settings or the routing
-            configuration do not build (exit status 1 with the message),
-            preceded by :data:`BUILD_FAILURE_FRAMING` on stderr.
+        SystemExit: from ``build_runtime`` when the configuration does not
+            build.
     """
     args = _build_parser().parse_args(argv)
     try:

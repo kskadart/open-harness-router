@@ -7,46 +7,16 @@ Both subcommands run from the repository root::
     PYTHONPATH=src .venv/bin/python -m cli.tls_probe probe --host HOST [--port 443] \\
         [--cafile certs/BUNDLE.pem]
 
-``match`` splits the given PEM files into certificates, fingerprints each
-one (SHA-256 over the DER encoding) and compares the set with every
-``*.pem`` bundle in ``certs/``. When one bundle already contains every
-input certificate it prints ``REUSE certs/<name>`` (exit 0); otherwise it
-prints the ``cat`` command that would create a new bundle (exit 10) -- it
-never writes files itself. An input that cannot be read or parsed exits 2.
-Inputs that live under ``proxy-ca/`` (the forward-proxy MITM CA directory,
-``settings.ProxySettings.ca_dir``) get a warning: copy from there, never
-write there.
+``match`` fingerprints the input certificates and compares them with every
+``*.pem`` bundle in ``certs/``: ``REUSE certs/<name>`` (exit 0) or the ``cat``
+command that would build a new bundle (exit 10) -- it never writes files, and
+warns about inputs under ``proxy-ca/`` and about certificates a reused bundle
+carries beyond the input.
 
-A bundle wider than the input is still reused -- that is the point of the
-subcommand -- but every certificate it carries beyond the input is named,
-because the new provider ends up trusting those CAs too. Warnings and
-errors go to stderr, so the ``REUSE``/``cat`` lines on stdout stay
-machine-readable.
-
-``probe`` performs one TLS handshake with exactly the trust store the
-router would use for the provider: ``httpx.create_ssl_context`` over
-``services.http_transport.build_upstream_verify``, the same pair every
-provider transport goes through, and with ``trust_env=False`` like that
-transport -- so ``SSL_CERT_FILE``/``SSL_CERT_DIR`` in the operator's shell
-cannot make the probe answer for a trust store the service does not have.
-The verdict therefore predicts what the running service will see -- certifi
-without ``--cafile``, the bundle alone with it. A bare
-``ssl.create_default_context()`` is deliberately not used: its roots depend
-on the interpreter build, not on what the router trusts.
-
-Verdicts and exit codes (:class:`Verdict`). Nothing meaningful uses 1, the
-status Python gives an uncaught exception, so a crash cannot be read as a
-verdict:
-
-* ``CHAIN_OK_HOSTNAME_OK`` 0 -- nothing to configure beyond ``ca_bundle``;
-* ``BUNDLE_UNUSABLE`` 2 -- ``--cafile`` holds no usable certificate, so no
-  handshake was attempted (the error code ``match`` also uses);
-* ``CHAIN_OK_HOSTNAME_MISMATCH`` 11 -- the chain verifies but the leaf does
-  not cover the host name: the only case for ``tls_verify_hostname: false``;
-* ``CHAIN_FAIL`` 12 -- the chain does not verify against this trust store
-  (wrong or incomplete certificates);
-* ``CONNECT_FAIL`` 13 -- no TLS session at all (DNS, network, VPN, port, or
-  a TLS failure that is not a verification failure).
+``probe`` handshakes once with exactly the trust store the router would use
+for the provider (``httpx.create_ssl_context`` over ``build_upstream_verify``,
+``trust_env=False`` as in the transport), so its verdict predicts what the
+running service will see. Verdicts and exit codes: :class:`Verdict`.
 """
 
 from __future__ import annotations
@@ -69,8 +39,7 @@ from services.http_transport import build_upstream_verify
 
 EXIT_MATCH_REUSE = 0
 EXIT_MATCH_ERROR = 2
-# Not 1: that is the status of an uncaught exception, and the skill reads
-# this code as "create a new bundle" (SKILL.md step 4).
+# The skill reads this code as "create a new bundle" (SKILL.md step 4).
 EXIT_MATCH_NEW_BUNDLE = 10
 
 DEFAULT_CERTS_DIR = Path("certs")
@@ -91,9 +60,15 @@ _HOSTNAME_MISMATCH_VERIFY_CODES = frozenset({62, 64})
 class Verdict(IntEnum):
     """Probe verdicts; the integer value doubles as the process exit code.
 
-    The failure verdicts start at 11 so that 1 -- what Python exits with on
-    an uncaught exception -- can never be mistaken for the mismatch verdict
-    that alone justifies ``tls_verify_hostname: false``.
+    Failures start at 11 so that 1, Python's uncaught-exception status, can
+    never be read as a verdict.
+
+    * ``CHAIN_OK_HOSTNAME_OK`` 0 -- chain and host name verify;
+    * ``BUNDLE_UNUSABLE`` 2 -- ``--cafile`` holds no usable certificate;
+    * ``CHAIN_OK_HOSTNAME_MISMATCH`` 11 -- chain verifies, leaf SAN does not
+      cover the host;
+    * ``CHAIN_FAIL`` 12 -- the chain does not verify with this trust store;
+    * ``CONNECT_FAIL`` 13 -- no TLS session at all (DNS, port, VPN).
     """
 
     CHAIN_OK_HOSTNAME_OK = 0
@@ -105,30 +80,21 @@ class Verdict(IntEnum):
 
 _VERDICT_HINTS: Mapping[Verdict, str] = {
     Verdict.CHAIN_OK_HOSTNAME_OK: (
-        "chain and host name verify with this trust store: nothing to fix -- give the "
-        "provider this ca_bundle and keep tls_verify_hostname at its default (true)"
+        "nothing to fix: set ca_bundle, leave tls_verify_hostname default"
     ),
     Verdict.BUNDLE_UNUSABLE: (
-        "the --cafile bundle could not be loaded, so no handshake was attempted and "
-        "nothing about the host was learnt: check that the file holds PEM CERTIFICATE "
-        "blocks (openssl x509 -in FILE -noout -subject), rebuild it with the 'cat ... > "
-        "certs/<provider>_ca.pem' command 'tls_probe match' prints, then re-run this probe"
+        "--cafile holds no certificate; check with 'openssl x509 -in FILE -noout -subject'"
     ),
     Verdict.CHAIN_OK_HOSTNAME_MISMATCH: (
-        "chain verifies, leaf SAN does not cover the host: the only case for "
-        "tls_verify_hostname: false (add a dated comment with the SAN above and the "
-        "condition for removing the flag), then re-run this probe to confirm"
+        "chain OK, leaf SAN does not cover the host: the only case for "
+        "tls_verify_hostname: false"
     ),
     Verdict.CHAIN_FAIL: (
-        "chain does not verify with this trust store: the CA certificates for this host "
-        "are wrong or incomplete -- do not add the provider; ask the gateway owner for "
-        "the full chain, rebuild the bundle with 'tls_probe match' and re-run this probe"
+        "chain does not verify with this trust store; get the full chain from the "
+        "gateway owner"
     ),
     Verdict.CONNECT_FAIL: (
-        "no TLS session was established, so nothing was verified and no verdict about "
-        "the certificates is possible yet: reach the host first -- check DNS, the port "
-        "and the firewall with 'curl -v https://HOST:PORT', and, for an internal "
-        "gateway, that the VPN is connected -- then re-run this probe"
+        "no TLS session; check DNS/port/VPN with 'curl -v https://HOST:PORT'"
     ),
 }
 
@@ -168,29 +134,16 @@ class ProbeResult:
 
 
 def split_pem_certificates(text: str) -> list[str]:
-    """Extract every ``CERTIFICATE`` PEM block from a text.
+    """Extract every ``CERTIFICATE`` PEM block, in file order, delimiters included.
 
     Text between blocks (bag attributes, comments) and PEM blocks of other
     types (private keys) are ignored.
-
-    Args:
-        text: contents of a PEM file or bundle.
-
-    Returns:
-        The certificate blocks in file order, delimiters included.
     """
     return _PEM_CERTIFICATE_BLOCK.findall(text)
 
 
 def summarize_certificate(certificate: x509.Certificate) -> CertificateSummary:
-    """Extract fingerprint, names and expiry from a parsed certificate.
-
-    Args:
-        certificate: the parsed certificate.
-
-    Returns:
-        Its summary.
-    """
+    """Extract fingerprint, names and expiry from a parsed certificate."""
     try:
         san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName)
         dns_names = tuple(san.value.get_values_for_type(x509.DNSName))
@@ -208,15 +161,7 @@ def summarize_certificate(certificate: x509.Certificate) -> CertificateSummary:
 
 
 def load_certificates(path: Path) -> list[x509.Certificate]:
-    """Load every certificate from a PEM file (a bundle may hold several).
-
-    Args:
-        path: the PEM file.
-
-    Returns:
-        The parsed certificates in file order; empty when the file has no
-        ``CERTIFICATE`` block.
-    """
+    """Load every certificate from a PEM file; empty when it holds no ``CERTIFICATE``."""
     return [
         x509.load_pem_x509_certificate(block.encode("ascii"))
         for block in split_pem_certificates(path.read_text(encoding="utf-8"))
@@ -224,26 +169,12 @@ def load_certificates(path: Path) -> list[x509.Certificate]:
 
 
 def fingerprint_set(certificates: Iterable[x509.Certificate]) -> frozenset[str]:
-    """Collect the SHA-256 fingerprints of the given certificates.
-
-    Args:
-        certificates: parsed certificates.
-
-    Returns:
-        Their fingerprints as a set.
-    """
+    """Collect the SHA-256 fingerprints of the given certificates."""
     return frozenset(summarize_certificate(certificate).fingerprint for certificate in certificates)
 
 
 def bundle_fingerprints(certs_dir: Path) -> dict[str, frozenset[str]]:
-    """Fingerprint every ``*.pem`` bundle in the router's certificate directory.
-
-    Args:
-        certs_dir: the directory ``ca_bundle`` values are resolved against.
-
-    Returns:
-        Bundle file name -> fingerprints of the certificates it contains.
-    """
+    """Map each ``*.pem`` in ``certs_dir`` to the fingerprints it contains."""
     return {
         bundle.name: fingerprint_set(load_certificates(bundle))
         for bundle in sorted(certs_dir.glob(_BUNDLE_GLOB))
@@ -253,17 +184,10 @@ def bundle_fingerprints(certs_dir: Path) -> dict[str, frozenset[str]]:
 def find_reusable_bundle(
     wanted: frozenset[str], bundles: Mapping[str, frozenset[str]]
 ) -> str | None:
-    """Pick the bundle that already contains every wanted certificate.
+    """Pick the bundle that already contains every wanted certificate, else ``None``.
 
-    When several bundles qualify, the smallest one wins (the closest to an
-    exact match), then the alphabetically first name.
-
-    Args:
-        wanted: fingerprints of the input certificates.
-        bundles: bundle name -> fingerprints, from :func:`bundle_fingerprints`.
-
-    Returns:
-        The bundle file name, or ``None`` when no bundle covers the input.
+    When several qualify, the smallest one wins (the closest to an exact
+    match), then the alphabetically first name.
     """
     candidates = [name for name, fingerprints in bundles.items() if wanted <= fingerprints]
     if not candidates:
@@ -272,16 +196,7 @@ def find_reusable_bundle(
 
 
 def extra_certificates(bundle: Path, wanted: frozenset[str]) -> list[CertificateSummary]:
-    """Summarize the certificates a bundle holds beyond the wanted ones.
-
-    Args:
-        bundle: the bundle picked for reuse.
-        wanted: fingerprints of the input certificates.
-
-    Returns:
-        Summaries of the bundle's certificates whose fingerprint is not in
-        ``wanted``, in file order.
-    """
+    """Summarize the certificates a bundle holds beyond the wanted ones."""
     return [
         summary
         for summary in (
@@ -291,29 +206,10 @@ def extra_certificates(bundle: Path, wanted: frozenset[str]) -> list[Certificate
     ]
 
 
-def is_inside_directory(path: Path, directory: Path) -> bool:
-    """Check whether ``path`` lives under ``directory`` (after resolving both).
-
-    Args:
-        path: the file to test.
-        directory: the directory to test against; need not exist.
-
-    Returns:
-        True when the resolved path is inside the resolved directory.
-    """
-    return path.resolve().is_relative_to(directory.resolve())
-
-
 def _warn_about_extra_certificates(bundle: Path, wanted: frozenset[str]) -> None:
     """Name the CAs a reused bundle adds to the provider's trust store.
 
-    Reuse is what the skill asks for, but a bundle that is a strict superset
-    of the input makes the new provider trust CAs it never asked for, and
-    only the operator can decide whether that is acceptable.
-
-    Args:
-        bundle: the bundle picked for reuse.
-        wanted: fingerprints of the input certificates.
+    Only the operator can decide whether trusting them is acceptable.
     """
     extras = extra_certificates(bundle, wanted)
     if not extras:
@@ -333,20 +229,10 @@ def run_match(
 ) -> int:
     """Compare the input certificates with the bundles in ``certs_dir``.
 
-    Args:
-        cert_paths: PEM files given by the user (each may hold several
-            certificates).
-        certs_dir: the router's certificate directory.
-        proxy_ca_dir: the forward-proxy CA directory; inputs under it only
-            produce a warning.
-        provider: provider name used in the suggested bundle file name.
-
-    Returns:
-        ``EXIT_MATCH_REUSE`` when an existing bundle covers the input (its
-        certificates beyond the input are named on stderr),
-        ``EXIT_MATCH_NEW_BUNDLE`` when a new bundle is needed (the command
-        is printed, not executed), ``EXIT_MATCH_ERROR`` when an input file
-        holds no certificate or cannot be read and parsed.
+    Returns ``EXIT_MATCH_REUSE`` when a bundle covers the input,
+    ``EXIT_MATCH_NEW_BUNDLE`` when the printed ``cat`` command has to build
+    one, ``EXIT_MATCH_ERROR`` when an input cannot be read or holds no
+    certificate.
     """
     wanted: set[str] = set()
     for cert_path in cert_paths:
@@ -354,22 +240,19 @@ def run_match(
             certificates = load_certificates(cert_path)
         except (OSError, UnicodeDecodeError, ValueError) as input_error:
             print(
-                f"ERROR: cannot read certificates from {cert_path}: {input_error}; "
-                "pass the PEM file the working cURL used with --cacert, or export the "
-                "chain with 'openssl s_client -showcerts -connect HOST:443 </dev/null'",
+                f"ERROR: cannot read certificates from {cert_path}: {input_error} "
+                "(export the chain with 'openssl s_client -showcerts -connect HOST:443')",
                 file=sys.stderr,
             )
             return EXIT_MATCH_ERROR
         if not certificates:
             print(
-                f"ERROR: no CERTIFICATE block in {cert_path}: the file holds no "
-                "'-----BEGIN CERTIFICATE-----' section (a private key or a DER file?); "
-                f"convert DER with 'openssl x509 -inform der -in {cert_path} -out "
-                f"{cert_path}.pem' and pass the .pem",
+                f"ERROR: {cert_path}: no PEM CERTIFICATE block (DER? 'openssl x509 "
+                f"-inform der -in {cert_path} -out {cert_path}.pem')",
                 file=sys.stderr,
             )
             return EXIT_MATCH_ERROR
-        if is_inside_directory(cert_path, proxy_ca_dir):
+        if cert_path.resolve().is_relative_to(proxy_ca_dir.resolve()):
             print(
                 f"WARNING: {cert_path} lives under {proxy_ca_dir}/ -- the forward-proxy "
                 "MITM CA directory (settings.ProxySettings.ca_dir): copy from it, never "
@@ -387,9 +270,8 @@ def run_match(
         bundles = bundle_fingerprints(certs_dir)
     except (OSError, UnicodeDecodeError, ValueError) as bundle_error:
         print(
-            f"ERROR: cannot read the bundles in {certs_dir}/: {bundle_error}; run this "
-            "command from the repository root, or point --certs-dir at the directory "
-            "ca_bundle values resolve against (ROUTER_CERTS_DIR)",
+            f"ERROR: cannot read the bundles in {certs_dir}/: {bundle_error} "
+            "(run from the repository root, or point --certs-dir at ROUTER_CERTS_DIR)",
             file=sys.stderr,
         )
         return EXIT_MATCH_ERROR
@@ -413,15 +295,6 @@ def run_match(
 def build_probe_context(cafile: Path | None, tls_verify_hostname: bool) -> ssl.SSLContext:
     """Build the SSL context the router itself would use for a provider.
 
-    Args:
-        cafile: the provider's ``ca_bundle`` path, or ``None`` for the
-            router's default trust store (certifi via httpx).
-        tls_verify_hostname: the provider's ``tls_verify_hostname`` value.
-
-    Returns:
-        The context, built by the same two functions the provider
-        transports use.
-
     Raises:
         OSError: ``cafile`` cannot be read or holds no usable certificate
             (``ssl.SSLError`` is an ``OSError``).
@@ -436,15 +309,7 @@ def build_probe_context(cafile: Path | None, tls_verify_hostname: bool) -> ssl.S
 
 
 def _handshake(host: str, port: int, context: ssl.SSLContext) -> CertificateSummary:
-    """Complete one TLS handshake and return the server's leaf certificate.
-
-    Args:
-        host: server name (also sent as SNI).
-        port: TCP port.
-        context: the verifying SSL context.
-
-    Returns:
-        Summary of the leaf certificate presented by the server.
+    """Complete one TLS handshake (``host`` doubles as SNI) and summarize the leaf.
 
     Raises:
         ssl.SSLCertVerificationError: the context rejected the certificate.
@@ -462,22 +327,7 @@ def _handshake(host: str, port: int, context: ssl.SSLContext) -> CertificateSumm
 def _confirm_chain_without_hostname(
     host: str, port: int, context: ssl.SSLContext, hostname_detail: str
 ) -> ProbeResult:
-    """Tell a host-name mismatch apart from a chain that does not verify.
-
-    Runs the chain-only handshake the router performs with
-    ``tls_verify_hostname: false``: when it succeeds, the strict handshake
-    failed on the leaf's names alone.
-
-    Args:
-        host: server name.
-        port: TCP port.
-        context: the chain-only context.
-        hostname_detail: verification message of the strict handshake.
-
-    Returns:
-        ``CHAIN_OK_HOSTNAME_MISMATCH`` when only the name failed, otherwise
-        the failure of this handshake.
-    """
+    """Retry chain-only: a handshake that now succeeds failed on the leaf's names alone."""
     try:
         leaf = _handshake(host, port, context)
     except ssl.SSLCertVerificationError as chain_error:
@@ -493,20 +343,6 @@ def probe_host(host: str, port: int, cafile: Path | None) -> ProbeResult:
     Both contexts are built before the first connection: loading a bundle
     that holds no certificate raises ``ssl.SSLError``, an ``OSError`` that
     would otherwise be caught below and reported as a connection failure.
-
-    A strict handshake (chain + host name) runs first. When it fails only on
-    the host name, a second handshake with the chain-only context the router
-    uses for ``tls_verify_hostname: false`` tells a hostname mismatch apart
-    from a broken chain.
-
-    Args:
-        host: server name.
-        port: TCP port.
-        cafile: the provider's CA bundle, or ``None`` for the default store.
-
-    Returns:
-        The verdict with the leaf certificate (when a handshake completed)
-        and the error detail (when one failed).
     """
     try:
         strict_context = build_probe_context(cafile, tls_verify_hostname=True)
@@ -531,19 +367,9 @@ def probe_host(host: str, port: int, cafile: Path | None) -> ProbeResult:
 
 
 def _print_probe_result(host: str, port: int, cafile: Path | None, result: ProbeResult) -> None:
-    """Print the probe verdict, the trust store used and the leaf identity.
-
-    Args:
-        host: server name that was probed.
-        port: TCP port that was probed.
-        cafile: the CA bundle used, or ``None`` for the default store.
-        result: the probe outcome.
-    """
+    """Print the probe verdict, the trust store used and the leaf identity."""
     trust_store = (
-        str(cafile)
-        if cafile is not None
-        else "httpx default: certifi; SSL_CERT_FILE/SSL_CERT_DIR are ignored, as in "
-        "the router's transport (what the router uses without ca_bundle)"
+        str(cafile) if cafile is not None else "certifi (httpx default, SSL_CERT_FILE ignored)"
     )
     print(f"verdict: {result.verdict.name}")
     print(f"host: {host}:{port}")
@@ -560,11 +386,7 @@ def _print_probe_result(host: str, port: int, cafile: Path | None, result: Probe
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Build the command-line parser with the ``match`` and ``probe`` subcommands.
-
-    Returns:
-        The configured parser.
-    """
+    """Build the command-line parser with the ``match`` and ``probe`` subcommands."""
     parser = argparse.ArgumentParser(
         prog="cli.tls_probe",
         description="Certificate matching against certs/ and a live TLS probe "
@@ -603,16 +425,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the ``match`` or ``probe`` subcommand.
-
-    Args:
-        argv: command-line arguments without the program name; ``None`` --
-            ``sys.argv[1:]``.
-
-    Returns:
-        The process exit code: the ``EXIT_MATCH_*`` constants for ``match``,
-        the :class:`Verdict` value for ``probe``.
-    """
+    """Run ``match`` (``EXIT_MATCH_*``) or ``probe`` (a :class:`Verdict`) and return its code."""
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "match":

@@ -1,33 +1,36 @@
 # Protocol detection: cURL signal -> `ProviderCfg`
 
-Field reference: `src/routing/schema.py` (`ProviderCfg`, lines 246-262 for
-the field list, validators below them; `RoutingRule`, lines 39-69, for the
-per-rule fields). All templates are generic; site facts belong in the
-gitignored `local/` directory.
+Field reference: `ProviderCfg` and `RoutingRule` in `src/routing/schema.py`.
+All templates are generic; site facts belong in the gitignored `local/`
+directory.
 
-`max_tokens_limit` and `context_window` are the only fields a RULE can
-override (`schema.py:69-70`): the provider block carries the gateway's
-shared connection settings plus these two as DEFAULTS, and a model that
-needs different numbers states them on its own rule. One gateway is always
-one provider, however many models it serves.
+One gateway is one provider block, and a rule overrides only
+`max_tokens_limit` and `context_window` -- see `routing.example.yaml`.
 
 ## Signal table
 
 | Signal in the cURL | `type` | `api_flavor` | `base_url` | auth | limits | notes |
 |---|---|---|---|---|---|---|
-| URL ends in `/v1/messages`, or `x-api-key` / `anthropic-version` headers | `passthrough` | omit (`responses` is rejected, `schema.py:283-302`) | URL minus `/v1/messages` (`src/providers/passthrough.py:42,374`) | `forward_client_auth: false` + `api_key_env` (`schema.py:377-432`); `auth_header: x-api-key` when the cURL sends `x-api-key`, else `bearer` | none (`max_tokens_limit` and `context_window` stay unset; an explicit `context_window` is rejected, `schema.py:353-360`) | rules carry no `upstream_model`, `max_tokens_limit` or `context_window` (`schema.py:571-579`, `:595-649`) |
-| URL ends in `/chat/completions` | `openai-translate` | `chat` (default) | URL minus `/chat/completions` | `api_key_env` required (`schema.py:553-557`), Bearer only | `max_tokens_limit` required (`schema.py:304-327`); `context_window` optional, greater than `max_tokens_limit` (`schema.py:329-375`), set once the deployment's total window is known -- mandatory when the upstream answers an overflow with a 5xx (SKILL.md step 6b); both are per-model overridable on the rule, and the effective pair is validated the same way (`schema.py:595-649`); `token_param: max_completion_tokens` only if the cURL body used that field | `drop_params` (`temperature`/`top_p`/`stop`, `schema.py:30`) only after a 400 "unsupported parameter". Some gateways answer HTTP 400 with an empty body when the request lacks a `stream` field: the router always sends it explicitly; hand-written curls must include `"stream": false` too |
-| URL ends in `/responses` | `openai-translate` | `responses` | URL minus `/responses` | as above | `token_param: max_output_tokens` (`routing.example.yaml:71`); `context_window` as in the chat row; `reasoning_effort` optional | `tools_max` only when the vendor documents a cap; same explicit-`stream` rule as the chat row |
-| `--cacert F` or `--cacert <(cat A B)` | | | | | | `ca_bundle: <file in certs/>` (`src/providers/factory.py:36-41`); `tls_verify_hostname: false` only after `cli.tls_probe probe` exit 11 |
+| URL ends in `/v1/messages`, or `x-api-key` / `anthropic-version` headers | `passthrough` | omit (`responses` is rejected) | URL minus `/v1/messages` | `forward_client_auth: false` + `api_key_env`; `auth_header: x-api-key` when the cURL sends `x-api-key`, else `bearer` | none | rules carry no `upstream_model`, `max_tokens_limit` or `context_window` |
+| URL ends in `/chat/completions` | `openai-translate` | `chat` (default) | URL minus `/chat/completions` | `api_key_env` required, Bearer only | `max_tokens_limit` required; `context_window` optional; `token_param: max_completion_tokens` only if the cURL body used that field | `drop_params` (`temperature`/`top_p`/`stop`) only after a 400 "unsupported parameter". Some gateways answer HTTP 400 with an empty body when the request lacks a `stream` field: the router always sends it explicitly; hand-written curls must include `"stream": false` too |
+| URL ends in `/responses` | `openai-translate` | `responses` | URL minus `/responses` | as above | `token_param: max_output_tokens`; `context_window` as in the chat row; `reasoning_effort` optional | `tools_max` only when the vendor documents a cap; same explicit-`stream` rule as the chat row |
+| `--cacert F` or `--cacert <(cat A B)` | | | | | | `ca_bundle: <file in certs/>`; `tls_verify_hostname: false` only after `cli.tls_probe probe` exit 11 |
 | `-k` / `--insecure` | | | | | | not representable: obtain the chain first |
-| extra `-H` headers | | | | | | `extra_headers` (never auth headers, `schema.py:481-522`) plus `User-Agent: llm-router/0.1` |
+| extra `-H` headers | | | | | | `extra_headers` (never auth headers) plus `User-Agent: llm-router/0.1` |
 | `"max_tokens": N` in the body | | | | | lower bound for `max_tokens_limit` | |
 | `"stream": true` in the body | | | | | | no config impact; both providers stream. Keep an explicit `stream` in every direct curl (see the openai-translate rows) |
+
+`context_window` is `openai-translate` only -- a passthrough provider or
+rule that sets it is a startup error. Set it once the deployment's total
+window is known; it is mandatory when the upstream answers an overflow with
+a 5xx (SKILL.md step 6b). Like `max_tokens_limit` it is a provider default a
+rule may override per model, and the effective pair is validated the same
+way at startup.
 
 Placement in `routing.yaml`: provider blocks under `providers:` after the
 existing ones; `exact` rules under `rules:` before any `prefix` /
 `contains` / `regex` rule that could match the alias. Do not set
-`timeout_s` -- it is parsed and ignored (`README.md:268-272`).
+`timeout_s` -- it is parsed and ignored.
 
 ## Provider templates
 
@@ -108,7 +111,7 @@ existing ones; `exact` rules under `rules:` before any `prefix` /
 ```yaml
   # <provider>: exact aliases only, one per model. Placed before any
   # prefix/contains/regex rule that could match these names; raw upstream
-  # ids are intentionally not routed -- clients send the alias.
+  # ids are not routed -- clients send the alias.
   - match: {type: exact, value: "<prefix><short-name>"}
     provider: <provider>
     upstream_model: <vendor>/<upstream-model-id>   # omit on passthrough
@@ -143,7 +146,7 @@ or an agent's `model:` frontmatter to send:
     client_models: ["<prefix><model-a>", "<prefix><model-b>"]
 ```
 
-Validation at startup (`schema.py:652-706`): every entry must be accepted
+Validation at startup: every entry must be accepted
 by its own rule, must not be captured by an earlier rule (first match
 wins) and must not be listed twice. `make sync-client-config` turns these
 ids into the client's picker rows and exits 1 on a non-exact rule that has
