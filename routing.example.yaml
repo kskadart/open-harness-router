@@ -284,7 +284,7 @@ providers:
 # at a passthrough provider (the body is forwarded byte-for-byte, so neither
 # the cap nor the pre-flight ever runs), and the EFFECTIVE pair must keep the
 # provider's invariant: context_window greater than max_tokens_limit plus the
-# pre-flight reserve (512) plus the minimum completion budget (100). Example
+# pre-flight reserve (512) plus the minimum useful completion budget (4096). Example
 # of the two-model shape:
 #   # provider: the gateway, with the safe defaults of its tightest model
 #   # gateway:

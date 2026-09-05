@@ -11,7 +11,9 @@ Verify:
 - Post-start upstream errors (ProviderError/AuthenticationError non-499)
   after the stream has started are closed with a proper ``event: error``
   instead of a ``raise`` (which would tear down the TCP socket -> the client
-  sees ECONNRESET).
+  sees ECONNRESET), and that frame carries the ProviderError's own error
+  type -- a remapped context-length 400 stays ``invalid_request_error``
+  rather than degrading into the ``api_error`` its status maps to.
 - ``OpenAITranslateProvider.create_stream`` retries a transient 401
   "insufficient permissions" before the stream starts, and returns a proper
   JSON response once retries are exhausted.
@@ -36,12 +38,14 @@ from openai import APIError, AuthenticationError
 
 from conversion.response_converter import (
     convert_openai_streaming_to_claude_with_cancellation,
+    convert_responses_streaming_to_claude_with_cancellation,
 )
 from errors import ProviderError, UpstreamError
 from models.claude import ClaudeMessagesRequest
 from providers.openai_translate import OpenAITranslateProvider
 from providers.passthrough import PassthroughProvider
 from routing.schema import ProviderCfg, RouteLimits
+from services.reasoning_cache import ReasoningCache
 
 
 def _request() -> ClaudeMessagesRequest:
@@ -261,6 +265,71 @@ async def test_http_exception_midstream_emits_error_event_not_raise() -> None:
 
     # The error is logged structurally.
     assert logger.warning.called
+
+
+async def test_remapped_context_length_error_midstream_keeps_invalid_request_error() -> None:
+    """A ProviderError carrying its own type keeps it in the error-event.
+
+    The status alone maps 400 to ``api_error``; the context-length remap in
+    ``_to_provider_error`` produced ``invalid_request_error``, and the
+    client's recovery path (compact, then retry) keys on that type together
+    with the ``prompt_too_long`` token.
+    """
+
+    async def error_stream() -> AsyncIterator[str]:
+        yield 'data: {"choices":[{"delta":{"content":"partial"},"finish_reason":null}]}'
+        raise ProviderError(
+            message="prompt is too long (capability_rejected: prompt_too_long)",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+
+    logger = MagicMock()
+    http_request = MagicMock()
+    http_request.is_disconnected = AsyncMock(return_value=False)
+    client = MagicMock()
+    client.name = "openai"
+
+    generator = convert_openai_streaming_to_claude_with_cancellation(
+        error_stream(), _request(), logger, http_request, client, "req-400"
+    )
+    events = _parse_events([chunk async for chunk in generator])
+
+    error_event = next(payload for name, payload in events if name == "error")
+    assert error_event["error"]["type"] == "invalid_request_error"
+    assert "prompt_too_long" in error_event["error"]["message"]
+
+
+async def test_responses_remapped_context_length_error_midstream_keeps_its_type() -> None:
+    """The Responses converter carries the type through the same way."""
+
+    async def error_stream() -> AsyncIterator[str]:
+        yield 'data: {"type":"response.created","response":{"id":"resp_1"}}'
+        raise ProviderError(
+            message="prompt is too long (capability_rejected: prompt_too_long)",
+            status_code=400,
+            error_type="invalid_request_error",
+        )
+
+    logger = MagicMock()
+    http_request = MagicMock()
+    http_request.is_disconnected = AsyncMock(return_value=False)
+    client = MagicMock()
+    client.name = "openai"
+
+    generator = convert_responses_streaming_to_claude_with_cancellation(
+        error_stream(),
+        _request(),
+        logger,
+        http_request,
+        client,
+        "req-400-responses",
+        reasoning_cache=ReasoningCache(),
+    )
+    events = _parse_events([chunk async for chunk in generator])
+
+    error_event = next(payload for name, payload in events if name == "error")
+    assert error_event["error"]["type"] == "invalid_request_error"
 
 
 async def test_authentication_error_midstream_emits_authentication_error_event() -> None:

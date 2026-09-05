@@ -1,9 +1,10 @@
 """Tests for context-window awareness of the openai-translate provider.
 
 Covers the pre-flight guard in ``handle_messages`` (reject when the prompt
-alone overflows the window, clamp the completion budget otherwise), the
-estimator-backed ``count_tokens``, and the remap of upstream context-length
-400s to the Anthropic-shaped ``invalid_request_error`` carrying the stable
+alone overflows the window, clamp the completion budget otherwise) on the
+non-streaming AND the streaming path, the estimator-backed ``count_tokens``
+with its silent tools cap, and the remap of upstream context-length 400s to
+the Anthropic-shaped ``invalid_request_error`` carrying the stable
 ``capability_rejected: prompt_too_long`` token. Wire bodies are captured
 with pytest-httpx on top of a real ``AsyncOpenAI`` (same pattern as
 ``test_openai_translate_stream_flag``).
@@ -35,10 +36,18 @@ from const import (
     MIN_USEFUL_COMPLETION_TOKENS,
 )
 from conversion.request_converter import convert_claude_to_openai
+from errors import ProviderError
 from models.claude import ClaudeMessagesRequest
 from providers.base import ProviderResult
 from providers.openai_translate import OpenAITranslateProvider
-from routing.schema import ApiFlavor, MatchRule, ProviderCfg, RouteLimits, RoutingRule
+from routing.schema import (
+    ApiFlavor,
+    MatchRule,
+    ProviderCfg,
+    RouteLimits,
+    RoutingRule,
+    TokenParam,
+)
 from services.token_estimator import estimate_openai_request_tokens
 from settings import UpstreamSettings
 
@@ -152,7 +161,10 @@ def provider_log(monkeypatch: pytest.MonkeyPatch) -> _LogRecorder:
 
 
 def _provider(
-    api_flavor: ApiFlavor = "chat", context_window: int | None = None
+    api_flavor: ApiFlavor = "chat",
+    context_window: int | None = None,
+    token_param: TokenParam = "max_tokens",
+    tools_max: int = 0,
 ) -> OpenAITranslateProvider:
     """Create a provider on a real AsyncOpenAI so captured bodies are what the SDK sends."""
     cfg = ProviderCfg(
@@ -160,6 +172,8 @@ def _provider(
         base_url=_BASE_URL,
         api_key_env="GATEWAY_API_KEY",
         api_flavor=api_flavor,
+        token_param=token_param,
+        tools_max=tools_max,
         max_tokens_limit=_MAX_TOKENS_LIMIT,
         context_window=context_window,
     )
@@ -223,6 +237,30 @@ async def _handle(
         return await provider.handle_messages(
             claude_body, {}, _ConnectedChannel(), _MODEL, RouteLimits.resolve(provider.cfg, rule)
         )
+    finally:
+        await provider.aclose()
+
+
+async def _handle_stream(
+    provider: OpenAITranslateProvider, claude_body: bytes
+) -> tuple[ProviderResult, list[bytes]]:
+    """Run a streaming ``handle_messages`` and drain the body before closing the provider.
+
+    Returns the result together with the frames the client would receive --
+    empty for a pre-flight refusal, which answers with a JSON body instead
+    of a stream.
+    """
+    try:
+        result = await provider.handle_messages(
+            claude_body,
+            {},
+            _ConnectedChannel(),
+            _MODEL,
+            RouteLimits.resolve(provider.cfg, None),
+        )
+        if isinstance(result.body, bytes):
+            return result, []
+        return result, [chunk async for chunk in result.body]
     finally:
         await provider.aclose()
 
@@ -423,8 +461,41 @@ def test_to_provider_error_rate_limit_mentioning_tokens_is_not_remapped() -> Non
     )
     mapped = provider._to_provider_error(RateLimitError(message, response=response, body=None))
     assert mapped.status_code == 429
-    assert mapped.error_type == "api_error"
+    assert mapped.error_type == "rate_limit_error"
     assert _PROMPT_TOO_LONG_TOKEN not in mapped.message
+
+
+@pytest.mark.parametrize(
+    ("status_code", "expected_type"),
+    [
+        (401, "authentication_error"),
+        (429, "rate_limit_error"),
+        (503, "overloaded_error"),
+        (502, "api_error"),
+        (400, "api_error"),
+    ],
+)
+def test_provider_error_without_an_explicit_type_derives_it_from_the_status(
+    status_code: int, expected_type: str
+) -> None:
+    """An unclassified failure reports the same type wherever it is rendered.
+
+    The mid-stream error event derives the type from the status; the JSON
+    body renders ``error_type``. With a hard-coded ``api_error`` default the
+    two disagreed on 401/429/503, and carrying the field into the stream
+    event would have downgraded those.
+    """
+    assert ProviderError("upstream said no", status_code=status_code).error_type == (
+        expected_type
+    )
+
+
+def test_provider_error_with_an_explicit_type_keeps_it() -> None:
+    """The context-length remap's own type outranks the status-derived default."""
+    remapped = ProviderError(
+        "prompt is too long", status_code=400, error_type="invalid_request_error"
+    )
+    assert remapped.error_type == "invalid_request_error"
 
 
 @pytest.mark.parametrize("api_flavor", ["chat", "responses"])
@@ -626,3 +697,177 @@ async def test_handle_messages_remaining_budget_below_the_useful_floor_is_reject
         f"{_CONTEXT_WINDOW - CONTEXT_WINDOW_RESERVE_TOKENS - MIN_USEFUL_COMPLETION_TOKENS} "
         f"maximum ({_PROMPT_TOO_LONG_TOKEN})"
     )
+
+
+# create(stream=True) only needs the connection to open and the converter to
+# reach a terminal event; the payload itself is irrelevant to the guard.
+_STREAM_BODY: dict[ApiFlavor, str] = {
+    "chat": (
+        'data: {"id":"chatcmpl-test","choices":[{"index":0,'
+        '"delta":{"role":"assistant","content":"Hi"},"finish_reason":"stop"}]}\n\n'
+        "data: [DONE]\n\n"
+    ),
+    "responses": (
+        'event: response.created\ndata: {"type":"response.created",'
+        '"response":{"id":"resp_test"}}\n\n'
+        'event: response.completed\ndata: {"type":"response.completed",'
+        '"response":{"id":"resp_test","status":"completed","output":[],'
+        '"usage":{"input_tokens":1,"output_tokens":1}}}\n\n'
+    ),
+}
+
+
+@pytest.mark.parametrize("api_flavor", ["chat", "responses"])
+async def test_handle_messages_streaming_prompt_over_budget_is_refused_with_json_not_sse(
+    httpx_mock: HTTPXMock, provider_log: _LogRecorder, api_flavor: ApiFlavor
+) -> None:
+    """A streaming client asking too much gets the JSON 400, never a started stream.
+
+    The pre-flight runs before the response is handed over, so the client
+    can still read a body and act on ``prompt_too_long``; an error smuggled
+    into an SSE frame after a 200 would not make Claude Code compact.
+    """
+    provider = _provider(api_flavor, context_window=_CONTEXT_WINDOW)
+    oversized = _claude_body(
+        stream=True, messages=[{"role": "user", "content": "x" * _OVERSIZED_PROMPT_CHARS}]
+    )
+
+    result, frames = await _handle_stream(provider, oversized)
+
+    assert result.status_code == 400
+    assert result.headers["content-type"] == "application/json"
+    assert frames == []
+    assert httpx_mock.get_request() is None
+    assert len(provider_log.named("context_window_reject")) == 1
+    body = _json_body(result)
+    assert body["error"]["type"] == "invalid_request_error"
+    assert _PROMPT_TOO_LONG_TOKEN in body["error"]["message"]
+
+
+@pytest.mark.parametrize("api_flavor", ["chat", "responses"])
+async def test_handle_messages_streaming_clamps_the_completion_budget_and_still_streams(
+    httpx_mock: HTTPXMock, provider_log: _LogRecorder, api_flavor: ApiFlavor
+) -> None:
+    """A streaming request that fits is clamped on the wire and keeps its SSE response."""
+    httpx_mock.add_response(
+        url=_BASE_URL + _ENDPOINT_PATH[api_flavor],
+        headers={"content-type": "text/event-stream"},
+        text=_STREAM_BODY[api_flavor],
+    )
+    provider = _provider(api_flavor, context_window=_CONTEXT_WINDOW)
+
+    result, frames = await _handle_stream(provider, _claude_body(stream=True))
+
+    assert result.status_code == 200
+    assert result.headers["content-type"] == "text/event-stream"
+    assert frames
+    sent = _sent_json(httpx_mock)
+    assert sent["stream"] is True
+    estimate = estimate_openai_request_tokens(sent)
+    expected = _CONTEXT_WINDOW - CONTEXT_WINDOW_RESERVE_TOKENS - estimate
+    assert expected < _MAX_TOKENS_LIMIT
+    assert sent[_TOKEN_KEY[api_flavor]] == expected
+    assert provider_log.named("context_window_clamp")[0]["clamped"] == expected
+
+
+async def test_handle_messages_clamps_the_renamed_token_param_leaving_no_stale_max_tokens(
+    httpx_mock: HTTPXMock,
+) -> None:
+    """A provider renaming the limit is clamped under its own key, not ``max_tokens``.
+
+    The clamp writes back into the CONVERTED body, where
+    ``apply_param_compat`` has already renamed the key; writing
+    ``max_tokens`` there would send the upstream both a stale unclamped
+    value and an unknown parameter.
+    """
+    httpx_mock.add_response(url=_BASE_URL + _ENDPOINT_PATH["chat"], json=_CHAT_COMPLETION_BODY)
+    provider = _provider(
+        "chat", context_window=_CONTEXT_WINDOW, token_param="max_completion_tokens"
+    )
+
+    result = await _handle(provider, _claude_body())
+
+    assert result.status_code == 200
+    sent = _sent_json(httpx_mock)
+    estimate = estimate_openai_request_tokens(sent)
+    expected = _CONTEXT_WINDOW - CONTEXT_WINDOW_RESERVE_TOKENS - estimate
+    assert expected < _MAX_TOKENS_LIMIT
+    assert sent["max_completion_tokens"] == expected
+    assert "max_tokens" not in sent
+
+
+@pytest.mark.parametrize("api_flavor", ["chat", "responses"])
+async def test_handle_messages_streaming_upstream_context_length_400_renders_invalid_request_error(
+    httpx_mock: HTTPXMock, api_flavor: ApiFlavor
+) -> None:
+    """The pre-stream path keeps the remapped type: a 400 before the stream is JSON, not SSE."""
+    httpx_mock.add_response(
+        url=_BASE_URL + _ENDPOINT_PATH[api_flavor],
+        status_code=400,
+        json=_sdk_error_body(
+            "This model's maximum context length is 8192 tokens. However, you requested 9000."
+        ),
+    )
+    provider = _provider(api_flavor)
+
+    result, frames = await _handle_stream(provider, _claude_body(stream=True))
+
+    assert result.status_code == 400
+    assert result.headers["content-type"] == "application/json"
+    assert frames == []
+    body = _json_body(result)
+    assert body["error"]["type"] == "invalid_request_error"
+    assert _PROMPT_TOO_LONG_TOKEN in body["error"]["message"]
+
+
+_TOOLS_CAP_WARNING = "tools array capped for openai provider"
+
+
+async def test_count_tokens_applies_the_tools_cap_without_logging_it(
+    provider_log: _LogRecorder,
+) -> None:
+    """Counting caps the tools array silently: nothing goes upstream, so nothing is dropped.
+
+    The cap has to run -- the count must describe the payload the request
+    would send -- but Claude Code issues a count per turn, so the warning
+    would repeat on every one of them and bury the entry that reports a
+    real truncation.
+    """
+    count_body: dict[str, Any] = {
+        "model": "claude-sonnet-4",
+        "messages": [{"role": "user", "content": "List the files in src."}],
+        "tools": _TOOLS,
+    }
+    provider = _provider("chat", tools_max=1)
+    try:
+        limits = RouteLimits.resolve(provider.cfg, None)
+        capped = await provider.count_tokens(
+            json.dumps(count_body).encode(), {}, _MODEL, limits
+        )
+        single_tool = await provider.count_tokens(
+            json.dumps({**count_body, "tools": _TOOLS[:1]}).encode(), {}, _MODEL, limits
+        )
+    finally:
+        await provider.aclose()
+
+    assert provider_log.named(_TOOLS_CAP_WARNING) == []
+    # The cap was applied, not skipped: the count matches the payload that
+    # keeps only the first tool.
+    assert _json_body(capped) == _json_body(single_tool)
+
+
+async def test_handle_messages_still_logs_the_tools_cap_warning(
+    httpx_mock: HTTPXMock, provider_log: _LogRecorder
+) -> None:
+    """Silencing the counting path must not silence a real request dropping tools."""
+    httpx_mock.add_response(url=_BASE_URL + _ENDPOINT_PATH["chat"], json=_CHAT_COMPLETION_BODY)
+    provider = _provider("chat", tools_max=1)
+
+    result = await _handle(
+        provider,
+        _claude_body(messages=[{"role": "user", "content": "hi"}], tools=_TOOLS),
+    )
+
+    assert result.status_code == 200
+    assert len(provider_log.named(_TOOLS_CAP_WARNING)) == 1
+    assert provider_log.named(_TOOLS_CAP_WARNING)[0]["dropped_count"] == 1

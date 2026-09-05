@@ -11,6 +11,7 @@ the registry.
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -513,3 +514,45 @@ def test_build_model_options_accepts_a_rule_window_where_the_provider_declares_n
     options = build_model_options(load_routing_config(routing_path))
 
     assert options[0]["description"] == "fleet_chat -- window 206650, max output 65536"
+
+
+def test_main_existing_settings_file_keeps_its_permissions(
+    fleet_routing: Path, settings_path: Path
+) -> None:
+    """A regeneration must not tighten a file the operator widened.
+
+    The replacement is written through ``tempfile``, which creates it 0600;
+    without copying the target's mode over, every sync would silently strip
+    the permissions the settings file had.
+    """
+    settings_path.write_text("{}\n", encoding="utf-8")
+    settings_path.chmod(0o644)
+
+    exit_code = main(["--settings-path", str(settings_path)])
+
+    assert exit_code == EXIT_OK
+    assert settings_path.stat().st_mode & 0o777 == 0o644
+
+
+def test_main_failed_write_leaves_no_temporary_file_and_keeps_the_previous_version(
+    fleet_routing: Path,
+    settings_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A write that fails mid-way is a refusal: no debris, no traceback, file untouched."""
+    previous = '{"permissions": {"allow": ["Bash(ls:*)"]}}\n'
+    settings_path.write_text(previous, encoding="utf-8")
+
+    def _fail_replace(*_args: object) -> None:
+        raise OSError("No space left on device")
+
+    monkeypatch.setattr(os, "replace", _fail_replace)
+
+    exit_code = main(["--settings-path", str(settings_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_CONFIG_ERROR
+    assert "No space left on device" in captured.err
+    assert settings_path.read_text(encoding="utf-8") == previous
+    assert [entry.name for entry in settings_path.parent.iterdir() if ".tmp" in entry.name] == []

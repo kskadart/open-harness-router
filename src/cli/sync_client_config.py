@@ -47,8 +47,9 @@ Exit codes:
 * 0 -- the settings file was written, or already matched;
 * 1 -- the routing configuration or the settings file cannot be used
   (unparsable JSON, a directory or unreadable target, a model with no
-  effective ``context_window``, or every rule skipped so that no model can
-  be listed at all); nothing is written;
+  effective ``context_window``, every rule skipped so that no model can be
+  listed at all, or the write itself failing); nothing is written, and a
+  failed write leaves the previous version in place;
 * 3 -- ``--check`` only: the file is out of sync; the difference is printed
   and nothing is written.
 """
@@ -245,22 +246,42 @@ def write_settings(path: Path, text: str) -> None:
     first: ``os.replace`` on a symlink would replace the LINK with a regular
     file, silently detaching the operator's real settings file.
 
+    An existing target keeps its permissions: ``tempfile`` creates the
+    replacement 0600, so without copying the mode over a regeneration would
+    silently tighten a file the operator may have made group-readable. A
+    failed write leaves nothing behind -- the temporary file is removed and
+    the previous version stays in place.
+
     Args:
         path: the settings file.
         text: the rendered document.
+
+    Raises:
+        OSError: the temporary file cannot be written or moved into place.
     """
     target = path.resolve()
     target.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(
+    existing_mode = target.stat().st_mode & 0o777 if target.exists() else None
+    # SIM115: the handle is closed by the ``with`` below; it is created
+    # outside it so a failure after creation can still remove the file.
+    handle = tempfile.NamedTemporaryFile(  # noqa: SIM115
         "w",
         encoding="utf-8",
         dir=target.parent,
         prefix=f".{target.name}.",
         suffix=".tmp",
         delete=False,
-    ) as handle:
-        handle.write(text)
-    os.replace(handle.name, target)
+    )
+    temp_path = Path(handle.name)
+    try:
+        with handle:
+            handle.write(text)
+        if existing_mode is not None:
+            temp_path.chmod(existing_mode)
+        os.replace(temp_path, target)
+    except OSError:
+        temp_path.unlink(missing_ok=True)
+        raise
 
 
 def _object_section(document: dict[str, Any], key: str) -> dict[str, Any]:
@@ -352,6 +373,19 @@ def main(argv: list[str] | None = None) -> int:
         options = build_model_options(config)
         current, existing = read_settings(settings_path)
         wanted = render_settings(build_settings_document(existing, options))
+
+        if current == wanted:
+            print(f"OK: {settings_path} is in sync ({len(options)} models)")
+            return EXIT_OK
+        if args.check:
+            print(_diff(current, wanted, settings_path), file=sys.stderr)
+            print(
+                f"OUT OF SYNC: {settings_path} does not match routing.yaml; "
+                "run 'make sync-client-config'",
+                file=sys.stderr,
+            )
+            return EXIT_OUT_OF_SYNC
+        write_settings(settings_path, wanted)
     except (ConfigError, ValidationError, OSError) as exc:
         # OSError covers an unreadable target and a target that turned into
         # something unwritable between the read and the write: the operator
@@ -359,18 +393,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"open-harness-router: {exc}", file=sys.stderr)
         return EXIT_CONFIG_ERROR
 
-    if current == wanted:
-        print(f"OK: {settings_path} is in sync ({len(options)} models)")
-        return EXIT_OK
-    if args.check:
-        print(_diff(current, wanted, settings_path), file=sys.stderr)
-        print(
-            f"OUT OF SYNC: {settings_path} does not match routing.yaml; "
-            "run 'make sync-client-config'",
-            file=sys.stderr,
-        )
-        return EXIT_OUT_OF_SYNC
-    write_settings(settings_path, wanted)
     print(f"WROTE {settings_path} ({len(options)} models)")
     return EXIT_OK
 

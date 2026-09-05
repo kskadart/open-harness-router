@@ -332,22 +332,25 @@ class ProviderCfg(BaseModel):
 
         The pre-flight estimate only runs on ``openai-translate``
         (``providers/openai_translate.py``); passthrough forwards the body
-        byte-for-byte and never sees a token count, so an explicit value
-        there is the same "configured value that quietly does nothing"
-        trap ``_validate_passthrough_auth`` eliminates. ``model_fields_set``
-        distinguishes an explicit value from the ``None`` default. A window
-        not greater than ``max_tokens_limit`` would reject every request
-        (the completion cap alone fills it), so it is a startup error too.
+        byte-for-byte and never sees a token count, so a value there is the
+        same "configured value that quietly does nothing" trap
+        ``_validate_passthrough_auth`` eliminates. Only a non-null value is
+        an error: an explicit ``context_window: null`` says "this provider
+        has no window", which is exactly what passthrough means, and
+        rejecting it would punish an operator for spelling out the default.
+        A window not greater than ``max_tokens_limit`` would reject every
+        request (the completion cap alone fills it), so it is a startup
+        error too.
 
         Returns:
             The validated configuration.
 
         Raises:
-            ValueError: ``context_window`` explicitly set on a
-                non-openai-translate provider, or not greater than
+            ValueError: a non-null ``context_window`` on a
+                non-openai-translate provider, or one not greater than
                 ``max_tokens_limit``.
         """
-        if "context_window" not in self.model_fields_set:
+        if self.context_window is None:
             return self
         if self.type != "openai-translate":
             raise ValueError(
@@ -356,8 +359,7 @@ class ProviderCfg(BaseModel):
                 "byte-for-byte and never estimates tokens)"
             )
         if (
-            self.context_window is not None
-            and self.max_tokens_limit is not None
+            self.max_tokens_limit is not None
             and self.context_window <= minimum_context_window(self.max_tokens_limit)
         ):
             raise ValueError(

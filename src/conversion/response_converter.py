@@ -290,9 +290,12 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
             return
         # The response has already started (the preamble went out) -- raising
         # would tear down the TCP socket (ECONNRESET). Close the SSE stream
-        # with a proper error-event mapping the status to an Anthropic type,
-        # then end the generator (no message_stop: the upstream was
-        # interrupted, the terminal sequence would be invalid).
+        # with an error-event carrying the ProviderError's own Anthropic
+        # type -- a context-length 400 remapped to invalid_request_error
+        # keeps it here too, instead of degrading into the api_error the
+        # status alone maps to -- then end the generator (no message_stop:
+        # the upstream was interrupted, the terminal sequence would be
+        # invalid).
         logger.warning(
             "upstream error mid-stream; closing anthropic stream with error-event",
             provider=openai_client.name,
@@ -300,7 +303,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
             status_code=e.status_code,
             detail=e.message,
         )
-        yield _stream_error_event(e.status_code, e.message)
+        yield _stream_error_event(e.status_code, e.message, e.error_type)
         return
     except APIError as e:
         # APIError from the OpenAI SDK mid-stream (not mapped to
@@ -471,12 +474,12 @@ def extract_reasoning_by_call_id(
     by_call_id: dict[str, list[dict[str, Any]]] = {}
     pending: list[dict[str, Any]] = []
 
-    for item in output_items:
-        item_type = item.get("type")
-        if item_type == "reasoning":
-            pending.append(item)
-        elif item_type == "function_call":
-            call_id = item.get("call_id")
+    for output_item in output_items:
+        output_type = output_item.get("type")
+        if output_type == "reasoning":
+            pending.append(output_item)
+        elif output_type == "function_call":
+            call_id = output_item.get("call_id")
             if pending and call_id:
                 by_call_id[call_id] = pending
             pending = []
@@ -525,28 +528,30 @@ def convert_responses_to_claude_response(
     content_blocks: list[dict[str, Any]] = []
     has_tool_use = False
 
-    for item in output_items:
-        item_type = item.get("type")
+    for output_item in output_items:
+        output_type = output_item.get("type")
 
-        if item_type == "message":
-            for part in item.get("content", []) or []:
+        if output_type == "message":
+            for part in output_item.get("content", []) or []:
                 if part.get("type") == "output_text":
                     content_blocks.append(
                         {"type": Constants.CONTENT_TEXT, "text": part.get("text", "")}
                     )
 
-        elif item_type == "function_call":
+        elif output_type == "function_call":
             has_tool_use = True
             try:
-                arguments = json.loads(item.get("arguments") or "{}")
+                arguments = json.loads(output_item.get("arguments") or "{}")
             except json.JSONDecodeError:
-                arguments = {"raw_arguments": item.get("arguments", "")}
+                arguments = {"raw_arguments": output_item.get("arguments", "")}
 
             content_blocks.append(
                 {
                     "type": Constants.CONTENT_TOOL_USE,
-                    "id": item.get("call_id") or item.get("id") or f"tool_{uuid.uuid4()}",
-                    "name": item.get("name", ""),
+                    "id": output_item.get("call_id")
+                    or output_item.get("id")
+                    or f"tool_{uuid.uuid4()}",
+                    "name": output_item.get("name", ""),
                     "input": arguments,
                 }
             )
@@ -659,16 +664,16 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                     yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': delta_text}}, ensure_ascii=False)}\n\n"  # noqa: E501
 
             elif event_type == "response.output_item.added":
-                item = event.get("item") or {}
+                added_item = event.get("item") or {}
                 # The id and name of a function_call item arrive in a single
                 # event, so the tool block opens immediately -- nothing to
                 # accumulate.
-                if item.get("type") == "function_call":
+                if added_item.get("type") == "function_call":
                     has_output = True
                     tool_block_counter += 1
                     claude_index = text_block_index + tool_block_counter
-                    tool_id = item.get("call_id") or item.get("id") or ""
-                    tool_name = item.get("name") or ""
+                    tool_id = added_item.get("call_id") or added_item.get("id") or ""
+                    tool_name = added_item.get("name") or ""
                     current_tool_calls[event.get("output_index", 0)] = {
                         "id": tool_id,
                         "name": tool_name,
@@ -771,9 +776,12 @@ async def convert_responses_streaming_to_claude_with_cancellation(
             return
         # The response has already started (the preamble went out) -- raising
         # would tear down the TCP socket (ECONNRESET). Close the SSE stream
-        # with a proper error-event mapping the status to an Anthropic type,
-        # then end the generator (no message_stop: the upstream was
-        # interrupted, the terminal sequence would be invalid).
+        # with an error-event carrying the ProviderError's own Anthropic
+        # type -- a context-length 400 remapped to invalid_request_error
+        # keeps it here too, instead of degrading into the api_error the
+        # status alone maps to -- then end the generator (no message_stop:
+        # the upstream was interrupted, the terminal sequence would be
+        # invalid).
         logger.warning(
             "upstream error mid-stream; closing anthropic stream with error-event",
             provider=openai_client.name,
@@ -781,7 +789,7 @@ async def convert_responses_streaming_to_claude_with_cancellation(
             status_code=e.status_code,
             detail=e.message,
         )
-        yield _stream_error_event(e.status_code, e.message)
+        yield _stream_error_event(e.status_code, e.message, e.error_type)
         return
     except APIError as e:
         # APIError from the OpenAI SDK mid-stream (not mapped to

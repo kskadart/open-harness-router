@@ -7,9 +7,13 @@ parsed by a pydantic model and translated to one of two OpenAI endpoints
 based on ``cfg.api_flavor``: ``chat`` -> /v1/chat/completions,
 ``responses`` -> /v1/responses.
 
-Upstream failures before the stream starts and on the non-streaming path
-are rendered with ``ProviderError.error_type``; mid-stream ``event: error``
-frames keep the status-derived type from ``anthropic_error_type_for_status``.
+Upstream failures are rendered with ``ProviderError.error_type`` wherever
+they surface -- before the stream starts, on the non-streaming path, and in
+the mid-stream ``event: error`` frame ``conversion.response_converter``
+emits -- so a context-length 400 remapped to ``invalid_request_error``
+reaches the client as one on every path. Only an error the router never
+classified (a raw SDK ``APIError`` mid-stream, passthrough proxying) falls
+back to the status-derived type from ``anthropic_error_type_for_status``.
 """
 
 from __future__ import annotations
@@ -124,6 +128,8 @@ def cap_tools(
     tools: list[ClaudeTool] | None,
     tools_max: int,
     provider_name: str,
+    *,
+    log_dropped: bool = True,
 ) -> list[ClaudeTool] | None:
     """Truncate the ``tools`` array to the provider's limit, keeping builtins.
 
@@ -136,6 +142,11 @@ def cap_tools(
         tools: array of tools from the Claude request (or None).
         tools_max: maximum number of elements; 0 = no limit.
         provider_name: provider name for logging.
+        log_dropped: whether a truncation is worth a warning. ``False`` on
+            the ``count_tokens`` path: that call sends nothing upstream, so
+            no tool is really lost, and Claude Code issues one count per
+            turn -- the warning would say the same thing on every one of
+            them and drown the entry that reports a real request.
 
     Returns:
         Truncated tools array (or the original, or None).
@@ -150,7 +161,7 @@ def cap_tools(
     kept_mcp = mcp_tools[:slots_for_mcp]
     dropped = mcp_tools[slots_for_mcp:]
 
-    if dropped:
+    if dropped and log_dropped:
         dropped_names = [t.name for t in dropped[:DROPPED_TOOLS_LOG_SAMPLE]]
         logger.warning(
             "tools array capped for openai provider",
@@ -657,6 +668,8 @@ class OpenAITranslateProvider:
         parsed: ClaudeMessagesRequest,
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        log_dropped_tools: bool = True,
     ) -> dict[str, Any]:
         """Translate a parsed Claude request into the upstream wire body.
 
@@ -672,6 +685,8 @@ class OpenAITranslateProvider:
             upstream_model: upstream model name from the routing rule, or
                 ``None`` to keep ``parsed.model``.
             limits: the route's effective token limits.
+            log_dropped_tools: whether a tools-array truncation is worth a
+                warning; ``False`` for the counting path (see ``cap_tools``).
 
         Returns:
             OpenAI request dict (Chat Completions or Responses).
@@ -681,7 +696,9 @@ class OpenAITranslateProvider:
         # (the .name field); the logic does not touch the passthrough
         # provider (byte-for-byte forwarding).
         if self.cfg.tools_max > 0 and parsed.tools is not None:
-            parsed.tools = cap_tools(parsed.tools, self.cfg.tools_max, self.name)
+            parsed.tools = cap_tools(
+                parsed.tools, self.cfg.tools_max, self.name, log_dropped=log_dropped_tools
+            )
 
         # The schema validator guarantees that openai-translate sets
         # max_tokens_limit, and a rule override is an int too, so the
@@ -791,7 +808,9 @@ class OpenAITranslateProvider:
         the minimum completion budget and pushed through the same builder
         as ``handle_messages``, so the number reflects the converted wire
         payload (capped tools, tool definitions, tool-call arguments)
-        rather than the raw Anthropic text.
+        rather than the raw Anthropic text. The tools cap still applies --
+        the count must match the request that follows -- but stays silent:
+        nothing is sent upstream, so no tool is actually dropped.
         """
         try:
             parsed = ClaudeTokenCountRequest.model_validate_json(raw_body)
@@ -802,7 +821,9 @@ class OpenAITranslateProvider:
         messages_request = ClaudeMessagesRequest(
             max_tokens=MIN_COMPLETION_TOKENS, **parsed.model_dump()
         )
-        openai_request = self._build_openai_request(messages_request, upstream_model, limits)
+        openai_request = self._build_openai_request(
+            messages_request, upstream_model, limits, log_dropped_tools=False
+        )
         return _json_result(200, {"input_tokens": estimate_openai_request_tokens(openai_request)})
 
     async def aclose(self) -> None:

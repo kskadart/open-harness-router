@@ -563,6 +563,18 @@ def test_context_window_set_on_passthrough_is_rejected() -> None:
         RoutingConfig.model_validate(raw)
 
 
+def test_context_window_explicitly_null_on_passthrough_is_accepted() -> None:
+    """An explicit null states the absence of a window -- exactly what passthrough has.
+
+    The rejection targets a value that would quietly do nothing; ``null``
+    configures nothing, so spelling out the default must not be an error.
+    """
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["context_window"] = None  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.providers["anthropic"].context_window is None
+
+
 def test_context_window_not_greater_than_max_tokens_limit_is_rejected() -> None:
     """context_window equal to max_tokens_limit leaves no room for any prompt."""
     raw = _clone_valid()

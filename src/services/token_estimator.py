@@ -16,18 +16,54 @@ MiniMax-M3 and DeepSeek-V4-Flash on three ~6000-character bodies (English
 prose; Python code plus six tool definitions; Russian prose): the estimate
 was above the measured count on all six samples, estimate/measured ratios
 1.10-1.33.
+
+Under-counting is the harmful direction -- it lets an oversized request
+through to an upstream that answers with a context-length 400 or, worse, a
+retried 500 -- so the two buckets the calibration could not cover are
+deliberately generous: CJK text (the samples were Latin and Cyrillic only,
+and CJK tokenizes far denser than Cyrillic) and the ``encrypted_content``
+of restored reasoning items (opaque, but counted through its length rather
+than skipped -- the upstream decrypts those items into the same context
+window the prompt lives in).
 """
 
 from __future__ import annotations
 
 import json
 import math
+import re
 from dataclasses import dataclass
 
 # Calibration of 2026-09-04 (module docstring): 3.5/2.0 kept every sample
-# over-estimated, so they were not lowered further.
+# over-estimated, so they were not lowered further. The non-ASCII divisor
+# was measured on Cyrillic and applies to every script except the CJK
+# ranges below, which are denser by a factor of two.
 _ASCII_CHARS_PER_TOKEN = 3.5
 _NON_ASCII_CHARS_PER_TOKEN = 2.0
+# CJK characters cost about one token each on the fleet's tokenizers
+# (o200k-family, GLM, MiniMax): one Han character is a frequent enough unit
+# to own a token, and rarer ones fall back to their UTF-8 bytes and cost
+# more. Counting them at the Cyrillic rate halved the estimate of a Chinese
+# or Japanese prompt.
+_CJK_CHARS_PER_TOKEN = 1.0
+# Ranges counted at the CJK rate: CJK symbols and punctuation, Hiragana,
+# Katakana, Han (Extension A, Unified, Compatibility), Hangul (Jamo and
+# Syllables), the fullwidth/halfwidth forms CJK input methods produce, and
+# Han Extension B+ on the supplementary plane.
+_CJK_PATTERN = re.compile(
+    "[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\u1100-\u11ff"
+    "\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af\uff00-\uffef"
+    "\U00020000-\U0002fa1f]"
+)
+# Characters of ``encrypted_content`` per token of the reasoning it stands
+# for. The blob is opaque, so the ratio is derived rather than measured:
+# it is base64 (4 characters per 3 ciphertext bytes) over an AEAD
+# ciphertext whose length tracks the plaintext reasoning trace, which at
+# the ASCII rate would be ~4.7 blob characters per token; if the upstream
+# compresses before encrypting (not observable from here), typical ~2x text
+# compression puts it near ~2.3. The value sits below both, so the estimate
+# errs high either way -- the direction this module requires.
+_REASONING_CHARS_PER_TOKEN = 2.0
 # Framing per message or input item (role, separators) and per tool
 # definition (the upstream renders the schema into its tool prompt).
 _MESSAGE_OVERHEAD_TOKENS = 4
@@ -46,27 +82,48 @@ class _Tally:
 
     ascii_chars: int = 0
     non_ascii_chars: int = 0
+    cjk_chars: int = 0
+    reasoning_chars: int = 0
     messages: int = 0
     tools: int = 0
     images: int = 0
 
     def add_text(self, text: object) -> None:
-        """Count a string's ASCII and non-ASCII characters; ignore non-strings."""
+        """Count a string's ASCII, CJK and other non-ASCII characters.
+
+        Non-strings are ignored, so a caller may hand over a field that the
+        wire shape leaves absent or null.
+        """
         if not isinstance(text, str):
             return
         ascii_chars = len(text.encode("ascii", "ignore"))
         self.ascii_chars += ascii_chars
-        self.non_ascii_chars += len(text) - ascii_chars
+        non_ascii_chars = len(text) - ascii_chars
+        if not non_ascii_chars:
+            return
+        # Only the non-ASCII remainder is scanned, and through the regex
+        # engine: a per-character Python loop over a 100K-character prompt
+        # would cost more than the whole estimate is worth.
+        cjk_chars = _CJK_PATTERN.subn("", text)[1]
+        self.cjk_chars += cjk_chars
+        self.non_ascii_chars += non_ascii_chars - cjk_chars
 
     def add_json(self, value: object) -> None:
         """Count a value in its compact JSON form (tool schemas, arguments)."""
         self.add_text(json.dumps(value, separators=(",", ":"), ensure_ascii=False))
+
+    def add_reasoning(self, encrypted_content: object) -> None:
+        """Count an encrypted reasoning blob through its length; ignore non-strings."""
+        if isinstance(encrypted_content, str):
+            self.reasoning_chars += len(encrypted_content)
 
     def total(self) -> int:
         """Token estimate: character terms rounded up plus the fixed overheads."""
         return (
             math.ceil(self.ascii_chars / _ASCII_CHARS_PER_TOKEN)
             + math.ceil(self.non_ascii_chars / _NON_ASCII_CHARS_PER_TOKEN)
+            + math.ceil(self.cjk_chars / _CJK_CHARS_PER_TOKEN)
+            + math.ceil(self.reasoning_chars / _REASONING_CHARS_PER_TOKEN)
             + self.messages * _MESSAGE_OVERHEAD_TOKENS
             + self.tools * _TOOL_OVERHEAD_TOKENS
             + self.images * _IMAGE_TOKENS
@@ -114,22 +171,27 @@ def _add_chat_messages(tally: _Tally, messages: object) -> None:
 
 
 def _add_responses_input(tally: _Tally, input_items: object) -> None:
-    """Count Responses API ``input`` items, skipping cached reasoning blobs."""
+    """Count Responses API ``input`` items, reasoning blobs included."""
     if not isinstance(input_items, list):
         return
-    for item in input_items:
-        # Reasoning items are opaque encrypted_content restored from the
-        # cache; the upstream charges them as its own state, not as prompt.
-        if not isinstance(item, dict) or item.get("type") == "reasoning":
+    for input_item in input_items:
+        if not isinstance(input_item, dict):
             continue
         tally.messages += 1
-        item_type = item.get("type")
-        if item_type == "function_call":
-            _add_function_call(tally, item)
-        elif item_type == "function_call_output":
-            tally.add_text(item.get("output"))
+        input_type = input_item.get("type")
+        if input_type == "reasoning":
+            # A reasoning item restored from the cache is opaque, but the
+            # upstream decrypts it into the same window as the prompt, and
+            # a long agentic turn puts many of them in ``input``. Only
+            # encrypted_content carries weight: the router asks for no
+            # reasoning summary, so ``summary`` arrives empty.
+            tally.add_reasoning(input_item.get("encrypted_content"))
+        elif input_type == "function_call":
+            _add_function_call(tally, input_item)
+        elif input_type == "function_call_output":
+            tally.add_text(input_item.get("output"))
         else:
-            _add_content(tally, item.get("content"))
+            _add_content(tally, input_item.get("content"))
 
 
 def _add_tools(tally: _Tally, tools: object) -> None:
@@ -153,9 +215,10 @@ def estimate_openai_request_tokens(openai_request: dict[str, object]) -> int:
     ``tool_calls[].function.arguments``, role ``tool`` results, nested
     ``tools[].function``) and Responses (``instructions``, ``input`` items
     including ``function_call``/``function_call_output``, flat ``tools``).
-    Every text string is counted; tool definitions and arguments in compact
-    JSON; images at a fixed cost with their data URL excluded; cached
-    reasoning items skipped. Terms are rounded up.
+    Every text string is counted, CJK characters at their own denser rate;
+    tool definitions and arguments in compact JSON; images at a fixed cost
+    with their data URL excluded; a restored reasoning item through the
+    length of its ``encrypted_content``. Terms are rounded up.
 
     Args:
         openai_request: the request dict as it will be sent upstream.
