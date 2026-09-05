@@ -34,6 +34,7 @@ from proxy.session import (
 )
 from proxy.tls import build_leaf_tls_context, build_upstream_tls_context
 from routing.registry import ProviderRegistry
+from routing.schema import ProviderCfg, RouteLimits
 from unit.conftest import ConnectedStreams
 
 StreamFactory = Callable[[], Awaitable[ConnectedStreams]]
@@ -64,6 +65,8 @@ class StubProvider:
 
     Attributes:
         name: the provider's name in the registry.
+        cfg: the provider configuration the registry reads the route's
+            limits from (a passthrough block: no conversion, no limits).
         seen_headers: headers of the last request received from the session.
         seen_channel: the client channel passed to ``handle_messages``.
     """
@@ -80,6 +83,7 @@ class StubProvider:
             error: the exception raised instead of a result.
         """
         self.name = "stub"
+        self.cfg = ProviderCfg(type="passthrough", base_url="https://upstream.test")
         self._result = result
         self._error = error
         self.seen_headers: Mapping[str, str] = {}
@@ -91,6 +95,7 @@ class StubProvider:
         client_headers: Mapping[str, str],
         client_channel: ClientChannel,
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
         """Return the prepared result or raise the prepared error."""
         self.seen_headers = client_headers
@@ -105,6 +110,7 @@ class StubProvider:
         raw_body: bytes,
         client_headers: Mapping[str, str],
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
         """Return a fixed token count estimate."""
         return ProviderResult(

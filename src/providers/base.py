@@ -12,7 +12,7 @@ from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
-from routing.schema import ProviderCfg
+from routing.schema import ProviderCfg, RouteLimits
 
 
 @runtime_checkable
@@ -60,7 +60,13 @@ class ProviderResult:
 
 @runtime_checkable
 class Provider(Protocol):
-    """Upstream provider contract."""
+    """Upstream provider contract.
+
+    ``upstream_model`` and ``limits`` come from the routing decision rather
+    than from ``cfg``: one provider serves every rule pointing at it, and a
+    rule may rename the model and override the provider's token limits for
+    the models it serves (``routing/registry.py``, ``RouteLimits``).
+    """
 
     name: str
     cfg: ProviderCfg
@@ -71,6 +77,7 @@ class Provider(Protocol):
         client_headers: Mapping[str, str],
         client_channel: ClientChannel,
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
         """Handle a ``/v1/messages`` request and return the response to the client."""
         ...
@@ -80,6 +87,7 @@ class Provider(Protocol):
         raw_body: bytes,
         client_headers: Mapping[str, str],
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
         """Handle a ``/v1/messages/count_tokens`` request."""
         ...

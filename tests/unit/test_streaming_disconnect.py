@@ -41,7 +41,7 @@ from errors import ProviderError, UpstreamError
 from models.claude import ClaudeMessagesRequest
 from providers.openai_translate import OpenAITranslateProvider
 from providers.passthrough import PassthroughProvider
-from routing.schema import ProviderCfg
+from routing.schema import ProviderCfg, RouteLimits
 
 
 def _request() -> ClaudeMessagesRequest:
@@ -626,7 +626,7 @@ async def test_passthrough_count_tokens_disconnect_raises_upstream_error() -> No
     )
 
     with pytest.raises(UpstreamError) as exc_info:
-        await provider.count_tokens(b"{}", {}, None)
+        await provider.count_tokens(b"{}", {}, None, RouteLimits.resolve(provider.cfg, None))
 
     assert exc_info.value.status_code == 502
     assert exc_info.value.message == "Upstream request failed. Retry the request."

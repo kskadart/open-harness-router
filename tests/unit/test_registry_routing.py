@@ -81,9 +81,20 @@ def test_describe_routes_lists_rules_in_priority_order_then_default(
             "match_value": "GLM",
             "provider": "openai_compatible",
             "upstream_model": "zai-org/GLM-5.2-FP8",
+            "max_tokens_limit": 65536,
         },
-        {"match_type": "prefix", "match_value": "gpt-", "provider": "openai"},
-        {"match_type": "prefix", "match_value": "chat-", "provider": "openai_chat"},
+        {
+            "match_type": "prefix",
+            "match_value": "gpt-",
+            "provider": "openai",
+            "max_tokens_limit": 128000,
+        },
+        {
+            "match_type": "prefix",
+            "match_value": "chat-",
+            "provider": "openai_chat",
+            "max_tokens_limit": 128000,
+        },
         {"match_type": "default", "provider": "anthropic"},
     ]
 
@@ -105,3 +116,35 @@ def test_describe_routes_includes_upstream_model_when_set(
 def test_describe_routes_last_entry_is_default(registry: ProviderRegistry) -> None:
     routes = registry.describe_routes()
     assert routes[-1] == {"match_type": "default", "provider": registry.default_provider}
+
+
+def test_resolve_falls_back_to_the_provider_limits_without_a_rule_override(
+    registry: ProviderRegistry,
+) -> None:
+    """A rule that overrides nothing hands the provider's own numbers to the provider."""
+    decision = registry.resolve("zai-org/GLM-5.2-FP8")
+    assert decision.limits.max_tokens_limit == 65536
+    assert decision.limits.context_window is None
+
+
+def test_resolve_and_describe_routes_carry_a_rule_limit_override(
+    _env: None,  # noqa: PT019
+) -> None:
+    """A per-model override reaches both the routing decision and the route table.
+
+    Two models on one gateway differ only by these numbers, so the decision
+    must carry the rule's values, not the provider block's.
+    """
+    settings = Settings()
+    config = load_routing_config(settings.routing.config_path)
+    config.rules[1].max_tokens_limit = 32000
+    config.rules[1].context_window = 223680
+    registry = ProviderRegistry.build(config, settings)
+
+    decision = registry.resolve("zai-org/GLM-5.2-FP8")
+
+    assert decision.limits.max_tokens_limit == 32000
+    assert decision.limits.context_window == 223680
+    assert registry.providers["openai_compatible"].cfg.max_tokens_limit == 65536
+    assert registry.describe_routes()[1]["max_tokens_limit"] == 32000
+    assert registry.describe_routes()[1]["context_window"] == 223680
