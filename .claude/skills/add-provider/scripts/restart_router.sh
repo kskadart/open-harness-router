@@ -17,21 +17,34 @@
 #                           first copied to routing.yaml.failed-<epoch> (the
 #                           path is printed), so a rollback never loses it.
 #
+# The launchd label:
+#   The default is the README placeholder com.example.open-harness-router,
+#   which no machine actually runs: the real label is a personal identifier
+#   and is not committed. Give it either in OHR_LAUNCHD_LABEL or, so that
+#   zero-argument runs keep working, in a .launchd-label file at the
+#   repository root -- one line with the label, for example
+#   com.<you>.open-harness-router. That file is gitignored. The environment
+#   variable wins over the file; a file that holds no label is an error.
+#
 # Environment overrides:
 #   OHR_REPO              repository root (default: four levels above this script)
-#   OHR_LAUNCHD_LABEL     launchd label (default: com.kskada.open-harness-router)
+#   OHR_LAUNCHD_LABEL     launchd label (default: the .launchd-label file at the
+#                         repository root, else com.example.open-harness-router)
 #   OHR_HEALTH_URL        health endpoint (default: http://127.0.0.1:8787/health)
 #   OHR_ERR_LOG           service stderr log
 #                         (default: ~/Library/Logs/open-harness-router.err.log)
 #   OHR_HEALTH_TIMEOUT_S  seconds to wait for a healthy restart, a positive
 #                         integer (default: 40 = ThrottleInterval 10 from the
-#                         plist + ~11 s startup + margin)
+#                         plist + ~11 s startup + margin). Spent in wall-clock
+#                         time, not poll iterations, so a curl that hangs for
+#                         its whole -m 3 eats the budget like any other wait.
 #
 # Exit codes:
 #   0   healthy with the new config
 #   1   rolled back to --routing-backup and healthy again on the old config
-#   2   service down, or unhealthy and rollback impossible (no backup given,
-#       backup missing, or still unhealthy after the rollback)
+#   2   bad arguments or an empty .launchd-label, service down, or unhealthy
+#       and rollback impossible (no backup given, backup missing, or still
+#       unhealthy after the rollback)
 #   64  not macOS: launchd only. On Linux run
 #       `systemctl --user restart open-harness-router.service` and poll /health.
 #   65  service not loaded in the user's launchd domain
@@ -41,20 +54,38 @@
 # after /health confirms the NEW process. Right after `kickstart -k` the old
 # process may still answer /health with the old config while it drains
 # (README.md, "Running"), and an existing provider name alone cannot tell the
-# two apart -- so success is "HTTP 200 AND the pid changed AND (when given)
-# the expected provider is listed". Rollback happens only on timeout, and
-# only when --routing-backup was given.
+# two apart -- so success is "HTTP 200 AND one pid that both preceded and
+# outlived that request AND differs from the pre-kickstart pid AND (when
+# given) the expected provider is listed". Rollback happens on the timeout or
+# on a startup error in err.log, and only when --routing-backup was given.
 #
 # Written for the stock macOS bash 3.2: no arrays, no mapfile, no `set -e`.
 set -u
 
+# The header block, from the line below the shebang to the `set -u` above.
 usage() {
-  sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^set -u$/p' "$0" | sed '$d' | sed 's/^# \{0,1\}//'
 }
+
+PLACEHOLDER_LABEL="com.example.open-harness-router"
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OHR_REPO="${OHR_REPO:-$(cd "$SCRIPT_DIR/../../../.." && pwd)}"
-LABEL="${OHR_LAUNCHD_LABEL:-com.kskada.open-harness-router}"
+LABEL_FILE="$OHR_REPO/.launchd-label"
+if [ -n "${OHR_LAUNCHD_LABEL:-}" ]; then
+  LABEL="$OHR_LAUNCHD_LABEL"
+elif [ -f "$LABEL_FILE" ]; then
+  # Hand-written file: first non-blank line, whitespace stripped.
+  LABEL="$(sed 's/[[:space:]]//g' "$LABEL_FILE" | sed -n '/./{p;q;}')"
+  if [ -z "$LABEL" ]; then
+    echo "restart_router.sh: $LABEL_FILE holds no launchd label; write the label on one" \
+      "line (launchctl print gui/\$(id -u) | grep open-harness-router shows it) or set" \
+      "OHR_LAUNCHD_LABEL" >&2
+    exit 2
+  fi
+else
+  LABEL="$PLACEHOLDER_LABEL"
+fi
 HEALTH_URL="${OHR_HEALTH_URL:-http://127.0.0.1:8787/health}"
 ERR_LOG="${OHR_ERR_LOG:-$HOME/Library/Logs/open-harness-router.err.log}"
 HEALTH_TIMEOUT_S="${OHR_HEALTH_TIMEOUT_S:-40}"
@@ -120,6 +151,10 @@ SERVICE="gui/$(id -u)/$LABEL"
 
 if ! launchctl print "$SERVICE" >/dev/null 2>&1; then
   echo "restart_router.sh: $SERVICE is not loaded (launchctl print failed)" >&2
+  if [ "$LABEL" = "$PLACEHOLDER_LABEL" ]; then
+    echo "that label is the published placeholder: put this machine's label in" \
+      "$LABEL_FILE (one line, gitignored) or in OHR_LAUNCHD_LABEL" >&2
+  fi
   exit 65
 fi
 
@@ -134,6 +169,18 @@ err_log_size() {
   else
     echo 0
   fi
+}
+
+# True when the service already wrote a startup failure since
+# ERR_LOG_SIZE_BEFORE was taken. `sys.exit("open-harness-router: ...")` covers
+# the handled failures (bad settings, unreadable routing.yaml) and a Traceback
+# the unhandled ones; uvicorn's own shutdown and access lines match neither.
+startup_error_logged() {
+  local size_now
+  size_now="$(err_log_size)"
+  [ "$size_now" -gt "$ERR_LOG_SIZE_BEFORE" ] || return 1
+  tail -c "+$((ERR_LOG_SIZE_BEFORE + 1))" "$ERR_LOG" |
+    grep -q -e '^open-harness-router: ' -e '^Traceback (most recent call last):'
 }
 
 # Prints whatever the service wrote to err.log since ERR_LOG_SIZE_BEFORE was
@@ -163,11 +210,23 @@ fetch_health() {
 # $1 = pid before the kickstart ("" = unknown, pid check skipped),
 # $2 = provider that must be listed ("" = none).
 new_process_healthy() {
-  local previous_pid="$1" required_provider="$2" current_pid
+  local previous_pid="$1" required_provider="$2" pid_before pid_after
+  # The pid is read on both sides of the request. The old process can answer
+  # with the old config and exit while launchd already starts its successor,
+  # and a single read after the response would then show a changed pid for a
+  # body the old process served.
+  pid_before="$(service_pid)"
   fetch_health || return 1
-  current_pid="$(service_pid)"
-  if [ -n "$previous_pid" ] && [ "$current_pid" = "$previous_pid" ]; then
+  pid_after="$(service_pid)"
+  if [ "$pid_before" != "$pid_after" ]; then
     return 1
+  fi
+  if [ -n "$previous_pid" ]; then
+    # An empty pid means launchd runs no process at all, so whatever answered
+    # is not the service this script restarted.
+    if [ -z "$pid_after" ] || [ "$pid_after" = "$previous_pid" ]; then
+      return 1
+    fi
   fi
   if [ -n "$required_provider" ]; then
     case "$HEALTH_BODY" in
@@ -179,17 +238,34 @@ new_process_healthy() {
 }
 
 WAITED_S=0
-# Polls new_process_healthy "$1" "$2" once a second for HEALTH_TIMEOUT_S.
+WAIT_FAILURE=""
+# Polls new_process_healthy "$1" "$2" once a second and sets WAITED_S; on
+# failure WAIT_FAILURE says why. The budget is wall clock rather than a poll
+# count: each curl can block for its own -m 3 seconds, which would stretch a
+# 40 s wait past two minutes when connections hang. A startup error already in
+# err.log ends the wait at once -- that process will not come up, and sitting
+# out the budget only lengthens the outage before the rollback.
 wait_until_healthy() {
+  local started_at
+  started_at="$(date +%s)"
   WAITED_S=0
-  while [ "$WAITED_S" -lt "$HEALTH_TIMEOUT_S" ]; do
+  WAIT_FAILURE=""
+  while :; do
     if new_process_healthy "$1" "$2"; then
+      WAITED_S=$(($(date +%s) - started_at))
       return 0
     fi
+    WAITED_S=$(($(date +%s) - started_at))
+    if startup_error_logged; then
+      WAIT_FAILURE="startup error in $ERR_LOG after ${WAITED_S}s"
+      return 1
+    fi
+    if [ "$WAITED_S" -ge "$HEALTH_TIMEOUT_S" ]; then
+      WAIT_FAILURE="no healthy new process within the ${HEALTH_TIMEOUT_S}s budget"
+      return 1
+    fi
     sleep 1
-    WAITED_S=$((WAITED_S + 1))
   done
-  return 1
 }
 
 kickstart() {
@@ -216,7 +292,7 @@ if wait_until_healthy "$OLD_PID" "$EXPECT_PROVIDER"; then
   exit 0
 fi
 
-echo "FAIL: not healthy with the new config after ${HEALTH_TIMEOUT_S}s" \
+echo "FAIL: not healthy with the new config -- $WAIT_FAILURE" \
   "(last response: ${HEALTH_BODY:-<none>})" >&2
 show_new_err_log_lines
 
@@ -258,7 +334,7 @@ if wait_until_healthy "$PID_BEFORE_ROLLBACK" ""; then
   exit 1
 fi
 
-echo "DOWN: still unhealthy ${HEALTH_TIMEOUT_S}s after the rollback;" \
+echo "DOWN: still unhealthy after the rollback -- $WAIT_FAILURE;" \
   "inspect $ERR_LOG and 'launchctl print $SERVICE'" >&2
 show_new_err_log_lines
 exit 2

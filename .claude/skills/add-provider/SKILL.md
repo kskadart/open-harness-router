@@ -17,7 +17,7 @@ existing provider". All commands run from the repository root.
 
 - This session and every subagent reach the API THROUGH the router being
   reconfigured. `routing.yaml` and `.env` are read once at startup
-  (`README.md:166-168`, `src/main.py:45`). A provider whose key variable is
+  (`README.md:162-164`, `src/main.py:45`). A provider whose key variable is
   unset or whose CA bundle is missing does not degrade the router, it stops
   it from starting at all (`src/providers/factory.py:67-72`,
   `src/main.py:54-58`); launchd's KeepAlive then crash-loops it.
@@ -28,7 +28,8 @@ existing provider". All commands run from the repository root.
 - The API key from the user's cURL is written exactly once, by the single
   append in step 3. It never appears in YAML, skill files, reports,
   subagent prompts or any other command.
-- Every new line in this repository is English (`tasks/lessons.md:3-7`).
+- Every new line in a repository file is written in English, even inside
+  a file that is otherwise Russian.
 - Site-specific facts (internal hosts, key procedures, model ids) live only
   in the gitignored `references/local/`; `references/local.example.md` is
   the committed template. A matching note is read before any question.
@@ -37,8 +38,8 @@ existing provider". All commands run from the repository root.
   `upstream_model` (`src/routing/schema.py:39-69`); first match wins
   (`src/routing/registry.py:70-88`), matching is case-sensitive
   (`src/routing/matcher.py:26-34`). `max_tokens_limit` and `context_window`
-  sit on the provider as its DEFAULTS (`src/routing/schema.py:215-216`) and
-  are overridden per model on the rule (`src/routing/schema.py:67-68`): one
+  sit on the provider as its DEFAULTS (`src/routing/schema.py:258-259`) and
+  are overridden per model on the rule (`src/routing/schema.py:69-70`): one
   gateway keeps ONE provider block even when its models need different
   limits -- never copy a provider to change a number.
 - The `/model` picker and the agent frontmatter are fed from
@@ -71,8 +72,8 @@ A checklist, not a script:
   `references/protocol-detection.md`.
 - Secret: `Authorization: Bearer <...>` or `x-api-key: <...>`. `x-api-key`
   on an OpenAI-style URL cannot be expressed: the OpenAI SDK only sends
-  Bearer (`src/providers/openai_translate.py:242-248`) and `extra_headers`
-  may not carry auth (`src/routing/schema.py:462-473`) -> stop and ask.
+  Bearer (`src/providers/openai_translate.py:254-260`) and `extra_headers`
+  may not carry auth (`src/routing/schema.py:481-522`) -> stop and ask.
 - Upstream model ids: `"model"` in the body plus `models=`.
 - Extra `-H` headers minus `content-type`, `accept`, `host`, `user-agent`
   and the auth header.
@@ -89,8 +90,10 @@ A checklist, not a script:
 
 ### 2. Existing provider with the same `base_url`?
 
-Search `routing.yaml` with the Grep tool -- `git grep` does not see
-gitignored files (`tasks/lessons.md:9-15`). If a provider already uses this
+Search `routing.yaml` with the Grep tool -- `git grep` never searches
+gitignored files such as `routing.yaml` and `certs/*.pem`, so before
+deleting or renaming anything grep the working tree with
+`grep -r --exclude-dir=.git`, not the index. If a provider already uses this
 `base_url`, take the "one more model" path: skip steps 3 and 4 and the
 provider block of step 7; run the smoke test of step 5 with the existing key
 (variable name from that provider's `api_key_env`); measure the new model's
@@ -126,7 +129,11 @@ PYTHONPATH=src .venv/bin/python -m cli.tls_probe match <cert.pem ...> --provider
 Prints `REUSE certs/<x>.pem` (exit 0) when an existing bundle already holds
 every input certificate, otherwise (exit 10) the command
 `cat A B > certs/<provider>_ca.pem` -- run it by hand (exit 2 = an input
-file that cannot be read or parsed). Then:
+file that cannot be read or parsed). The verdict and the certificate
+inventory are on stdout, but every `WARNING:` line goes to stderr and must
+still be shown: reusing a bundle wider than the input prints how many extra
+certificates it carries and names them (subject, notAfter, sha256) -- the
+new provider will trust those too. Then:
 
 ```sh
 PYTHONPATH=src .venv/bin/python -m cli.tls_probe probe --host <host> [--cafile certs/<bundle>.pem]
@@ -199,10 +206,10 @@ lands in (templates in `references/protocol-detection.md`).
 
 Semantics: the outgoing `max_tokens` is
 `min(max(client, 100), max_tokens_limit)`, silently
-(`src/conversion/request_converter.py:138-141`), where `max_tokens_limit` is
+(`src/conversion/request_converter.py:141-147`), where `max_tokens_limit` is
 the rule's value when it sets one and the provider's otherwise. Too low ->
 reasoning models return empty `content` with `stop_reason: max_tokens`
-(`src/routing/schema.py:119-128`); too high -> a vLLM-style upstream answers
+(`src/routing/schema.py:161-163`); too high -> a vLLM-style upstream answers
 400. Ladder:
 
 1. `curl -sS --noproxy '*' --cacert ... -H "Authorization: Bearer $K" <base_url>/models | jq '(.data // [])[] | {id, max_model_len, context_length, context_window, max_output_tokens}'`
@@ -223,21 +230,21 @@ reasoning models return empty `content` with `stop_reason: max_tokens`
 When the models on one gateway differ (one clamps, one fails; one thinks,
 one does not), keep the ONE provider block: give it the lowest measured cap
 as its default and write the higher cap as `max_tokens_limit:` on the rule
-of the model that was probed at that value (`src/routing/schema.py:67-68`).
+of the model that was probed at that value (`src/routing/schema.py:69-70`).
 Duplicating the provider to carry a second number is the mistake this
 override exists to remove. Record the source of each number and the probe
 outcome in a YAML comment next to it.
 
 #### 6b. `context_window` -- the deployment's total window
 
-Semantics (`src/routing/schema.py:130-145`; README "Context window and token
-counting", `README.md:315-440`): schema-optional, `openai-translate` only,
-must be greater than `max_tokens_limit` (`src/routing/schema.py:286-327`).
+Semantics (`src/routing/schema.py:171-188`): schema-optional,
+`openai-translate` only, must be greater than `max_tokens_limit`
+(`src/routing/schema.py:329-375`).
 Unset = no estimate, no pre-flight, the request goes upstream unchanged. A
-rule may override it for one model (`src/routing/schema.py:67-68`); the
+rule may override it for one model (`src/routing/schema.py:69-70`); the
 EFFECTIVE pair -- rule value where set, provider value otherwise -- is
 validated the same way at startup, in a message naming the rule index
-(`src/routing/schema.py:547-597`).
+(`src/routing/schema.py:595-649`).
 
 Precondition, non-negotiable for any model a client will actually drive:
 the generated client config sets
@@ -251,13 +258,13 @@ Set = before any upstream call the router estimates the converted wire
 body (`src/services/token_estimator.py`, a character heuristic calibrated
 to over-count -- estimate/usage 1.10-1.33 on 2026-09-04; the same estimate
 answers `/v1/messages/count_tokens`,
-`src/providers/openai_translate.py:772-797`) against `context_window - 512`:
+`src/providers/openai_translate.py:798-827`) against `context_window - 512`:
 a prompt leaving less than 100 tokens is rejected without an upstream call
 -- HTTP 400 `invalid_request_error`, `prompt is too long: <N> tokens > <M>
 maximum (capability_rejected: prompt_too_long)`, log event
 `context_window_reject`; otherwise the completion budget is clamped to what
 remains, log event `context_window_clamp` (`_enforce_context_window`,
-`src/providers/openai_translate.py:709-770`). Claude Code reads the token,
+`src/providers/openai_translate.py:728-796`). Claude Code reads the token,
 retries with a smaller `max_tokens`, then compacts. The window used is the
 route's effective one, resolved per request by the registry (`RouteLimits`,
 `src/routing/registry.py:70-88`).
@@ -290,11 +297,11 @@ its `max_model_len`, often below the architecture's maximum. Ladder:
 First: `cp -p routing.yaml routing.yaml.bak-$(date +%s)` and REMEMBER the
 exact file name (it is passed literally to step 9; `ls -t` is unreliable
 because `cp -p` preserves mtime). Templates: `references/protocol-detection.md`.
-Rules: English comments; no dead `timeout_s` (`README.md:309-313`);
+Rules: English comments; no dead `timeout_s` (`README.md:268-272`);
 `extra_headers: {User-Agent: llm-router/0.1}`; one `exact` rule per model,
 placed before any `prefix`/`contains`/`regex` rule that could match the
 alias (exact rules shadow nothing themselves); `upstream_model` is
-forbidden on passthrough (`src/routing/schema.py:524-531`) -- there the
+forbidden on passthrough (`src/routing/schema.py:571-579`) -- there the
 alias is what the client sends -- and so are `max_tokens_limit` and
 `context_window` (nothing is converted, so neither would ever run).
 
@@ -307,7 +314,7 @@ A `prefix`/`contains`/`regex` rule ALSO needs `client_models: [...]` with
 the exact ids clients may send: its match value is a pattern, and `gpt-` or
 `GLM` sent upstream verbatim is a vendor 404. An `exact` rule needs no list
 (its value is the id). Startup validation
-(`src/routing/schema.py:599-654`) rejects an entry the rule's own match
+(`src/routing/schema.py:652-706`) rejects an entry the rule's own match
 does not accept, one an earlier rule captures, and one listed twice.
 Without `client_models` step 12 exits 1 for that rule.
 
@@ -335,13 +342,26 @@ bash .claude/skills/add-provider/scripts/restart_router.sh \
 
 During a Bash call the session itself has no open stream, but parallel
 subagents do and `kickstart -k` cuts them off: restart only with no agents
-running. The command returns only after `/health` answers 200 from a new
-pid listing the provider; on timeout it restores the backup, restarts
-again and exits 1 (2 = still down). Forbidden alternatives: `nohup`, `uv`
+running. The script needs the real launchd label: it defaults to the
+placeholder `com.example.open-harness-router`, resolved as env
+`OHR_LAUNCHD_LABEL` -> a gitignored `.launchd-label` file at the repository
+root (its first non-blank line) -> the placeholder. Put this machine's
+label in `.launchd-label` (or the env var) so a zero-argument run works;
+without either, the script exits 65 with a hint naming that file. The
+command returns only after `/health` answers 200 from a new pid listing the
+provider; otherwise it restores the backup, restarts again and exits 1
+(exit 2 = bad arguments, an empty `.launchd-label`, the service down, or
+unhealthy with rollback impossible). `OHR_HEALTH_TIMEOUT_S` is a wall-clock
+budget in seconds, not a poll count. The rollback triggers on the timeout
+OR on a startup error in the error log (`open-harness-router: ...` or a
+traceback), and only when `--routing-backup` was given. Failure messages
+read `FAIL: not healthy with the new config -- <reason>` and
+`DOWN: still unhealthy after the rollback -- <reason>` where `<reason>` is
+the budget or the startup error. Forbidden alternatives: `nohup`, `uv`
 wrappers, `make run`, a manual `python -m entrypoint` (second process on
 8787/8788), `bootout`/`bootstrap` (plist edits only). Not macOS: the script
 exits 64; use `systemctl --user restart open-harness-router.service` and
-poll `/health` (`README.md:623-627`).
+poll `/health` (`README.md:431-467`).
 
 ### 10. End-to-end through the router, for EVERY alias
 
@@ -431,7 +451,7 @@ compaction; the variable applies to unknown ids only.
 | e2e: empty `content`, `stop_reason: max_tokens` | `max_tokens_limit` too low for a reasoning model (step 6a); raise it on THAT model's rule, not on the provider shared with the others |
 | e2e: 400 on long prompts | `max_tokens_limit` above the upstream ceiling for this model (step 6a); lower it on the model's rule |
 | 400 `prompt is too long ... (capability_rejected: prompt_too_long)` plus a `context_window_reject` log event | the router pre-flight: the estimated prompt does not fit `context_window - 512 - 100`. Expected for an oversized context (Claude Code compacts); on a prompt the upstream is known to accept, `context_window` is below the deployment's real window (step 6b) |
-| empty final message from a subagent, or `output_tokens: 1` with `stop_reason: end_turn` | check the router log for the `empty_completion` warning (`src/providers/openai_translate.py:631-650`, `src/conversion/response_converter.py:335-343`, `:811-819`): the upstream closed the turn with no text and no tool call. The router forwards in-conversation system messages as user text on the chat flavor (`src/conversion/request_converter.py:84-106`) because some open-model chat templates stop on a trailing system message; if the warning still appears, capture the wire body and compare what the upstream received |
+| empty final message from a subagent, or `output_tokens: 1` with `stop_reason: end_turn` | check the router log for the `empty_completion` warning (`src/providers/openai_translate.py:631-650`, `src/conversion/response_converter.py:345-353`, `:830-838`): the upstream closed the turn with no text and no tool call. The router forwards in-conversation system messages as user text on the chat flavor (`src/conversion/request_converter.py:84-106`) because some open-model chat templates stop on a trailing system message; if the warning still appears, capture the wire body and compare what the upstream received |
 | a small curl smoke test gets an HTML 403 | an anti-bot WAF in front of the gateway; it fires on small bodies (< ~8 KB) with shell-like text. Use an innocuous prompt (the step 5 body) or a body over ~8 KB; real Claude Code bodies are much larger and unaffected |
 | identical bodies get identical, instantly returned replies | a response cache on the gateway keyed by body; add a nonce to the prompt when repeating a test |
 
