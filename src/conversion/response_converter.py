@@ -154,12 +154,22 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
     current_tool_calls: dict[int, dict[str, Any]] = {}
     final_stop_reason = Constants.STOP_END_TURN
     usage_data: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
+    # Empty-completion detection: whether a non-empty text delta or a tool
+    # call went out before the terminal events, plus what the upstream said
+    # about itself, for the warning below. ``ended_early`` marks the paths
+    # that stop before the upstream finished (client gone, transport break):
+    # they log their own event and having no output is expected there.
+    has_output = False
+    ended_early = False
+    upstream_model: str | None = None
+    upstream_finish_reason: str | None = None
 
     try:
         async for line in openai_stream:
             if await client_channel.is_disconnected():
                 logger.info(f"Client disconnected, cancelling request {request_id}")
                 openai_client.cancel_request(request_id)
+                ended_early = True
                 break
 
             if line.strip():  # noqa: SIM102
@@ -170,6 +180,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
 
                     try:
                         chunk = json.loads(chunk_data)
+                        upstream_model = chunk.get("model") or upstream_model
                         usage = chunk.get("usage", None)
                         if usage:
                             cache_read_input_tokens = 0
@@ -197,6 +208,10 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
                     finish_reason = choice.get("finish_reason")
 
                     if delta and "content" in delta and delta["content"] is not None:
+                        # Whitespace is not an answer: a turn made only of it
+                        # reaches the client as blank, like an empty one.
+                        if delta["content"].strip():
+                            has_output = True
                         yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': delta['content']}}, ensure_ascii=False)}\n\n"  # noqa: E501
 
                     if "tool_calls" in delta and delta["tool_calls"]:
@@ -231,6 +246,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
                                 claude_index = text_block_index + tool_block_counter
                                 tool_call["claude_index"] = claude_index
                                 tool_call["started"] = True
+                                has_output = True
 
                                 yield f"event: {Constants.EVENT_CONTENT_BLOCK_START}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_START, 'index': claude_index, 'content_block': {'type': Constants.CONTENT_TOOL_USE, 'id': tool_call['id'], 'name': tool_call['name'], 'input': {}}}, ensure_ascii=False)}\n\n"  # noqa: E501
 
@@ -250,6 +266,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
                                     pass
 
                     if finish_reason:
+                        upstream_finish_reason = finish_reason
                         if finish_reason == "length":
                             final_stop_reason = Constants.STOP_MAX_TOKENS
                         elif finish_reason in ["tool_calls", "function_call"]:
@@ -311,6 +328,7 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
             request_id=request_id,
             error_type=type(e).__name__,
         )
+        ended_early = True
     except Exception as e:
         logger.error(f"Streaming error: {e}")
         logger.error(traceback.format_exc())
@@ -320,6 +338,16 @@ async def convert_openai_streaming_to_claude_with_cancellation(  # noqa: PLR0912
         }
         yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
         return
+
+    if not has_output and not ended_early:
+        logger.warning(
+            "empty_completion",
+            provider=openai_client.name,
+            model=original_request.model,
+            upstream_model=upstream_model,
+            stream=True,
+            finish_reason=upstream_finish_reason,
+        )
 
     yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': text_block_index}, ensure_ascii=False)}\n\n"  # noqa: E501
 
@@ -594,12 +622,18 @@ async def convert_responses_streaming_to_claude_with_cancellation(
     final_stop_reason = Constants.STOP_END_TURN
     usage_data: dict[str, int] = {"input_tokens": 0, "output_tokens": 0}
     unknown_event_types: set[str] = set()
+    # Empty-completion detection, as in the Chat Completions converter; the
+    # final response object supplies the model and status for the warning.
+    has_output = False
+    ended_early = False
+    terminal_response: dict[str, Any] = {}
 
     try:
         async for line in openai_stream:
             if await client_channel.is_disconnected():
                 logger.info(f"Client disconnected, cancelling request {request_id}")
                 openai_client.cancel_request(request_id)
+                ended_early = True
                 break
 
             if not line.strip() or not line.startswith("data: "):
@@ -620,6 +654,8 @@ async def convert_responses_streaming_to_claude_with_cancellation(
             if event_type == "response.output_text.delta":
                 delta_text = event.get("delta")
                 if delta_text:
+                    # Whitespace is not an answer, as in the chat converter.
+                    has_output = has_output or bool(delta_text.strip())
                     yield f"event: {Constants.EVENT_CONTENT_BLOCK_DELTA}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_DELTA, 'index': text_block_index, 'delta': {'type': Constants.DELTA_TEXT, 'text': delta_text}}, ensure_ascii=False)}\n\n"  # noqa: E501
 
             elif event_type == "response.output_item.added":
@@ -628,6 +664,7 @@ async def convert_responses_streaming_to_claude_with_cancellation(
                 # event, so the tool block opens immediately -- nothing to
                 # accumulate.
                 if item.get("type") == "function_call":
+                    has_output = True
                     tool_block_counter += 1
                     claude_index = text_block_index + tool_block_counter
                     tool_id = item.get("call_id") or item.get("id") or ""
@@ -667,6 +704,7 @@ async def convert_responses_streaming_to_claude_with_cancellation(
 
             elif event_type in _RESPONSES_TERMINAL_EVENTS:
                 response_body = event.get("response") or {}
+                terminal_response = response_body
                 usage_data = _responses_usage(response_body.get("usage"))
 
                 if response_body.get("status") == "failed":
@@ -770,6 +808,7 @@ async def convert_responses_streaming_to_claude_with_cancellation(
             request_id=request_id,
             error_type=type(e).__name__,
         )
+        ended_early = True
     except Exception as e:
         logger.error(f"Streaming error: {e}")
         logger.error(traceback.format_exc())
@@ -779,6 +818,16 @@ async def convert_responses_streaming_to_claude_with_cancellation(
         }
         yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
         return
+
+    if not has_output and not ended_early:
+        logger.warning(
+            "empty_completion",
+            provider=openai_client.name,
+            model=original_request.model,
+            upstream_model=terminal_response.get("model"),
+            stream=True,
+            finish_reason=terminal_response.get("status"),
+        )
 
     yield f"event: {Constants.EVENT_CONTENT_BLOCK_STOP}\ndata: {json.dumps({'type': Constants.EVENT_CONTENT_BLOCK_STOP, 'index': text_block_index}, ensure_ascii=False)}\n\n"  # noqa: E501
 

@@ -101,6 +101,10 @@ UPSTREAM_REQUEST_FAILED_MESSAGE: str = "Upstream request failed. Retry the reque
 UPSTREAM_REQUEST_TIMEOUT_MESSAGE: str = "Upstream request timed out. Retry the request."
 UPSTREAM_STREAM_INTERRUPTED_MESSAGE: str = "Upstream stream interrupted. Retry the request."
 
+# Smallest completion budget the router asks an upstream for: the floor the
+# converters apply to the client's ``max_tokens``.
+MIN_COMPLETION_TOKENS: int = 100
+
 
 class Constants:
     """String constants for the Anthropic/OpenAI protocols."""

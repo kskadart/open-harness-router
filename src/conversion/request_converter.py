@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any
 
-from const import Constants
+from const import MIN_COMPLETION_TOKENS, Constants
 from log import get_logger
 
 if TYPE_CHECKING:
@@ -33,7 +33,7 @@ def convert_claude_to_openai(  # noqa: PLR0912, PLR0915
     claude_request: ClaudeMessagesRequest,
     upstream_model: str | None = None,
     *,
-    min_tokens_limit: int = 100,
+    min_tokens_limit: int = MIN_COMPLETION_TOKENS,
     max_tokens_limit: int = 4096,
 ) -> dict[str, Any]:
     """Convert an Anthropic Messages request into OpenAI Chat Completions format.
@@ -54,25 +54,15 @@ def convert_claude_to_openai(  # noqa: PLR0912, PLR0915
     openai_messages: list[dict[str, Any]] = []
 
     if claude_request.system:
-        system_text = ""
-        if isinstance(claude_request.system, str):
-            system_text = claude_request.system
-        elif isinstance(claude_request.system, list):
-            text_parts = []
-            for block in claude_request.system:
-                if hasattr(block, "type") and block.type == Constants.CONTENT_TEXT:
-                    text_parts.append(block.text)
-                elif (
-                    isinstance(block, dict)
-                    and block.get("type") == Constants.CONTENT_TEXT
-                ):
-                    text_parts.append(block.get("text", ""))
-            system_text = "\n\n".join(text_parts)
-
-        if system_text.strip():
+        system_text = extract_claude_system_text(claude_request.system)
+        if system_text:
             openai_messages.append(
-                {"role": Constants.ROLE_SYSTEM, "content": system_text.strip()}
+                {"role": Constants.ROLE_SYSTEM, "content": system_text}
             )
+
+    # System text that could not be merged backward and is waiting for the
+    # next user turn to be prepended to (see the ROLE_SYSTEM branch).
+    pending_system_text: list[str] = []
 
     i = 0
     while i < len(claude_request.messages):
@@ -80,33 +70,40 @@ def convert_claude_to_openai(  # noqa: PLR0912, PLR0915
 
         if msg.role == Constants.ROLE_USER:
             openai_message = convert_claude_user_message(msg)
+            if pending_system_text:
+                prepend_system_text(openai_message, "\n\n".join(pending_system_text))
+                pending_system_text.clear()
             openai_messages.append(openai_message)
         elif msg.role == Constants.ROLE_SYSTEM:
             # Anthropic clients (including Claude Code) sometimes send a system
             # role inside the messages array, not only in the top-level system
             # field. The message is kept at its current position to avoid
             # losing instructions or breaking the order relative to
-            # user/assistant.
-            system_text = ""
-            if isinstance(msg.content, str):
-                system_text = msg.content
-            elif isinstance(msg.content, list):
-                text_parts = []
-                for block in msg.content:
-                    if hasattr(block, "type") and block.type == Constants.CONTENT_TEXT:
-                        text_parts.append(block.text)
-                    elif (
-                        isinstance(block, dict)
-                        and block.get("type") == Constants.CONTENT_TEXT
-                    ):
-                        text_parts.append(block.get("text", ""))
-                system_text = "\n\n".join(text_parts)
-
-            if system_text.strip():
-                openai_messages.append(
-                    {"role": Constants.ROLE_SYSTEM, "content": system_text.strip()}
-                )
+            # user/assistant -- but as USER text, not a system message:
+            # open-model chat templates (DeepSeek) answer a trailing system
+            # message with an immediate EOS, while OpenAI tolerates both.
+            # The text never opens a turn of its own next to another user
+            # turn: chat templates with strict role alternation answer two
+            # adjacent user messages with a 400. It merges into the previous
+            # emitted message when that is a plain user turn, and otherwise
+            # waits for the next user turn to be prepended to; only when
+            # neither exists (an assistant turn follows, or the array ends)
+            # does it become a user turn of its own.
+            system_text = extract_claude_system_text(msg.content)
+            previous = openai_messages[-1] if openai_messages else None
+            if system_text and previous is not None and previous["role"] == Constants.ROLE_USER:
+                append_system_text(previous, system_text)
+            elif system_text:
+                pending_system_text.append(system_text)
         elif msg.role == Constants.ROLE_ASSISTANT:
+            if pending_system_text:
+                openai_messages.append(
+                    {
+                        "role": Constants.ROLE_USER,
+                        "content": "\n\n".join(pending_system_text),
+                    }
+                )
+                pending_system_text.clear()
             openai_message = convert_claude_assistant_message(msg)
             openai_messages.append(openai_message)
 
@@ -124,8 +121,22 @@ def convert_claude_to_openai(  # noqa: PLR0912, PLR0915
                     i += 1
                     tool_results = convert_claude_tool_results(next_msg)
                     openai_messages.extend(tool_results)
+                    # Text/image blocks sent alongside the tool results (Claude
+                    # Code's retry nudge, system-reminders) follow as a user
+                    # turn; convert_claude_user_message skips tool_result
+                    # blocks, so an empty remainder means there were none.
+                    # Whitespace-only text is no remainder either -- it would
+                    # reach the upstream as a blank user turn.
+                    remainder = convert_claude_user_message(next_msg)
+                    if has_visible_content(remainder):
+                        openai_messages.append(remainder)
 
         i += 1
+
+    if pending_system_text:
+        openai_messages.append(
+            {"role": Constants.ROLE_USER, "content": "\n\n".join(pending_system_text)}
+        )
 
     openai_request: dict[str, Any] = {
         "model": openai_model,
@@ -180,6 +191,51 @@ def convert_claude_to_openai(  # noqa: PLR0912, PLR0915
             openai_request["tool_choice"] = "auto"
 
     return openai_request
+
+
+def append_system_text(message: dict[str, Any], text: str) -> None:
+    """Fold system text into the end of an OpenAI user message.
+
+    Args:
+        message: the user message to extend, with string or part-list content.
+        text: the system instruction text to add.
+    """
+    if isinstance(message["content"], list):
+        message["content"].append({"type": "text", "text": text})
+    elif message["content"]:
+        message["content"] = f"{message['content']}\n\n{text}"
+    else:
+        message["content"] = text
+
+
+def prepend_system_text(message: dict[str, Any], text: str) -> None:
+    """Fold system text into the start of an OpenAI user message.
+
+    Args:
+        message: the user message to extend, with string or part-list content.
+        text: the system instruction text to add.
+    """
+    if isinstance(message["content"], list):
+        message["content"].insert(0, {"type": "text", "text": text})
+    elif message["content"]:
+        message["content"] = f"{text}\n\n{message['content']}"
+    else:
+        message["content"] = text
+
+
+def has_visible_content(message: dict[str, Any]) -> bool:
+    """Report whether an OpenAI user message carries anything worth sending.
+
+    Args:
+        message: converted user message with string or part-list content.
+
+    Returns:
+        ``True`` when the message has non-blank text or an image part.
+    """
+    content = message["content"]
+    if isinstance(content, str):
+        return bool(content.strip())
+    return any(part["type"] != "text" or part["text"].strip() for part in content)
 
 
 def convert_claude_user_message(msg: ClaudeMessage) -> dict[str, Any]:
@@ -314,24 +370,28 @@ def parse_tool_result_content(content: Any) -> str:  # noqa: PLR0911, PLR0912
 
     if isinstance(content, list):
         result_parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict) and item.get("type") == Constants.CONTENT_TEXT:
-                result_parts.append(item.get("text", ""))
-            elif isinstance(item, str):
-                result_parts.append(item)
-            elif isinstance(item, dict):
-                if "text" in item:
-                    result_parts.append(item.get("text", ""))
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == Constants.CONTENT_TEXT:
+                result_parts.append(block.get("text", ""))
+            elif isinstance(block, str):
+                result_parts.append(block)
+            elif isinstance(block, dict):
+                if block.get("type") == Constants.CONTENT_IMAGE:
+                    result_parts.append(describe_omitted_image(block))
+                elif "text" in block:
+                    result_parts.append(block.get("text", ""))
                 else:
                     try:
-                        result_parts.append(json.dumps(item, ensure_ascii=False))
+                        result_parts.append(json.dumps(block, ensure_ascii=False))
                     except (TypeError, ValueError):
-                        result_parts.append(str(item))
+                        result_parts.append(str(block))
         return "\n".join(result_parts).strip()
 
     if isinstance(content, dict):
         if content.get("type") == Constants.CONTENT_TEXT:
             return content.get("text", "")
+        if content.get("type") == Constants.CONTENT_IMAGE:
+            return describe_omitted_image(content)
         try:
             return json.dumps(content, ensure_ascii=False)
         except (TypeError, ValueError):
@@ -341,6 +401,25 @@ def parse_tool_result_content(content: Any) -> str:  # noqa: PLR0911, PLR0912
         return str(content)
     except Exception:
         return "Unparseable content"
+
+
+def describe_omitted_image(block: dict[str, Any]) -> str:
+    """Summarize an image block nested in a tool result.
+
+    An OpenAI ``tool`` message carries text only, so an image serialized
+    into it cannot be rendered upstream while its base64 payload still
+    spends the context it costs -- for a screenshot that is most of the
+    window. Only the media type is worth forwarding.
+
+    Args:
+        block: raw Anthropic ``image`` block from ``tool_result`` content.
+
+    Returns:
+        Short note naming the media type when the source carries one.
+    """
+    source = block.get("source")
+    media_type = source.get("media_type") if isinstance(source, dict) else None
+    return f"[image omitted: {media_type}]" if media_type else "[image omitted]"
 
 
 def extract_claude_system_text(content: str | list[Any]) -> str:
@@ -498,7 +577,13 @@ def convert_claude_messages_to_input(
         elif msg.role == Constants.ROLE_SYSTEM:
             # A positional system role inside messages is kept in place:
             # moving it into instructions would break the ordering of
-            # instructions relative to user/assistant.
+            # instructions relative to user/assistant. It also keeps the
+            # system role, where the Chat Completions converter reshapes the
+            # same message into user text: /v1/responses is OpenAI's own
+            # endpoint and accepts a system item at any position, so there is
+            # no chat template to placate. Reshape here too the day a
+            # responses-flavor endpoint fronts an open-weight model whose
+            # template rejects a trailing system turn.
             system_text = extract_claude_system_text(msg.content)
             if system_text:
                 items.append(
@@ -514,7 +599,7 @@ def convert_claude_to_responses(
     max_tokens_limit: int,
     reasoning_effort_fallback: ReasoningEffort,
     reasoning_cache: ReasoningCache,
-    min_tokens_limit: int = 100,
+    min_tokens_limit: int = MIN_COMPLETION_TOKENS,
 ) -> dict[str, Any]:
     """Convert an Anthropic Messages request into OpenAI Responses API format.
 

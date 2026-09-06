@@ -491,3 +491,26 @@ def test_assistant_text_and_reasoning_both_precede_the_function_call() -> None:
         "function_call",
         "function_call_output",
     ]
+
+
+def test_trailing_system_role_message_after_tool_result_stays_system_in_input() -> None:
+    """The Responses converter keeps a closing system message as-is (the chat flavor does not).
+
+    The divergence is deliberate, not an oversight: /v1/responses is
+    OpenAI's own endpoint and accepts a system item at any position, while
+    the chat converter has to fold the same message into user text because
+    open-weight chat templates answer a trailing system turn with an
+    immediate EOS. Only a responses-flavor endpoint fronting such a model
+    would make the reshaping worth doing here as well.
+    """
+    request = _build_request(
+        messages=[*_tool_cycle_messages(), {"role": "system", "content": "be brief"}]
+    )
+    result = _convert(request)
+    assert [item.get("type") or item["role"] for item in result["input"]] == [
+        "user",
+        "function_call",
+        "function_call_output",
+        "system",
+    ]
+    assert result["input"][-1] == {"role": "system", "content": "be brief"}
