@@ -26,7 +26,7 @@ from const import (
 from errors import UpstreamError, stream_error_event
 from log import get_logger
 from providers.base import ClientChannel, ProviderResult
-from routing.schema import ProviderCfg
+from routing.schema import ProviderCfg, RouteLimits
 from services.header_utils import (
     forward_headers,
     merge_extra_headers,
@@ -361,8 +361,9 @@ class PassthroughProvider:
         client_headers: Mapping[str, str],
         client_channel: ClientChannel,
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
-        """Proxy ``/v1/messages`` to the Anthropic-compatible upstream."""
+        """Proxy /v1/messages; upstream_model and limits do not apply (verbatim body)."""
         return await self._proxy(_MESSAGES_PATH, raw_body, client_headers, client_channel)
 
     async def count_tokens(
@@ -370,8 +371,9 @@ class PassthroughProvider:
         raw_body: bytes,
         client_headers: Mapping[str, str],
         upstream_model: str | None,
+        limits: RouteLimits,
     ) -> ProviderResult:
-        """Proxy ``/v1/messages/count_tokens`` to the Anthropic-compatible upstream."""
+        """Proxy ``/v1/messages/count_tokens`` to the upstream's own endpoint."""
         fwd = self._build_headers(client_headers)
         return await self._proxy_unary(_COUNT_TOKENS_PATH, raw_body, fwd)
 

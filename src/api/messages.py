@@ -43,6 +43,6 @@ async def create_message(
     # http_request structurally satisfies ClientChannel (see providers.base):
     # the provider only needs is_disconnected(), not the whole ASGI request.
     result = await decision.provider.handle_messages(
-        raw_body, http_request.headers, http_request, decision.upstream_model
+        raw_body, http_request.headers, http_request, decision.upstream_model, decision.limits
     )
     return to_fastapi_response(result)

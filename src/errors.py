@@ -28,19 +28,20 @@ class UpstreamError(Exception):
     Args:
         message: human-readable description.
         status_code: HTTP status returned to the client.
-        error_type: error type in Anthropic format.
+        error_type: error type in Anthropic format; ``None`` derives it
+            from the status (``anthropic_error_type_for_status``).
     """
 
     def __init__(
         self,
         message: str,
         status_code: int = 502,
-        error_type: str = "api_error",
+        error_type: str | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
-        self.error_type = error_type
+        self.error_type = error_type or anthropic_error_type_for_status(status_code)
 
 
 class ProviderError(UpstreamError):
@@ -75,7 +76,11 @@ def anthropic_error_body(error_type: str, message: str) -> dict[str, Any]:
 
 
 def anthropic_error_type_for_status(status_code: int) -> str:
-    """Map an HTTP status to an Anthropic error type for a mid-stream error event.
+    """Map an HTTP status to an Anthropic error type.
+
+    The fallback for every error the router did not classify itself: the
+    default ``UpstreamError.error_type``, and the type of a stream error
+    event a byte-for-byte proxy emits with nothing but a status in hand.
 
     Args:
         status_code: HTTP status of the upstream error.
@@ -93,7 +98,9 @@ def anthropic_error_type_for_status(status_code: int) -> str:
     return "api_error"
 
 
-def stream_error_event(status_code: int, message: str) -> str:
+def stream_error_event(
+    status_code: int, message: str, error_type: str | None = None
+) -> str:
     """Build an Anthropic SSE ``event: error`` frame for a post-start error.
 
     The frame is valid at any point in an Anthropic stream and is terminal,
@@ -103,11 +110,15 @@ def stream_error_event(status_code: int, message: str) -> str:
     Args:
         status_code: HTTP status of the upstream error.
         message: human-readable message.
+        error_type: the Anthropic error type the caller already knows;
+            ``None`` derives it from the status.
 
     Returns:
         An SSE string ``event: error\\ndata: {...}\\n\\n``.
     """
-    body = anthropic_error_body(anthropic_error_type_for_status(status_code), message)
+    body = anthropic_error_body(
+        error_type or anthropic_error_type_for_status(status_code), message
+    )
     return f"event: error\ndata: {json.dumps(body, ensure_ascii=False)}\n\n"
 
 

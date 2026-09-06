@@ -1,4 +1,4 @@
-.PHONY: install run run-proxy test lint typecheck full-check freeze
+.PHONY: install run run-proxy sync-client-config test lint typecheck full-check freeze
 
 install:
 	uv sync
@@ -11,6 +11,11 @@ run:
 
 run-proxy:
 	ROUTER_PROXY_ENABLED=true PYTHONPATH=src uv run python -m entrypoint
+
+# Regenerates ~/.claude/open-harness-router.settings.json from routing.yaml:
+# the /model picker rows and the unknown-model window enforcement switch.
+sync-client-config:
+	PYTHONPATH=src uv run python -m cli.sync_client_config
 
 test:
 	uv run pytest -q

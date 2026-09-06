@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
+import yaml
 
 from routing.config_loader import load_routing_config
 from routing.registry import ProviderRegistry
@@ -81,9 +84,20 @@ def test_describe_routes_lists_rules_in_priority_order_then_default(
             "match_value": "GLM",
             "provider": "openai_compatible",
             "upstream_model": "zai-org/GLM-5.2-FP8",
+            "max_tokens_limit": 65536,
         },
-        {"match_type": "prefix", "match_value": "gpt-", "provider": "openai"},
-        {"match_type": "prefix", "match_value": "chat-", "provider": "openai_chat"},
+        {
+            "match_type": "prefix",
+            "match_value": "gpt-",
+            "provider": "openai",
+            "max_tokens_limit": 128000,
+        },
+        {
+            "match_type": "prefix",
+            "match_value": "chat-",
+            "provider": "openai_chat",
+            "max_tokens_limit": 128000,
+        },
         {"match_type": "default", "provider": "anthropic"},
     ]
 
@@ -105,3 +119,44 @@ def test_describe_routes_includes_upstream_model_when_set(
 def test_describe_routes_last_entry_is_default(registry: ProviderRegistry) -> None:
     routes = registry.describe_routes()
     assert routes[-1] == {"match_type": "default", "provider": registry.default_provider}
+
+
+def test_resolve_falls_back_to_the_provider_limits_without_a_rule_override(
+    registry: ProviderRegistry,
+) -> None:
+    """A rule that overrides nothing hands the provider's own numbers to the provider."""
+    decision = registry.resolve("zai-org/GLM-5.2-FP8")
+    assert decision.limits.max_tokens_limit == 65536
+    assert decision.limits.context_window is None
+
+
+def test_resolve_and_describe_routes_carry_a_rule_limit_override(
+    _env: None,  # noqa: PT019
+    tmp_path: Path,
+) -> None:
+    """A per-model override reaches both the routing decision and the route table.
+
+    Two models on one gateway differ only by these numbers, so the decision
+    must carry the rule's values, not the provider block's.
+
+    The overrides go into the routing file and through ``load_routing_config``
+    rather than onto an already-built model: patching a validated rule in
+    place would skip the very validators that decide whether the pair is
+    usable.
+    """
+    settings = Settings()
+    raw = yaml.safe_load(settings.routing.config_path.read_text(encoding="utf-8"))
+    raw["rules"][1]["max_tokens_limit"] = 32000
+    raw["rules"][1]["context_window"] = 223680
+    routing_path = tmp_path / "routing_override.yaml"
+    routing_path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+
+    registry = ProviderRegistry.build(load_routing_config(routing_path), settings)
+
+    decision = registry.resolve("zai-org/GLM-5.2-FP8")
+
+    assert decision.limits.max_tokens_limit == 32000
+    assert decision.limits.context_window == 223680
+    assert registry.providers["openai_compatible"].cfg.max_tokens_limit == 65536
+    assert registry.describe_routes()[1]["max_tokens_limit"] == 32000
+    assert registry.describe_routes()[1]["context_window"] == 223680

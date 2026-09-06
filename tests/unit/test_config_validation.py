@@ -533,3 +533,329 @@ def test_tls_verify_hostname_false_parsed_when_set() -> None:
     raw["providers"]["openai_compatible"]["tls_verify_hostname"] = False  # type: ignore[index]
     cfg = RoutingConfig.model_validate(raw)
     assert cfg.providers["openai_compatible"].tls_verify_hostname is False
+
+
+def test_context_window_unset_defaults_to_none() -> None:
+    """context_window is optional: unset on both provider types -> None, behaviour unchanged."""
+    cfg = RoutingConfig.model_validate(_clone_valid())
+    assert cfg.providers["anthropic"].context_window is None
+    assert cfg.providers["openai_compatible"].context_window is None
+
+
+def test_context_window_set_on_openai_translate_is_accepted() -> None:
+    """An explicit context_window above max_tokens_limit parses on openai-translate."""
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["context_window"] = 131072  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.providers["openai_compatible"].context_window == 131072
+
+
+def test_context_window_set_on_passthrough_is_rejected() -> None:
+    """context_window is meaningless (and rejected) on passthrough providers.
+
+    Passthrough forwards byte-for-byte and never estimates tokens, so a
+    configured window would quietly do nothing -- the same trap class as
+    forward_client_auth/auth_header on the wrong provider type.
+    """
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["context_window"] = 200000  # type: ignore[index]
+    with pytest.raises(ValueError, match="context_window only applies to openai-translate"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_context_window_explicitly_null_on_passthrough_is_accepted() -> None:
+    """An explicit null states the absence of a window -- exactly what passthrough has.
+
+    The rejection targets a value that would quietly do nothing; ``null``
+    configures nothing, so spelling out the default must not be an error.
+    """
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["context_window"] = None  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.providers["anthropic"].context_window is None
+
+
+@pytest.mark.parametrize(
+    ("provider_patch", "expected_message"),
+    [
+        pytest.param(
+            {"context_window": 65536},
+            "context_window must be greater than max_tokens_limit",
+            id="equal_to_the_completion_cap",
+        ),
+        pytest.param(
+            {"max_tokens_limit": 500, "context_window": 600},
+            (
+                r"context_window=600, max_tokens_limit=500, "
+                r"reserve=512, minimum useful completion=4096"
+            ),
+            id="no_room_for_reserve_and_completion",
+        ),
+    ],
+)
+def test_context_window_the_completion_budget_fills_is_rejected(
+    provider_patch: dict[str, int], expected_message: str
+) -> None:
+    """The window must exceed the cap, the pre-flight reserve and the minimum completion."""
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"].update(provider_patch)  # type: ignore[union-attr]
+    with pytest.raises(ValueError, match=expected_message):
+        RoutingConfig.model_validate(raw)
+
+
+def test_client_models_defaults_to_empty_list() -> None:
+    """client_models is optional: rules that omit it keep an empty list."""
+    cfg = RoutingConfig.model_validate(_clone_valid())
+    assert cfg.rules[0].client_models == []
+    assert cfg.rules[1].client_models == []
+
+
+def test_client_models_matching_its_own_rule_is_accepted() -> None:
+    """An id its own rule accepts and no earlier rule captures parses fine."""
+    raw = _clone_valid()
+    raw["rules"][1]["client_models"] = ["zai-org/GLM-5.2-FP8"]  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.rules[1].client_models == ["zai-org/GLM-5.2-FP8"]
+
+
+def test_client_models_entry_its_own_rule_rejects_is_rejected() -> None:
+    """An id the rule's own match does not accept would route somewhere else.
+
+    The picker offers exactly these ids to the client, so an entry the rule
+    cannot match is a row that lands on the default route (native
+    Anthropic) instead of the provider the operator meant.
+    """
+    raw = _clone_valid()
+    raw["rules"][1]["client_models"] = ["gpt-5.6-sol"]  # type: ignore[index]
+    with pytest.raises(ValueError, match="which its own match does not accept"):
+        RoutingConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("rules", "expected_message"),
+    [
+        pytest.param(
+            [
+                {"match": {"type": "prefix", "value": "claude-"}, "provider": "anthropic"},
+                {
+                    "match": {"type": "contains", "value": "GLM"},
+                    "provider": "openai_compatible",
+                    "client_models": ["claude-GLM-hybrid"],
+                },
+            ],
+            r"'claude-GLM-hybrid'.*is captured by the earlier rule #1",
+            id="client_models_entry",
+        ),
+        pytest.param(
+            [
+                {
+                    "match": {"type": "prefix", "value": "gpt-"},
+                    "provider": "openai_compatible",
+                    "client_models": ["gpt-5.6-sol"],
+                },
+                {
+                    "match": {"type": "exact", "value": "gpt-5.6-mini"},
+                    "provider": "openai_compatible",
+                },
+            ],
+            r"'gpt-5.6-mini'.*is captured by the earlier rule #1",
+            id="exact_rule_match_value",
+        ),
+    ],
+)
+def test_model_id_captured_by_an_earlier_rule_is_rejected(
+    rules: list[dict[str, object]], expected_message: str
+) -> None:
+    """First match wins, so an id an earlier rule also matches never arrives."""
+    raw = _clone_valid()
+    raw["rules"] = rules
+    with pytest.raises(ValueError, match=expected_message):
+        RoutingConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("rules", "expected_message"),
+    [
+        pytest.param(
+            [
+                {
+                    "match": {"type": "exact", "value": "shared-alias"},
+                    "provider": "anthropic",
+                    "client_models": ["shared-alias"],
+                },
+                {
+                    "match": {"type": "contains", "value": "shared"},
+                    "provider": "openai_compatible",
+                    "client_models": ["shared-alias"],
+                },
+            ],
+            "'shared-alias' is listed by rule #1 and rule #2",
+            id="two_client_models_lists",
+        ),
+        pytest.param(
+            [
+                {
+                    "match": {"type": "exact", "value": "fleet-minimax"},
+                    "provider": "openai_compatible",
+                },
+                {
+                    "match": {"type": "contains", "value": "minimax"},
+                    "provider": "openai_compatible",
+                    "client_models": ["fleet-minimax"],
+                },
+            ],
+            "'fleet-minimax' is listed by rule #1 and rule #2",
+            id="exact_rule_value_and_a_client_models_list",
+        ),
+    ],
+)
+def test_model_id_owned_by_two_rules_is_rejected(
+    rules: list[dict[str, object]], expected_message: str
+) -> None:
+    """One model id belongs to exactly one rule -- two owners are ambiguous."""
+    raw = _clone_valid()
+    raw["rules"] = rules
+    with pytest.raises(ValueError, match=expected_message):
+        RoutingConfig.model_validate(raw)
+
+
+def test_client_models_id_listed_twice_in_one_rule_is_rejected() -> None:
+    """A repeated id would emit the same picker row twice."""
+    raw = _clone_valid()
+    raw["rules"][1]["client_models"] = ["GLM-a", "GLM-a"]  # type: ignore[index]
+    with pytest.raises(ValueError, match="is listed by rule #2 and rule #2"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_client_models_on_an_exact_rule_is_accepted() -> None:
+    """An exact rule may still spell out its id explicitly."""
+    raw = _clone_valid()
+    raw["rules"].append(  # type: ignore[union-attr]
+        {
+            "match": {"type": "exact", "value": "agen-minimax-m3"},
+            "provider": "openai_compatible",
+            "client_models": ["agen-minimax-m3"],
+        }
+    )
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.rules[2].client_models == ["agen-minimax-m3"]
+
+
+def test_rule_limit_overrides_on_openai_translate_rule_are_accepted() -> None:
+    """Per-model limits on a rule: several models on one gateway, one provider block.
+
+    The pair exists so two models served by the same base_url/key/CA bundle
+    no longer need duplicate provider entries just to carry different caps.
+    """
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["context_window"] = 223680  # type: ignore[index]
+    raw["rules"][1]["max_tokens_limit"] = 65536  # type: ignore[index]
+    raw["rules"][1]["context_window"] = 1048576  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.rules[1].max_tokens_limit == 65536
+    assert cfg.rules[1].context_window == 1048576
+
+
+def test_rule_limit_overrides_unset_stay_none() -> None:
+    """An untouched rule keeps both overrides at None -- the provider's values apply."""
+    cfg = RoutingConfig.model_validate(_clone_valid())
+    assert cfg.rules[0].max_tokens_limit is None
+    assert cfg.rules[0].context_window is None
+    assert cfg.rules[1].max_tokens_limit is None
+    assert cfg.rules[1].context_window is None
+
+
+@pytest.mark.parametrize("field", ["max_tokens_limit", "context_window"])
+def test_rule_limit_override_on_passthrough_rule_is_rejected(field: str) -> None:
+    """A limit override on a passthrough rule -> startup error, like upstream_model.
+
+    Byte-for-byte proxying never converts the body, so neither the
+    completion cap nor the pre-flight estimate runs: the number would be a
+    configured value that quietly does nothing.
+    """
+    raw = _clone_valid()
+    raw["rules"][0][field] = 32000  # type: ignore[index]
+    with pytest.raises(ValueError, match=rf"rule #1 \('claude-'\).*{field}.*passthrough"):
+        RoutingConfig.model_validate(raw)
+
+
+@pytest.mark.parametrize(
+    ("provider_patch", "rule_patch", "expected_message"),
+    [
+        pytest.param(
+            {},
+            {"max_tokens_limit": 200000, "context_window": 100000},
+            r"rule #2 \('GLM'\).*context_window=100000, max_tokens_limit=200000",
+            id="both_overridden",
+        ),
+        pytest.param(
+            {"context_window": 206650},
+            {"max_tokens_limit": 300000},
+            r"rule #2 \('GLM'\).*context_window=206650, max_tokens_limit=300000",
+            id="max_tokens_limit_overridden_window_from_provider",
+        ),
+        pytest.param(
+            {},
+            {"context_window": 65536},
+            r"rule #2 \('GLM'\).*context_window=65536, max_tokens_limit=65536",
+            id="window_overridden_cap_from_provider",
+        ),
+        pytest.param(
+            {"context_window": 65536},
+            {},
+            r"context_window=65536, max_tokens_limit=65536, reserve=512",
+            id="both_from_provider",
+        ),
+        pytest.param(
+            {},
+            {"max_tokens_limit": 500, "context_window": 600},
+            r"rule #2 \('GLM'\).*context_window=600, max_tokens_limit=500, reserve=512",
+            id="no_room_for_reserve_and_completion",
+        ),
+    ],
+)
+def test_rule_effective_window_not_greater_than_effective_cap_is_rejected(
+    provider_patch: dict[str, int],
+    rule_patch: dict[str, int],
+    expected_message: str,
+) -> None:
+    """The provider invariant holds for the EFFECTIVE pair, in every override combination.
+
+    A window the completion cap alone fills leaves no room for a prompt, so
+    every request would be rejected -- whichever of the two numbers comes
+    from the rule and which from the provider.
+    """
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"].update(provider_patch)  # type: ignore[union-attr]
+    raw["rules"][1].update(rule_patch)  # type: ignore[union-attr]
+    with pytest.raises(ValueError, match=expected_message):
+        RoutingConfig.model_validate(raw)
+
+
+def test_rule_window_override_above_the_provider_cap_is_accepted() -> None:
+    """Raising only the window on a rule is the DeepSeek case and must validate."""
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["context_window"] = 223680  # type: ignore[index]
+    raw["rules"][1]["context_window"] = 1048576  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.rules[1].context_window == 1048576
+    assert cfg.providers["openai_compatible"].context_window == 223680
+
+
+def test_exact_rule_value_no_earlier_rule_captures_is_accepted() -> None:
+    """The common shape stays valid: an exact rule after unrelated patterns."""
+    raw = _clone_valid()
+    raw["rules"].append(  # type: ignore[union-attr]
+        {"match": {"type": "exact", "value": "ag-MiniMax-M3"}, "provider": "openai_compatible"}
+    )
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.rules[2].match.value == "ag-MiniMax-M3"
+
+
+def test_context_window_just_above_the_sum_of_cap_reserve_and_completion_is_accepted() -> None:
+    """One token above the sum is enough: the guard is a strict inequality."""
+    raw = _clone_valid()
+    raw["providers"]["openai_compatible"]["max_tokens_limit"] = 500  # type: ignore[index]
+    raw["providers"]["openai_compatible"]["context_window"] = 5109  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+    assert cfg.providers["openai_compatible"].context_window == 5109

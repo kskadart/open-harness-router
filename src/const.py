@@ -101,9 +101,20 @@ UPSTREAM_REQUEST_FAILED_MESSAGE: str = "Upstream request failed. Retry the reque
 UPSTREAM_REQUEST_TIMEOUT_MESSAGE: str = "Upstream request timed out. Retry the request."
 UPSTREAM_STREAM_INTERRUPTED_MESSAGE: str = "Upstream stream interrupted. Retry the request."
 
+# Context-window guard for openai-translate providers that set
+# ``context_window``. The reserve absorbs what the character heuristic in
+# ``services.token_estimator`` cannot see (chat-template tokens, tool-call
+# framing, upstream-side additions), so the effective budget is
+# ``context_window - CONTEXT_WINDOW_RESERVE_TOKENS``.
+CONTEXT_WINDOW_RESERVE_TOKENS: int = 512
+
 # Smallest completion budget the router asks an upstream for: the floor the
 # converters apply to the client's ``max_tokens``.
 MIN_COMPLETION_TOKENS: int = 100
+
+# Floor for the context pre-flight: below this a reasoning upstream burns the
+# budget on reasoning and returns empty content, which the client cannot act on.
+MIN_USEFUL_COMPLETION_TOKENS: int = 4096
 
 
 class Constants:
