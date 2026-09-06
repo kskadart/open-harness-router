@@ -42,6 +42,24 @@ logger = get_logger(__name__)
 _MESSAGES_PATH = "/v1/messages"
 _COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 
+
+def _with_query(path: str, query: str) -> str:
+    """Re-attach the client's query string to an upstream path.
+
+    The router routes on the path alone, but the upstream should see the
+    target the client sent: Claude Code posts to ``/v1/messages?beta=true``,
+    and byte-for-byte proxying has no reason to drop that part.
+
+    Args:
+        path: the upstream path (``/v1/messages`` or its count endpoint).
+        query: the client's query string without the leading ``?``; empty
+            when the target had none.
+
+    Returns:
+        ``path`` with ``?query`` appended when ``query`` is non-empty.
+    """
+    return f"{path}?{query}" if query else path
+
 # Statuses for upstream transport failures: the client sees a gateway error
 # rather than a router 500, and can tell upstream unavailability apart from
 # timeout exhaustion by the status code.
@@ -362,9 +380,13 @@ class PassthroughProvider:
         client_channel: ClientChannel,
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Proxy /v1/messages; upstream_model and limits do not apply (verbatim body)."""
-        return await self._proxy(_MESSAGES_PATH, raw_body, client_headers, client_channel)
+        return await self._proxy(
+            _with_query(_MESSAGES_PATH, query), raw_body, client_headers, client_channel
+        )
 
     async def count_tokens(
         self,
@@ -372,10 +394,12 @@ class PassthroughProvider:
         client_headers: Mapping[str, str],
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Proxy ``/v1/messages/count_tokens`` to the upstream's own endpoint."""
         fwd = self._build_headers(client_headers)
-        return await self._proxy_unary(_COUNT_TOKENS_PATH, raw_body, fwd)
+        return await self._proxy_unary(_with_query(_COUNT_TOKENS_PATH, query), raw_body, fwd)
 
     async def aclose(self) -> None:
         """Close the httpx client."""

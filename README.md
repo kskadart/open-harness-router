@@ -131,6 +131,8 @@ provider/model is a YAML edit, no code changes. Provider types:
   passthrough provider is a startup error: byte-for-byte proxying forwards
   the request body, including the `model` field, unchanged and cannot
   rewrite it (`upstream_model` is only meaningful for `openai-translate`).
+  The request target's query string travels with the body: Claude Code
+  posts to `/v1/messages?beta=true`, and the upstream sees the same target.
   Supports `ca_bundle` (for a corporate/self-hosted Anthropic-compatible
   gateway behind a private CA, same as `openai-translate` below) and
   `extra_headers` (merged in after this provider's own auth handling, so it

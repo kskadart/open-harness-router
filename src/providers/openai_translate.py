@@ -527,8 +527,15 @@ class OpenAITranslateProvider:
         client_channel: ClientChannel,
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
-        """Translate ``/v1/messages`` into OpenAI and return an Anthropic response."""
+        """Translate ``/v1/messages`` into OpenAI and return an Anthropic response.
+
+        ``query`` is accepted for the provider contract and ignored: the
+        OpenAI-format upstream has no counterpart for the Anthropic target's
+        query string.
+        """
         try:
             parsed = ClaudeMessagesRequest.model_validate_json(raw_body)
         except ValidationError as exc:
@@ -781,6 +788,8 @@ class OpenAITranslateProvider:
         client_headers: Mapping[str, str],
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Estimate the input token count locally (the upstream has no count_tokens).
 

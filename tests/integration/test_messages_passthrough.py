@@ -13,6 +13,13 @@ import httpx
 from pytest_httpx import HTTPXMock
 
 _ANTHROPIC_URL = "https://api.anthropic.com/v1/messages"
+_ANTHROPIC_COUNT_URL = "https://api.anthropic.com/v1/messages/count_tokens"
+_CLIENT_HEADERS = {"x-api-key": "test-client-key", "anthropic-version": "2023-06-01"}
+_PAYLOAD = {
+    "model": "claude-opus-4-8",
+    "max_tokens": 16,
+    "messages": [{"role": "user", "content": "hi"}],
+}
 
 _ANTHROPIC_RESPONSE = {
     "id": "msg_test_01",
@@ -59,3 +66,45 @@ async def test_passthrough_forwards_claude_request_and_returns_upstream_body(
     assert upstream.headers.get("anthropic-version") == "2023-06-01"
     # The body must be proxied byte-for-byte.
     assert json.loads(upstream.content) == payload
+
+
+async def test_passthrough_keeps_the_query_string_on_messages(
+    client: httpx.AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    """Claude Code posts to ``/v1/messages?beta=true``; the upstream sees the same target."""
+    httpx_mock.add_response(
+        url=f"{_ANTHROPIC_URL}?beta=true",
+        method="POST",
+        json=_ANTHROPIC_RESPONSE,
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+    response = await client.post("/v1/messages?beta=true", json=_PAYLOAD, headers=_CLIENT_HEADERS)
+
+    assert response.status_code == 200
+    assert response.json() == _ANTHROPIC_RESPONSE
+    upstream = httpx_mock.get_requests(method="POST")
+    assert [str(request.url) for request in upstream] == [f"{_ANTHROPIC_URL}?beta=true"]
+
+
+async def test_passthrough_keeps_the_query_string_on_count_tokens(
+    client: httpx.AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    """The count endpoint is proxied with the client's query string as well."""
+    httpx_mock.add_response(
+        url=f"{_ANTHROPIC_COUNT_URL}?beta=true",
+        method="POST",
+        json={"input_tokens": 3},
+        status_code=200,
+        headers={"content-type": "application/json"},
+    )
+
+    response = await client.post(
+        "/v1/messages/count_tokens?beta=true", json=_PAYLOAD, headers=_CLIENT_HEADERS
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"input_tokens": 3}
+    upstream = httpx_mock.get_requests(method="POST")
+    assert [str(request.url) for request in upstream] == [f"{_ANTHROPIC_COUNT_URL}?beta=true"]

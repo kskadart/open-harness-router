@@ -66,6 +66,12 @@ class Provider(Protocol):
     than from ``cfg``: one provider serves every rule pointing at it, and a
     rule may rename the model and override the provider's token limits for
     the models it serves (``routing/registry.py``, ``RouteLimits``).
+
+    ``query`` is the client's request-target query string without the
+    leading ``?`` (Claude Code posts to ``/v1/messages?beta=true``). The
+    routing decision never looks at it; passthrough re-attaches it to the
+    upstream path so the upstream sees the target the client sent, and
+    translate ignores it -- an OpenAI-format upstream has no equivalent.
     """
 
     name: str
@@ -78,6 +84,8 @@ class Provider(Protocol):
         client_channel: ClientChannel,
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Handle a ``/v1/messages`` request and return the response to the client."""
         ...
@@ -88,6 +96,8 @@ class Provider(Protocol):
         client_headers: Mapping[str, str],
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Handle a ``/v1/messages/count_tokens`` request."""
         ...
