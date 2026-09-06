@@ -9,6 +9,7 @@ provider requests (default httpx transport) are intercepted by pytest-httpx.
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -17,7 +18,10 @@ import pytest
 import pytest_asyncio
 import structlog
 from fastapi import FastAPI
+from pydantic_settings import BaseSettings
 
+import main as main_module
+import settings as settings_module
 from main import create_app
 from routing.config_loader import load_routing_config
 from routing.registry import ProviderRegistry
@@ -26,6 +30,35 @@ from settings import Settings
 TESTS_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = TESTS_DIR.parent
 ROUTING_TEST_YAML = TESTS_DIR / "fixtures" / "routing_test.yaml"
+
+
+def _settings_classes() -> list[type[BaseSettings]]:
+    """Every ``BaseSettings`` subclass defined in ``settings``."""
+    return [
+        cls
+        for _name, cls in inspect.getmembers(settings_module, inspect.isclass)
+        if issubclass(cls, BaseSettings) and cls is not BaseSettings
+    ]
+
+
+@pytest.fixture(autouse=True)
+def _ignore_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the developer's working ``.env`` out of the test run.
+
+    The file reaches the code on two paths, and both are relative to the
+    current directory, which is the repository root under ``make test``:
+    every settings class reads ``env_file=".env"``, and ``build_runtime``
+    calls ``load_dotenv()``, which writes the file into ``os.environ`` for
+    the rest of the process -- past ``monkeypatch``, past the test that
+    triggered it. A working ``.env`` there (``ROUTER_PROXY_ENABLED=true`` on
+    a machine that runs the forward-proxy) leaked into tests that assert
+    the defaults and made them fail depending on the checkout, not the
+    code. Tests set what they need through ``monkeypatch.setenv``, so both
+    paths are disabled for all of them.
+    """
+    for cls in _settings_classes():
+        monkeypatch.setitem(cls.model_config, "env_file", None)
+    monkeypatch.setattr(main_module, "load_dotenv", lambda *_args, **_kwargs: False)
 
 
 @pytest.fixture(autouse=True)
