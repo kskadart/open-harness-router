@@ -1,3 +1,5 @@
+**English** | [Русский](README.ru.md)
+
 # Open Harness Router
 
 Run models from any vendor inside the Claude Code CLI. A single process speaks
@@ -21,6 +23,18 @@ Remote Control working: the CLI disables it under a custom
 `ANTHROPIC_BASE_URL`, but with the base URL untouched the feature stays on
 while every request is still routed across the fleet -- see the
 "Forward-proxy" section below.
+
+> **Platform support.** The router is developed and used daily on macOS, but
+> the router itself and its CLI helpers (`cli.validate_routing`,
+> `cli.tls_probe`, `cli.sync_client_config`) are plain Python with no
+> platform-specific code: the test suite runs on Ubuntu in CI
+> (`.github/workflows/ci.yml`, `runs-on: ubuntu-latest`) and the README covers
+> running the service under systemd on Linux. What is macOS-only is the
+> add-provider skill's restart step: its `restart_router.sh` talks to launchd
+> and exits with code 64 and a systemd hint on any other OS, and the skill's
+> default log path assumes `~/Library/Logs`. On Linux, restart the service by
+> hand (`systemctl --user restart ...` with your real unit name) and point
+> `OHR_ERR_LOG` at your own log file. Windows is untested.
 
 ## Installation
 
@@ -47,7 +61,11 @@ provider/model is a YAML edit, no code changes. Provider types:
   name `authorization`/`x-api-key` itself, or it would silently override
   the auth header this provider forwards or injects; rejected at startup);
 - `openai-translate` -- translates to OpenAI ChatCompletions (its own
-  `base_url`, key via `api_key_env`, optional `ca_bundle` in `certs/`).
+  `base_url`, key via `api_key_env`, optional `ca_bundle` in `certs/`). On
+  the `chat` flavor, `system`-role messages that the client appends inside
+  `messages` (not the top-level `system` prompt) are forwarded as user
+  text: some open-model chat templates stop generating on a trailing
+  system message and return an empty completion.
 
 `passthrough` has two mutually exclusive auth modes, set by
 `forward_client_auth` (`ProviderCfg`, `src/routing/schema.py`):
@@ -122,6 +140,25 @@ whole router, not just itself):
   it happened to carry a stray `ca_bundle`. Remove `ca_bundle` from any
   passthrough provider that doesn't actually sit behind a private CA.
 
+Three new rule-level validators can break an existing config at startup
+when a rule no longer satisfies them. Each error names the offending rule
+and how to fix it; as above, one bad rule blocks the whole router:
+
+- Every model id a rule advertises -- its `client_models` entries and, for
+  an `exact` rule, its own match value -- is now checked against the rules
+  above it. An `exact` rule whose id an earlier
+  `prefix`/`contains`/`regex` rule already captures used to load silently
+  and never match; it is now a startup error naming both rules. Same for an
+  id listed in two rules. Move the exact rule above the broader one, or
+  delete it.
+- Rule-level `max_tokens_limit` and `context_window` are now only allowed
+  on rules that point at an `openai-translate` provider; on a `passthrough`
+  rule they are a startup error, like `upstream_model` already was.
+- `context_window`, where set, must exceed `max_tokens_limit` plus
+  `CONTEXT_WINDOW_RESERVE_TOKENS` (512) plus `MIN_USEFUL_COMPLETION_TOKENS`
+  (4096); a smaller window is a startup error because no request could ever
+  fit. Only configs that set the new field are affected.
+
 Required variable: `ROUTER_CONFIG_PATH` (path to `routing.yaml`).
 Provider secrets are set via environment variables whose names are declared in
 `routing.yaml` (`api_key_env`).
@@ -163,6 +200,130 @@ changes are needed:
    hot-reloaded (for launchd -- `launchctl kickstart -k`, for systemd --
    `systemctl --user restart`, in a terminal -- restart `make run`).
 
+### The add-provider skill
+
+A guided version of the procedure above ships as a Claude Code skill,
+`.claude/skills/add-provider`: it turns a working cURL example (plus the CA
+certificate files, when the gateway sits behind a private CA) into a provider
+block, alias rules, a key in `.env` and a restarted router. It is
+user-invoked only (`disable-model-invocation: true` in its frontmatter) --
+the model never starts it on its own.
+
+```
+/add-provider <curl command> [cert.pem ...] [provider=<name>] [alias-prefix=<pfx->] [models=<upstream-id>[,...]]
+```
+
+Everything the cURL does not carry (provider name, alias prefix, the list of
+models) is asked for in one question, so `/add-provider <curl> [cert.pem ...]`
+is enough to start.
+
+What it does, in this order: parses the cURL into provider fields (`base_url`
+minus the endpoint suffix, `type` and `api_flavor`, auth header, upstream
+model ids, extra headers); appends the key to `.env` under the `api_key_env`
+name, in a single command, so the value never reaches a later one; matches
+the given certificates against the bundles in `certs/` and builds a new
+bundle only when none of them covers the input; smoke-tests the upstream
+directly, bypassing the forward-proxy, before any config is touched;
+determines `max_tokens_limit` and `context_window` per model and decides
+which number belongs on the provider as its default and which on a rule;
+writes the provider block and one `exact` rule per model into `routing.yaml`
+after a timestamped backup; validates the result offline; restarts the
+service with a health check and an automatic rollback; runs end-to-end
+checks through the router for every alias; and, optionally, writes subagent
+files and regenerates the client config. A cURL whose `base_url` already
+belongs to a provider in `routing.yaml` takes the "one more model" path
+instead: one new rule, the existing key and bundle, no second provider block.
+Certificates found in `proxy-ca/` are copied, never modified -- that
+directory belongs to the forward-proxy's own CA.
+
+Three helper commands do the work that would otherwise be guesswork; all of
+them are useful on their own and run from the repository root:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m cli.validate_routing \
+  [--expect-provider NAME] [ALIAS[=UPSTREAM_MODEL] ...]
+PYTHONPATH=src .venv/bin/python -m cli.tls_probe match CERT.pem [CERT.pem ...] [--provider NAME]
+PYTHONPATH=src .venv/bin/python -m cli.tls_probe probe --host HOST [--port 443] [--cafile certs/BUNDLE.pem]
+make sync-client-config
+```
+
+- `cli.validate_routing` builds the provider registry through
+  `main.build_runtime` -- the same code the service runs at startup, minus
+  the listening socket -- so a missing key variable, an unreadable CA bundle
+  or a misrouted alias surfaces here instead of crash-looping the service
+  after a restart. The `=== ROUTES ===` table prints each route's effective
+  `max_tokens_limit` and `context_window`, and every positional
+  `ALIAS=UPSTREAM_MODEL` is resolved and compared with what the rules
+  actually produce. Exit 0 -- the config builds and all expectations hold;
+  1 -- it does not build, with the same `open-harness-router: ...` message
+  the service would write to its err.log; 3 -- an alias resolved to a
+  different provider or upstream model than expected (or
+  `--expect-provider` names a provider that was not built).
+- `cli.tls_probe match` fingerprints the given PEM files and compares them
+  with every bundle in `certs/`: it prints `REUSE certs/<name>` (exit 0)
+  when one bundle already contains all of them, otherwise the `cat` command
+  that would create a new one (exit 10), and exits 2 when an input cannot be
+  read or holds no certificate. It never writes a file itself. Every
+  `WARNING:` line goes to stderr, including the certificates (subject,
+  notAfter, sha256) a reused bundle carries beyond the input -- the new
+  provider will trust those too. Neither subcommand uses exit 1 -- that is
+  the status Python gives an uncaught exception, so a crash can never be
+  read as a result.
+- `cli.tls_probe probe` performs one TLS handshake with exactly the trust
+  store the router would use for that provider (`httpx.create_ssl_context`
+  over `build_upstream_verify` in `src/services/http_transport.py`, not a
+  default context whose roots depend on the interpreter build), and builds
+  it with `trust_env=False` exactly as the router's own transport does, so
+  `SSL_CERT_FILE` and `SSL_CERT_DIR` in the shell cannot move the verdict.
+  That is what separates a host-name mismatch from a broken chain:
+  `CHAIN_OK_HOSTNAME_OK` (exit 0) needs nothing beyond `ca_bundle`,
+  `BUNDLE_UNUSABLE` (2) means the `--cafile` bundle could not be loaded and
+  no handshake was attempted, `CHAIN_OK_HOSTNAME_MISMATCH` (11) is the only
+  case that justifies
+  `tls_verify_hostname: false`, `CHAIN_FAIL` (12) means wrong or incomplete
+  certificates, and `CONNECT_FAIL` (13) means there was no TLS session at
+  all (DNS, VPN, port, firewall).
+- `make sync-client-config` regenerates the `/model` picker rows from the
+  new rules (see "Model picker and client settings").
+
+The restart is one blocking command rather than a bare `launchctl kickstart`:
+
+```bash
+bash .claude/skills/add-provider/scripts/restart_router.sh \
+  --expect-provider NAME --routing-backup routing.yaml.bak-<TS>
+```
+
+It returns only after `/health` answers 200 from a NEW pid whose provider
+list contains the expected name -- right after `kickstart -k` the old
+process can still answer with the old config while it drains, and an
+already-known provider name alone cannot tell the two apart. The script
+needs the real launchd label: it defaults to the placeholder
+`com.example.open-harness-router`, resolved as env `OHR_LAUNCHD_LABEL` ->
+a gitignored `.launchd-label` file at the repository root (its first
+non-blank line) -> the placeholder; without either, a zero-argument run
+exits 65 with a hint naming the file. On timeout -- or on a startup error
+in the error log (`open-harness-router: ...` line or a traceback), still
+only when `--routing-backup` was given -- it keeps the rejected config as
+`routing.yaml.failed-<epoch>`, copies the backup back over `routing.yaml`,
+restarts again and exits 1 (0 -- healthy on the new config, 2 -- bad
+arguments, an empty `.launchd-label`, the service down, or rollback
+impossible, 64 -- not macOS, 65 -- the service is not loaded in the user's
+launchd domain). This restart step is launchd-only: on any other OS the
+script exits with code 64 and a systemd hint, so on Linux restart the
+service by hand and point `OHR_ERR_LOG` at your own log.
+`OHR_HEALTH_TIMEOUT_S` bounds the wait in wall-clock seconds. Only the
+top-level session should run it, and only with no subagents in flight:
+during a Bash call the session itself holds no open stream, but a running
+subagent does, and `kickstart -k` cuts it off.
+
+Site-specific facts -- internal gateway hosts, where keys are issued, which
+model ids a deployment serves, which chain it presents -- stay out of the
+repository. They live in
+`.claude/skills/add-provider/references/local/`, gitignored via
+`.claude/skills/*/references/local/`, and the skill reads the note matching
+a host before asking anything. The committed template is
+`.claude/skills/add-provider/references/local.example.md`.
+
 ### How rules work
 
 Rules under `rules:` are checked top to bottom, and the first match wins
@@ -181,6 +342,28 @@ them first.
 upstream under, when it must differ from what the client sent. Only valid on
 rules pointing at an `openai-translate` provider: on `passthrough`, setting
 it is a startup error (see "Configuration" above).
+
+`max_tokens_limit` and `context_window` in a rule (optional) -- per-model
+limits that override the provider's own values for the models this rule
+serves; unset means the provider's value applies. One gateway usually hosts
+several models whose limits differ (one silently clamps an oversized
+completion budget, the next answers HTTP 500; one is served on a 223K
+window, the next on a 1M one), and without the override each of them needs
+its own provider block repeating the same `base_url`, `api_key_env`,
+`ca_bundle` and `extra_headers`. Give the provider the conservative pair as
+its default and raise it on the rule of a model that was measured. Both are
+startup errors on a rule pointing at a `passthrough` provider (no
+conversion, so neither the cap nor the pre-flight ever runs), and the
+EFFECTIVE pair must satisfy the same invariant the provider's does --
+`context_window` greater than `max_tokens_limit`.
+
+`client_models` in a rule (optional) -- the exact model ids a client may
+send for this rule, used by `make sync-client-config` to build the `/model`
+picker (see "Model picker and client settings"). A `prefix`/`contains`/`regex`
+match value is a pattern and not a usable id, so those rules can only be
+advertised through this list; an `exact` rule already is its own id. Each
+entry is validated at startup against its own rule and against the rules
+above it -- an id an earlier rule also matches would never arrive here.
 
 If no rule matches, `default.provider` is used. The schema
 (`src/routing/schema.py`) requires `default.provider` to be a `passthrough`
@@ -221,9 +404,13 @@ tail -f ~/Library/Logs/open-harness-router.log | jq 'select(.event == "startup")
 
 ```json
 {"match_type": "prefix", "match_value": "claude-", "provider": "anthropic"}
-{"match_type": "contains", "match_value": "GLM", "provider": "openai_compatible", "upstream_model": "zai-org/GLM-5.2-FP8"}
+{"match_type": "contains", "match_value": "GLM", "provider": "openai_compatible", "upstream_model": "zai-org/GLM-5.2-FP8", "max_tokens_limit": 65536, "context_window": 206650}
 {"match_type": "default", "provider": "anthropic"}
 ```
+
+The two limits are the effective ones for that route (the rule's overrides
+folded onto the provider's values), so two models on one provider show
+their own numbers; fields the route does not have are omitted.
 
 Useful after editing the config: if the expected rule is missing from the
 list, or sits below a broader one, either the router restarted with a stale
@@ -249,7 +436,13 @@ Fields of an `openai-translate` provider (`ProviderCfg`,
   provider fails validation at startup). Caps `max_tokens` on the outgoing
   request; for reasoning models a low cap is dangerous -- reasoning tokens
   burn the budget before any visible text appears, and the upstream returns
-  empty `content` with `stop_reason max_tokens`.
+  empty `content` with `stop_reason max_tokens`. It is the default for
+  every rule on this provider; a rule may override it per model (see
+  "Routing rules").
+- `context_window` -- optional, the deployment's total context in tokens
+  (prompt plus completion). Must be greater than `max_tokens_limit` plus
+  `CONTEXT_WINDOW_RESERVE_TOKENS` (512) plus `MIN_USEFUL_COMPLETION_TOKENS`
+  (4096). See "Context window and token counting" below.
 - `drop_params` -- which top-level request parameters to strip before
   sending (only `temperature`, `top_p`, `stop` are allowed); needed when the
   upstream errors out on an unsupported parameter instead of silently
@@ -270,6 +463,117 @@ only `connect_timeout_s` (`ROUTER_UPSTREAM_CONNECT_TIMEOUT_S`, shared
 across all upstreams) and `stream_read_timeout_s` (per provider) ever reach
 `httpx.Timeout`. Setting `timeout_s` in `routing.yaml` parses without error
 but has no effect on either provider type.
+
+### Context window and token counting
+
+`context_window` (`ProviderCfg`, `src/routing/schema.py`) -- the upstream
+model's total context size in tokens, prompt plus completion. Optional and
+`openai-translate`-only: an explicit value on `passthrough` is a startup
+error (the body is forwarded byte-for-byte and never estimated), and the
+value must be greater than `max_tokens_limit` plus
+`CONTEXT_WINDOW_RESERVE_TOKENS` (512) plus `MIN_USEFUL_COMPLETION_TOKENS`
+(4096). Unset means no estimate and no pre-flight: the request goes
+upstream exactly as before.
+
+The number the guard actually uses is the EFFECTIVE one for the resolved
+route: `RoutingRule.context_window` where the matching rule sets it, the
+provider's value otherwise (same for `max_tokens_limit`). The registry
+resolves the pair once per request and hands it to the provider
+(`RouteLimits`, `src/routing/registry.py`), which is what lets one gateway
+serve several models with different windows from a single provider block --
+the conservative pair on the provider, the measured one on the rule of each
+model that was probed.
+
+`make sync-client-config` writes
+`CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` (see "Model picker
+and client settings"), so from then on the router's pre-flight is the only
+guard: an `openai-translate` model with no effective `context_window`
+(neither on its rule nor on its provider) has none at all, which is why
+`cli.sync_client_config` refuses to advertise such a model.
+
+Set it to the deployment's real limit, not the model card's: a serving
+stack such as vLLM caps at its `max_model_len`, which is often lower than
+the architecture allows. Ways to find it: the model's entry in the
+upstream's `/v1/models` (fields such as `max_model_len` or
+`context_length`, when the upstream exposes them), the vendor's
+documentation, or the upstream's own error text on an oversized test
+request (an OpenAI-compatible context-length 400 usually names the limit).
+`/add-provider` (`.claude/skills/add-provider`) walks through this as part
+of its guided procedure.
+
+`POST /v1/messages/count_tokens` is served per provider type
+(`src/api/count_tokens.py`):
+
+- `passthrough` -- proxied to the upstream's own
+  `/v1/messages/count_tokens`, so the count is the vendor's;
+- `openai-translate` -- estimated locally
+  (`src/services/token_estimator.py`), since most OpenAI-compatible
+  upstreams have no count endpoint. The count request goes through the
+  same request builder as `/v1/messages`, so it is a character heuristic
+  over the exact converted wire payload, calibrated 2026-09-04 against
+  `usage.input_tokens` of two fleet models to over-count by 1.10-1.33.
+
+Overflow behaviour when `context_window` is set
+(`OpenAITranslateProvider._enforce_context_window`,
+`src/providers/openai_translate.py`), streaming and non-streaming alike,
+before any upstream call:
+
+- budget = `context_window - CONTEXT_WINDOW_RESERVE_TOKENS` (512,
+  `src/const.py`; the reserve absorbs what the heuristic cannot see --
+  chat-template tokens, tool-call framing, upstream-side additions);
+- if the estimated prompt leaves less than `MIN_USEFUL_COMPLETION_TOKENS`
+  (4096, `src/const.py`) of that budget, the request is rejected without
+  calling the upstream:
+  HTTP 400 `invalid_request_error` with the message `prompt is too long:
+  <N> tokens > <M> maximum (capability_rejected: prompt_too_long)`, and a
+  `context_window_reject` log event (`provider`, `model`, `estimate`,
+  `context_window`);
+- otherwise the completion budget -- `max_tokens` (under the provider's
+  `token_param` name) or `max_output_tokens` on the `responses` flavor --
+  is clamped to what remains, and a `context_window_clamp` event
+  (`estimate`, `requested`, `clamped`) is logged only when the value
+  actually changed.
+
+Upstream context-length 400s (texts such as `maximum context length`,
+`context length exceeded`, `prompt is too long`) are remapped to the same
+400 `invalid_request_error` shape with the same token, so the client sees
+one error whether the router or the upstream caught the overflow. The
+remap covers 400s only: an upstream that answers an overflow with a 5xx
+instead (seen on a self-hosted fleet deployment) is retried by the SDK
+like any server error and never reaches the remap -- there the pre-flight
+above is the only protection, which is the main reason to set
+`context_window` for such a deployment.
+
+How Claude Code reacts, from its official docs:
+
+- `count_tokens` is optional in the gateway protocol: when the endpoint is
+  absent, Claude Code counts context usage through the inference endpoint
+  instead (`llm-gateway-protocol.md`, "Optional endpoints and startup
+  traffic"). The router serves it for both provider types, so counts do
+  not consume inference requests.
+- A request rejected because the input plus `max_tokens` exceeds the
+  context limit is retried with a reduced `max_tokens`; Claude Code stops
+  retrying and compacts when no reduction can fit (`errors.md`,
+  "Automatic retries"). The recovery matches on the error wording, so a
+  gateway that wraps errors breaks it unless the message carries a stable
+  `capability_rejected:` token (`llm-gateway-protocol.md`, "Automatic
+  retry and error forwarding"); `capability_rejected: prompt_too_long` is
+  treated the same as `Prompt is too long`, recognized from Claude Code
+  v2.1.228 (`errors.md`, "Prompt is too long"). That is why the router's
+  reject and remap messages carry the token.
+- For a model ID it does not recognize (a fleet alias), Claude Code
+  compacts at the context window it assumes for the ID;
+  `CLAUDE_CODE_MAX_CONTEXT_TOKENS` declares the window it should assume
+  instead (applies directly when the ID neither starts with `claude-` nor
+  contains `[1m]`), and the auto-compact threshold is set with
+  `/autocompact <value>` (saved as the `autoCompactWindow` setting), the
+  `--autocompact` flag, or `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+  (`model-config.md`, "Context window and auto-compaction"). With
+  `CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` it compacts
+  only after the API rejects the conversation with a too-long error it
+  recognizes -- the router's reject and remap produce exactly that
+  wording. Either way the router's guard is the backstop for when the
+  assumed window exceeds the deployment's real one.
 
 ## Running
 
@@ -355,7 +659,19 @@ Key fields:
 - `StandardOutPath` / `StandardErrorPath` -- stdout and stderr go to separate
   files.
 
-Management (current `bootstrap`/`bootout` syntax, the `gui/<uid>` domain of
+First save the plist above to `~/Library/LaunchAgents/<your label>.plist`,
+replacing the placeholder `com.example.open-harness-router` label and the
+`/path/to/...` program path with the real values. Then open the LaunchAgent:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.example.open-harness-router.plist
+```
+
+Put the same label into a `.launchd-label` file at the repository root (one
+line, gitignored): the add-provider skill's restart script looks the service up
+by that label.
+
+For management (current `bootstrap`/`bootout` syntax, the `gui/<uid>` domain of
 the user session):
 
 ```bash
@@ -492,12 +808,67 @@ Anthropic via the subscription), subagents run on the model from
 `CLAUDE_CODE_SUBAGENT_MODEL` (e.g. GLM via the corporate-gateway template,
 see "Configuration" -- the provider and rule need to be uncommented). For
 per-agent control, instead of the global variable you can set `model:` in
-the frontmatter of individual agents under `.claude/agents/*.md`.
+the frontmatter of individual agents under `.claude/agents/*.md`. That directory
+and its files are your own Claude Code configuration, not part of this
+repository -- create them yourself if they don't exist yet.
 
 A limitation of the CLI itself: as long as `ANTHROPIC_BASE_URL` doesn't point
 at `api.anthropic.com`, Remote Control is unavailable (as of v2.1.196). This
 limitation is specific to reverse-proxy mode -- forward-proxy works around it
 without losing routing, see below.
+
+### Model picker and client settings
+
+The `/model` picker does not discover the router's models on its own: gateway
+model discovery keeps only ids containing `claude` or `anthropic`, and the
+router serves no `/v1/models` endpoint anyway. The way to list arbitrary ids
+is the `modelPicker.options` setting (Claude Code v2.1.242 and newer), which
+the CLI reads only from managed settings, from a file passed with
+`--settings`, and from user settings.
+
+`~/.claude/settings.json` is the wrong file to generate: the CLI writes to it
+during a session (`/model` stores `model`, `/effort` stores `modelSettings`),
+so a regenerated copy would drop what the session had just saved. Instead the
+router generates a dedicated file and the wrapper passes it explicitly:
+
+```bash
+make sync-client-config      # -> ~/.claude/open-harness-router.settings.json
+```
+
+The command (`src/cli/sync_client_config.py`, also runnable as
+`PYTHONPATH=src .venv/bin/python -m cli.sync_client_config`) reads
+`routing.yaml` and writes two things:
+
+- `modelPicker.options` -- one row per offered model, labelled with its
+  provider and the effective context window and output cap of that model's
+  own rule (so two models sharing a provider advertise their own limits). A
+  `prefix`/`contains`/`regex` rule without `client_models` is skipped with a
+  warning naming the rule, and the run fails only when no model can be
+  listed at all. Rules serving a `passthrough` provider are skipped --
+  native `claude-*` ids are already in the picker.
+- `env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` = `"1"` --
+  without it, Claude Code compacts proactively against the window it assumes
+  for an unrecognised model id, which has nothing to do with the real window
+  of the deployment behind the router. The variable applies to unrecognised
+  ids only, so `claude-*` sessions keep their normal compaction (see
+  "Context window and token counting").
+
+Every other key in the file is preserved -- at the top level and inside
+`env`/`modelPicker`, so a hand-set `modelPicker.replaceBuiltInOptions`
+survives a regeneration. The write is atomic (temporary file plus
+`os.replace`), keeps the file's previous permission mode, and leaves the
+previous version intact if the write fails; an unparsable file is a refusal
+rather than an overwrite. `--check` reports whether the file matches
+`routing.yaml` without writing anything (exit 3 when it does not), and
+`--settings-path` targets a different file.
+
+Wire the file into the session -- it takes effect in a new session only:
+
+```bash
+env -u ANTHROPIC_API_KEY \
+  ANTHROPIC_BASE_URL=http://127.0.0.1:8787 \
+  claude --settings ~/.claude/open-harness-router.settings.json
+```
 
 ## Forward-proxy
 
