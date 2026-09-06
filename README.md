@@ -580,7 +580,8 @@ How Claude Code reacts, from its official docs:
 ```bash
 make run          # reverse-proxy: uvicorn main:create_app --factory
                   # (port ROUTER_SERVER_PORT, default 8787)
-make run-proxy    # forward-proxy: python -m proxy.server
+make run-proxy    # both listeners in one process:
+                  # ROUTER_PROXY_ENABLED=true python -m entrypoint
                   # (port ROUTER_PROXY_PORT, default 8788)
 ```
 
@@ -659,6 +660,14 @@ Key fields:
 - `StandardOutPath` / `StandardErrorPath` -- stdout and stderr go to separate
   files.
 
+`bin/open-harness-router` in the repository is a ready-made
+`ProgramArguments` target: it execs `.venv/bin/python -m entrypoint` from
+the repository root, so the macOS Background Items entry carries the
+service name instead of `python`. Use it in place of the `uvicorn` path
+above when one agent should also be able to start the forward-proxy; it
+needs `PYTHONPATH=src` in `EnvironmentVariables`, because `src` is not
+installed into the venv.
+
 First save the plist above to `~/Library/LaunchAgents/<your label>.plist`,
 replacing the placeholder `com.example.open-harness-router` label and the
 `/path/to/...` program path with the real values. Then open the LaunchAgent:
@@ -702,14 +711,15 @@ tail -f ~/Library/Logs/open-harness-router.log | jq 'select(.level == "error")'
 
 #### Both modes at once
 
-Forward-proxy is launched from a different entry point (`python -m
-proxy.server`, not `uvicorn`), so it needs a separate LaunchAgent -- its own
-`Label`, its own `ProgramArguments`, its own log files. `python -m` has no
-equivalent of the `--app-dir` flag that `uvicorn` uses to add `src/` to
-`sys.path`, so it needs an explicit `EnvironmentVariables` with
-`PYTHONPATH=src` instead (in the Makefile this is done by `PYTHONPATH=src uv
-run python -m proxy.server`; launchd doesn't read the Makefile, so the
-variable must be set in the plist):
+`make run-proxy` serves both ports from one process (`python -m entrypoint`
+with `ROUTER_PROXY_ENABLED=true`), but under launchd the forward-proxy can
+also stay a separate agent: `python -m proxy.server` is still a standalone
+entry point that starts the proxy alone, and it needs its own `Label`, its
+own `ProgramArguments`, its own log files. `python -m` has no equivalent of
+the `--app-dir` flag that `uvicorn` uses to add `src/` to `sys.path`, so it
+needs an explicit `EnvironmentVariables` with `PYTHONPATH=src` instead (in
+the Makefile this is done by `PYTHONPATH=src uv run python -m entrypoint`;
+launchd doesn't read the Makefile, so the variable must be set in the plist):
 
 ```xml
     <key>Label</key>
@@ -740,9 +750,12 @@ variable must be set in the plist):
 (`RunAtLoad`, `KeepAlive`, `ThrottleInterval` -- same as in the first plist.)
 Both services can run in parallel: reverse-proxy listens on
 `ROUTER_SERVER_PORT` (default 8787), forward-proxy on
-`ROUTER_PROXY_PORT` (default 8788) -- two independent processes with no
-shared state, other than the shared `routing.yaml` and the environment
-variables holding provider keys.
+`ROUTER_PROXY_PORT` (default 8788) -- two processes, each with its own
+provider registry and its own connection pools, sharing nothing but
+`routing.yaml` and the environment variables holding provider keys. One
+agent running `python -m entrypoint` with `ROUTER_PROXY_ENABLED=true` and
+`PYTHONPATH=src` in `EnvironmentVariables` covers both ports instead, from
+a single process on a single registry.
 
 ### Linux (systemd)
 
@@ -939,10 +952,14 @@ proxy:
 - `ROUTER_PROXY_NO_PROXY_HOSTS` -- a comma-separated list of hosts that
   always go direct, bypassing the corporate proxy.
 
-Other mode variables: `ROUTER_PROXY_HOST` / `ROUTER_PROXY_PORT`
-(interface and port for accepting `CONNECT`, default `127.0.0.1:8788`),
-`ROUTER_PROXY_CONNECT_TIMEOUT_S` (timeout for establishing the outgoing
-connection and waiting for the upstream proxy's response).
+Other mode variables: `ROUTER_PROXY_ENABLED` (default `false`; the combined
+entrypoint starts the forward-proxy only when it is `true`, and a bare
+`uvicorn main:create_app --factory` ignores it, logging a
+`proxy_enabled_without_entrypoint` warning), `ROUTER_PROXY_HOST` /
+`ROUTER_PROXY_PORT` (interface and port for accepting `CONNECT`, default
+`127.0.0.1:8788`), `ROUTER_PROXY_CONNECT_TIMEOUT_S` (timeout for
+establishing the outgoing connection and waiting for the upstream proxy's
+response).
 
 ## Development
 
@@ -957,7 +974,8 @@ make typecheck
 
 ```
 src/
-  main.py            create_app() factory + lifespan; build_runtime() for forward-proxy
+  entrypoint.py      ASGI listener + optional forward-proxy in one process
+  main.py            create_app() factory + lifespan; build_runtime() builds settings + registry
   settings.py        pydantic-settings by domain (server, routing, proxy, logging, secrets)
   log.py             structlog JSON
   const.py           constants
@@ -970,6 +988,7 @@ src/
   proxy/             forward-proxy: CONNECT, MITM TLS, certificates, tunnel, HTTP/1.1 session
   routing/           routing.yaml schema, matcher, loader, registry
   services/          headers, reasoning-context cache, token estimation
+bin/                 launcher for launchd: execs .venv python -m entrypoint
 routing.example.yaml example provider/rule registry (in git)
 routing.yaml         personal provider/rule registry (gitignored, cp from the example)
 certs/               your own CA bundles for upstream providers (create as needed)
