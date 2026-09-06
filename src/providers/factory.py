@@ -37,7 +37,10 @@ def _resolve_ca_bundle(name: str, cfg: ProviderCfg, settings: Settings) -> Path 
         return None
     ca_path = settings.routing.certs_dir / cfg.ca_bundle
     if not ca_path.exists():
-        raise ConfigError(f"provider '{name}': CA bundle not found: {ca_path}")
+        raise ConfigError(
+            f"provider '{name}': CA bundle not found: {ca_path} (ca_bundle resolves "
+            f"against certs_dir from ROUTER_CERTS_DIR); create it or fix ca_bundle"
+        )
     return ca_path
 
 
@@ -67,7 +70,8 @@ def _resolve_required_api_key(name: str, cfg: ProviderCfg, settings: Settings) -
     api_key = settings.secrets.resolve(cast(str, cfg.api_key_env))
     if api_key is None:
         raise ConfigError(
-            f"provider '{name}': env '{cfg.api_key_env}' with API key is not set"
+            f"provider '{name}': env '{cfg.api_key_env}' with API key is not set; "
+            f"add {cfg.api_key_env}=<value> to .env and re-run"
         )
     return api_key
 

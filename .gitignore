@@ -23,3 +23,5 @@ certs/*.pem
 tasks/
 # macOS Finder metadata
 .DS_Store
+# Local launchd label for scripts/restart_router.sh -- one machine's service name
+.launchd-label
