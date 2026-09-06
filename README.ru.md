@@ -2,14 +2,16 @@
 
 # Open Harness Router
 
-Запуск моделей любого вендора внутри CLI Claude Code. Один процесс говорит с
-клиентом на Anthropic API (`/v1/messages`) и разводит каждый запрос по имени
-модели на парк провайдеров. Нативные модели Anthropic идут сквозным режимом,
-байт в байт. Всё остальное проходит трансляцию Anthropic <-> OpenAI: OpenAI
-GPT-5.x (включая Responses API, он нужен reasoning-моделям с инструментами),
-Kimi (Moonshot AI), Qwen (Alibaba Cloud Model Studio), Grok (xAI), GLM за
-корпоративным OpenAI-совместимым шлюзом, DeepSeek, OpenRouter, локальный
-инстанс vLLM.
+Запуск моделей любого вендора внутри CLI Claude Code. Роутер это одна программа,
+которая принимает запросы в формате Anthropic Messages API
+(`POST /v1/messages`), поэтому Claude Code подключается к ней как к самой
+Anthropic. Для каждого запроса роутер смотрит имя модели и по правилам из
+`routing.yaml` отправляет его одному из настроенных провайдеров. Модели
+Anthropic уходят в Anthropic без изменений (сквозной режим). Любая другая модель
+переводится в формат OpenAI и уходит в сторонний API: OpenAI GPT-5.x (включая
+Responses API, он нужен reasoning-моделям с инструментами), Kimi (Moonshot AI),
+Qwen (Alibaba Cloud Model Studio), Grok (xAI), GLM за корпоративным
+OpenAI-совместимым шлюзом, DeepSeek, OpenRouter, локальный инстанс vLLM.
 
 Оркестратор Claude Code всегда остаётся на нативных моделях Anthropic.
 Правила `claude-*` и правила алиасов ведут в сквозной режим, а маршрут по
