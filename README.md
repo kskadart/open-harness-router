@@ -2,6 +2,8 @@
 
 # Open Harness Router
 
+![The dashboard: request, error, in-flight, token and cost tiles, per-provider and per-model tables, the requests in flight, the event feed and the routing table](docs/dashboard.png)
+
 Run models from any vendor inside the Claude Code CLI. The router is one program
 that accepts requests in the Anthropic Messages API format
 (`POST /v1/messages`), so Claude Code connects to it as if it were Anthropic
@@ -1025,8 +1027,6 @@ establishing the outgoing connection and waiting for the upstream proxy's
 response).
 
 ## Dashboard
-
-![The dashboard: request, error, in-flight, token and cost tiles, per-provider and per-model tables, the requests in flight, the event feed and the routing table](docs/dashboard.png)
 
 `http://127.0.0.1:8787/dashboard` (the ASGI listener, in both run modes)
 shows what the router is doing without a log file: the requests in flight
