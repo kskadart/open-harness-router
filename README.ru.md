@@ -1031,6 +1031,82 @@ env -u ANTHROPIC_BASE_URL \
 `127.0.0.1:8788`), `ROUTER_PROXY_CONNECT_TIMEOUT_S` (таймаут установки
 исходящего соединения и ожидания ответа от вышестоящего прокси).
 
+## Дашборд
+
+`http://127.0.0.1:8787/dashboard` (ASGI-слушатель, в обоих режимах работы)
+показывает, чем занят роутер, без чтения лога: запросы в полёте и сколько
+они уже идут, счётчики по провайдерам и моделям (запросы, ошибки, средняя
+длительность, токены на входе, выходе и в кэше, стоимость), ленту последних
+событий, таблицу маршрутов и факты о forward-proxy (адрес, белый список
+MITM, срок корневого CA). Страница опрашивает `GET /dashboard/state`,
+который отдаёт ту же картину в JSON, так что её можно читать через
+`curl`/`jq` или забирать чем угодно ещё.
+
+Откуда данные (`src/services/monitor.py`):
+
+- каждый маршрутизируемый запрос `/v1/messages` и
+  `/v1/messages/count_tokens`, в обоих входах, от решения о маршруте до
+  последнего байта ответа. Токены считываются с ответа в формате Anthropic
+  по пути к клиенту (объект `usage` в JSON-теле или события `message_start`
+  и `message_delta` в SSE-потоке) без буферизации и без изменения байтов;
+  то же чтение работает и для транслированных ответов. Поток в gzip или
+  deflate (так `api.anthropic.com` отвечает клиенту, который это принимает;
+  passthrough передаёт его сжатым) распаковывается только для чтения;
+  поток в кодировке, которую stdlib не умеет (`br`, `zstd`), уходит как
+  есть и токенов не даёт;
+- события лога, которые стоит видеть: что forward-proxy туннелировал или
+  передал мимо маршрутизируемых путей, повторы, обрезки и отказы по
+  контекстному окну, а также все предупреждения и ошибки.
+
+Колонке стоимости нужны цены: необязательный блок `pricing` у провайдера
+(по умолчанию для его правил) или у правила (только для этой модели), в
+долларах за миллион токенов: `input`, `output` и по желанию `cache_write`
+и `cache_read` (незаданные цены кэша считаются по цене `input`, верхняя
+оценка). Роутер ничего не биллит и никуда эти числа не отправляет; на
+passthrough-маршруте по подписке колонка показывает, сколько тот же трафик
+стоил бы по ценам API. Без `pricing` в колонке стоит `n/a`, колонки с
+токенами работают.
+
+```yaml
+providers:
+  anthropic:
+    type: passthrough
+    base_url: https://api.anthropic.com
+    pricing: {input: 3, output: 15, cache_write: 3.75, cache_read: 0.3}
+```
+
+Счётчики живут в процессе роутера (сбрасываются при перезапуске), лента
+хранит последние 500 записей. В состоянии есть имена моделей, провайдеров,
+пути запросов и хосты туннелей, но никогда тела и учётные данные; как и
+`/health`, оно рассчитано на loopback-интерфейс, который слушатель
+занимает по умолчанию.
+
+### Prometheus и Grafana
+
+Те же счётчики отдаются в текстовом формате Prometheus на `GET /metrics`
+(без клиентской библиотеки, `src/api/metrics.py`): `ohr_requests_total`,
+`ohr_errors_total`, `ohr_request_duration_seconds` (`_sum` и `_count`
+summary), `ohr_tokens_total` с меткой `kind` (`input`, `output`,
+`cache_write`, `cache_read`), `ohr_cost_usd_total` и
+`ohr_priced_requests_total`, все с метками `provider` и `model`; плюс
+gauge `ohr_inflight_requests` по `provider`, `ohr_uptime_seconds`,
+`ohr_forward_proxy_enabled` и `ohr_info{version}`. Итоги по провайдеру
+получаются через `sum by (provider)`.
+
+В `monitoring/` лежит готовый стек: `docker-compose.yml` с Prometheus
+(опрашивает `host.docker.internal:8787/metrics` каждые 5 с, хранит 30
+дней) и Grafana с уже подключённым источником данных и дашбордом
+(запросы, ошибки, in-flight, токены по видам, стоимость, средняя
+длительность и таблица итогов). Оба слушают только loopback.
+
+```bash
+cd monitoring && docker compose up -d
+open http://127.0.0.1:3000        # admin / admin
+```
+
+Сама лента событий остаётся в JSON-логе (см. «Как проверить, куда уйдёт
+модель»); просмотрщик вроде `lnav` или стек Loki читают его как есть.
+
 ## Релизы
 
 Версии в формате `major.minor.micro`, каждый релиз получает тег `vX.Y.Z`.
@@ -1088,15 +1164,16 @@ src/
   const.py           constants
   dependencies.py    FastAPI DI providers (Depends)
   errors.py          domain exceptions, Anthropic error format
-  api/               /v1/messages, /v1/messages/count_tokens, /health, request adapters
+  api/               /v1/messages, /v1/messages/count_tokens, /health, /dashboard, /metrics, request adapters
   conversion/        Anthropic <-> OpenAI translation (request/response)
   models/            pydantic schemas for Anthropic requests
   providers/         passthrough, openai-translate, base interface, factory
   proxy/             forward-proxy: CONNECT, MITM TLS, certificates, tunnel, HTTP/1.1 session
   routing/           routing.yaml schema, matcher, loader, registry
-  services/          headers, reasoning-context cache, token estimation
+  services/          headers, reasoning-context cache, token estimation, монитор дашборда
 .claude/skills/      Claude Code skills: add-provider, release
 bin/                 launcher for launchd: execs .venv python -m entrypoint
+monitoring/          стек Prometheus + Grafana для /metrics (docker compose), готовый дашборд
 routing.example.yaml example provider/rule registry (in git)
 routing.yaml         personal provider/rule registry (gitignored, cp from the example)
 certs/               your own CA bundles for upstream providers (create as needed)

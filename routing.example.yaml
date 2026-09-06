@@ -27,6 +27,15 @@ providers:
     forward_client_auth: true          # forward authorization / anthropic-version / anthropic-beta
     timeout_s: 120
     stream_read_timeout_s: 600
+    # Optional, for the cost column of http://127.0.0.1:8787/dashboard only:
+    # USD per million tokens, never sent anywhere. On a subscription-billed
+    # route this shows what the same traffic would cost at API prices. A
+    # rule may override it for its own model (pricing: under rules:).
+    # pricing:
+    #   input: 3
+    #   output: 15
+    #   cache_write: 3.75
+    #   cache_read: 0.3
 
   # Template for an OpenAI-compatible provider behind a translation layer
   # (type: openai-translate). The primary use case is a corporate

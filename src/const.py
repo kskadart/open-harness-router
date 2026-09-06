@@ -116,6 +116,15 @@ MIN_COMPLETION_TOKENS: int = 100
 # budget on reasoning and returns empty content, which the client cannot act on.
 MIN_USEFUL_COMPLETION_TOKENS: int = 4096
 
+# Bounds of the dashboard monitor (``services.monitor``): how many feed
+# entries the ring buffer keeps, how long a copied log field may be, and the
+# longest SSE line the usage scanner is willing to buffer before giving up
+# on it. None of them is a setting: the feed is a glance at recent activity,
+# not a log, and the scanner must never grow with a hostile stream.
+MONITOR_EVENT_BUFFER: int = 500
+MONITOR_EVENT_TEXT_LIMIT: int = 300
+MONITOR_SSE_LINE_LIMIT: int = 1 << 20
+
 
 class Constants:
     """String constants for the Anthropic/OpenAI protocols."""

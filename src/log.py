@@ -15,13 +15,17 @@ import logging.config
 
 import structlog
 
+from services.monitor import capture_for_monitor
 from settings import LoggingSettings
 
-# Processors shared by structlog and stdlib logs (uvicorn etc.).
+# Processors shared by structlog and stdlib logs (uvicorn etc.). The monitor
+# capture comes last: it reads the level and timestamp the two processors
+# before it add, and it returns the event dict untouched.
 _SHARED: list[structlog.typing.Processor] = [
     structlog.contextvars.merge_contextvars,
     structlog.stdlib.add_log_level,
     structlog.processors.TimeStamper(fmt="iso"),
+    capture_for_monitor,
 ]
 
 

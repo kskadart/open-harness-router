@@ -9,6 +9,12 @@ providers:
     forward_client_auth: true
     timeout_s: 30
     stream_read_timeout_s: 30
+    # Dashboard cost column (USD per million tokens); never sent upstream.
+    pricing:
+      input: 3
+      output: 15
+      cache_write: 3.75
+      cache_read: 0.3
 
   openai_compatible:
     type: openai-translate

@@ -8,7 +8,13 @@ from log import get_logger
 from providers.base import Provider
 from providers.factory import build_provider
 from routing.matcher import match_model
-from routing.schema import RouteLimits, RoutingConfig, RoutingRule
+from routing.schema import (
+    PricingCfg,
+    RouteLimits,
+    RoutingConfig,
+    RoutingRule,
+    effective_pricing,
+)
 from settings import Settings
 
 logger = get_logger(__name__)
@@ -23,11 +29,15 @@ class RouteDecision:
         upstream_model: model name for the upstream (None -> keep the original).
         limits: token limits for this route -- the matched rule's overrides
             folded onto the provider's own values.
+        pricing: the prices the dashboard costs this route at, resolved the
+            same way; ``None`` when neither the rule nor the provider sets
+            them.
     """
 
     provider: Provider
     upstream_model: str | None
     limits: RouteLimits
+    pricing: PricingCfg | None = None
 
 
 class ProviderRegistry:
@@ -83,9 +93,15 @@ class ProviderRegistry:
                     provider,
                     rule.upstream_model,
                     RouteLimits.resolve(provider.cfg, rule),
+                    effective_pricing(provider.cfg, rule),
                 )
         default = self.providers[self.default_provider]
-        return RouteDecision(default, None, RouteLimits.resolve(default.cfg, None))
+        return RouteDecision(
+            default,
+            None,
+            RouteLimits.resolve(default.cfg, None),
+            effective_pricing(default.cfg, None),
+        )
 
     def describe_routes(self) -> list[dict[str, str | int]]:
         """Build a compact description of the routing table for the startup log.
