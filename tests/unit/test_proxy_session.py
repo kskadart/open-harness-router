@@ -29,6 +29,7 @@ from proxy.session import (
     is_protocol_switch_requested,
     next_event,
     request_path,
+    request_query,
     response_has_body,
     upstream_request_headers,
 )
@@ -69,6 +70,7 @@ class StubProvider:
             limits from (a passthrough block: no conversion, no limits).
         seen_headers: headers of the last request received from the session.
         seen_channel: the client channel passed to ``handle_messages``.
+        seen_query: the query string passed with the last request.
     """
 
     def __init__(
@@ -88,6 +90,7 @@ class StubProvider:
         self._error = error
         self.seen_headers: Mapping[str, str] = {}
         self.seen_channel: ClientChannel | None = None
+        self.seen_query = ""
 
     async def handle_messages(
         self,
@@ -96,10 +99,13 @@ class StubProvider:
         client_channel: ClientChannel,
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Return the prepared result or raise the prepared error."""
         self.seen_headers = client_headers
         self.seen_channel = client_channel
+        self.seen_query = query
         if self._error is not None:
             raise self._error
         assert self._result is not None
@@ -111,8 +117,11 @@ class StubProvider:
         client_headers: Mapping[str, str],
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Return a fixed token count estimate."""
+        self.seen_query = query
         return ProviderResult(
             status_code=200,
             headers={"content-type": "application/json"},
@@ -659,6 +668,49 @@ def test_protocol_switch_is_recognised_from_upgrade_or_connection_header(
 def test_query_string_is_stripped_from_the_routed_path(target: bytes, expected: str) -> None:
     """The routing decision is made on the path, not the target with a query part."""
     assert request_path(target) == expected
+
+
+@pytest.mark.parametrize(
+    ("target", "expected"),
+    [
+        (b"/v1/messages", ""),
+        (b"/v1/messages?", ""),
+        (b"/v1/messages?beta=true", "beta=true"),
+        (b"/api/feature_flags/v1?app=cli&x=1", "app=cli&x=1"),
+    ],
+)
+def test_query_string_is_recovered_from_the_target(target: bytes, expected: str) -> None:
+    """The query part is kept separately, so the provider can pass it upstream."""
+    assert request_query(target) == expected
+
+
+@pytest.mark.parametrize(
+    ("target", "expected_query"),
+    [
+        ("/v1/messages?beta=true", "beta=true"),
+        ("/v1/messages/count_tokens?beta=true", "beta=true"),
+        ("/v1/messages", ""),
+    ],
+)
+async def test_query_string_reaches_the_provider(
+    connect_streams: StreamFactory, target: str, expected_query: str
+) -> None:
+    """Routing ignores the query, but the provider still receives it.
+
+    Claude Code posts inference to ``/v1/messages?beta=true``; a passthrough
+    provider re-attaches the query, so the upstream sees the same target.
+    """
+    provider = StubProvider(ProviderResult(200, {"content-type": "application/json"}, b"{}"))
+    streams = await connect_streams()
+    task = _start_session(streams, _registry(provider))
+    conn = h11.Connection(h11.CLIENT)
+
+    await _send_request(streams, conn, target, _MESSAGES_BODY)
+    response, _body = await _read_response(streams, conn)
+
+    assert response.status_code == 200
+    assert provider.seen_query == expected_query
+    task.cancel()
 
 
 @pytest.mark.parametrize(

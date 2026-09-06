@@ -208,6 +208,10 @@ async def next_event(
 def request_path(target: bytes) -> str:
     """Extract the path from the request target, discarding the query string.
 
+    The query is only left out of the ROUTING decision; ``request_query``
+    recovers it, and the routed handler hands it to the provider so the
+    upstream still sees the target the client sent.
+
     Trailing slashes are stripped: ``/v1/messages/`` denotes the same
     resource as ``/v1/messages``, but compared literally against the route
     table it would not match and would go to the real upstream -- meaning
@@ -223,6 +227,24 @@ def request_path(target: bytes) -> str:
     """
     path = target.split(b"?", 1)[0].decode(_HEADER_ENCODING)
     return path.rstrip("/") or "/"
+
+
+def request_query(target: bytes) -> str:
+    """Extract the query string from the request target, without the ``?``.
+
+    Claude Code posts inference to ``/v1/messages?beta=true``; the routing
+    decision ignores that part (``request_path``), but the provider receives
+    it so a passthrough upstream sees the same target the client sent.
+
+    Args:
+        target: request target in origin-form (``/v1/messages?beta=true``).
+
+    Returns:
+        The query part after the first ``?``; an empty string when the
+        target has none (``/v1/messages?`` counts as none).
+    """
+    _path, separator, query = target.partition(b"?")
+    return query.decode(_HEADER_ENCODING) if separator else ""
 
 
 def client_headers_mapping(headers: Iterable[tuple[bytes, bytes]]) -> dict[str, str]:
@@ -640,13 +662,19 @@ class MitmHttpSession:
         )
 
         headers = client_headers_mapping(request.headers)
+        query = request_query(request.target)
         if path == _COUNT_TOKENS_PATH:
             result = await decision.provider.count_tokens(
-                raw_body, headers, decision.upstream_model, decision.limits
+                raw_body, headers, decision.upstream_model, decision.limits, query=query
             )
         else:
             result = await decision.provider.handle_messages(
-                raw_body, headers, self._channel, decision.upstream_model, decision.limits
+                raw_body,
+                headers,
+                self._channel,
+                decision.upstream_model,
+                decision.limits,
+                query=query,
             )
         return await self._send_result(result)
 

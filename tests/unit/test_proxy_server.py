@@ -52,6 +52,8 @@ class StubProvider:
         client_channel: ClientChannel,
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Return a fixed response instead of calling a real model."""
         return ProviderResult(
@@ -66,6 +68,8 @@ class StubProvider:
         client_headers: Mapping[str, str],
         upstream_model: str | None,
         limits: RouteLimits,
+        *,
+        query: str = "",
     ) -> ProviderResult:
         """Return a fixed token count estimate."""
         return ProviderResult(status_code=200, headers={}, body=b"{}")
