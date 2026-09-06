@@ -1033,6 +1033,8 @@ env -u ANTHROPIC_BASE_URL \
 
 ## Дашборд
 
+![Дашборд: плитки запросов, ошибок, in-flight, токенов и стоимости, таблицы по провайдерам и моделям, запросы в полёте, лента событий и таблица маршрутов](docs/dashboard.png)
+
 `http://127.0.0.1:8787/dashboard` (ASGI-слушатель, в обоих режимах работы)
 показывает, чем занят роутер, без чтения лога: запросы в полёте и сколько
 они уже идут, счётчики по провайдерам и моделям (запросы, ошибки, средняя
@@ -1179,4 +1181,5 @@ routing.yaml         personal provider/rule registry (gitignored, cp from the ex
 certs/               your own CA bundles for upstream providers (create as needed)
 proxy-ca/            forward-proxy root CA (generated on first run)
 CHANGELOG.md         release notes, one section per version (created by the first /release)
+docs/                картинки для README (скриншот дашборда)
 ```
