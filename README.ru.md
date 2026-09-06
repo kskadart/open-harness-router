@@ -15,14 +15,25 @@ Kimi (Moonshot AI), Qwen (Alibaba Cloud Model Studio), Grok (xAI), GLM за
 Правила `claude-*` и правила алиасов ведут в сквозной режим, а маршрут по
 умолчанию обязан быть сквозным, это проверяет валидатор конфигурации.
 
-Два режима запуска делят один реестр провайдеров: reverse-proxy (`make run`,
-клиент смотрит на роутер через `ANTHROPIC_BASE_URL`) и forward-proxy
-(`make run-proxy`, клиент ходит через `HTTPS_PROXY`, а `ANTHROPIC_BASE_URL`
-остаётся нетронутым). Forward-proxy сохраняет работу Remote Control из
-claude.ai: CLI выключает эту функцию под кастомным `ANTHROPIC_BASE_URL`, а с
-нетронутым базовым URL она остаётся включённой, и при этом каждый запрос
-по-прежнему расходится по парку. Подробности собраны в разделе
-«Forward-proxy» ниже.
+Два режима запуска делят один реестр провайдеров и одинаково маршрутизируют
+кастомные модели. Основной режим forward-proxy (`make run-proxy`): клиент
+оставляет `ANTHROPIC_BASE_URL` по умолчанию и задаёт только `HTTPS_PROXY` и
+`NODE_EXTRA_CA_CERTS`, поэтому CLI считает, что говорит с
+`api.anthropic.com`, и все функции Claude Code работают как при прямом
+подключении, включая Remote Control (`/rc`). Через реестр провайдеров идут
+только `/v1/messages` и `/v1/messages/count_tokens`, остальные пути на этом
+хосте уходят к настоящему апстриму без изменений. Цена: один раз доверить
+корневой сертификат роутера через `NODE_EXTRA_CA_CERTS` и поднять слушатель
+прокси (`ROUTER_PROXY_ENABLED=true`, оба слушателя в одном процессе), об этом
+раздел «Forward-proxy» ниже. Reverse-proxy (`make run`) проще: клиент
+направляет `ANTHROPIC_BASE_URL` на роутер, шага с сертификатом нет,
+кастомные модели маршрутизируются так же, но под кастомным
+`ANTHROPIC_BASE_URL` CLI выключает Remote Control. Направляйте клиент сюда,
+когда `/rc` не нужен или когда клиент не умеет ходить через HTTPS-прокси.
+Это ещё и обычный HTTP-интерфейс роутера: `/health`, прямые проверки
+`/v1/messages` через `curl`, любой SDK или инструмент, который знает только
+базовый URL, ходят сюда, поэтому объединённый процесс всегда держит этот
+слушатель поднятым рядом с прокси.
 
 > **Поддержка платформ.** Роутер разрабатывается и ежедневно используется на
 > macOS, но сам роутер и его вспомогательные CLI-модули (`cli.validate_routing`,
@@ -422,14 +433,15 @@ tail -f ~/Library/Logs/open-harness-router.log | jq 'select(.event == "startup")
 
 ### Два режима и выбор между ними
 
-`make run` (reverse-proxy, клиент задаёт `ANTHROPIC_BASE_URL`) проще в
-настройке, доверие сертификату не требуется. `make run-proxy` (forward-proxy,
-клиент задаёт `HTTPS_PROXY` и `NODE_EXTRA_CA_CERTS`, подробности в разделе
-«Forward-proxy» ниже) настраивается дольше, зато сохраняет работу Remote
-Control в CLI. Критерий выбора: `ANTHROPIC_BASE_URL`, который смотрит не на
-`api.anthropic.com`, выключает Remote Control (см. «Подключение Claude Code»
-ниже). Нужен Remote Control, берите forward-proxy; не нужен, берите
-reverse-proxy.
+Правило выбора дано во вступлении в начале файла: по умолчанию forward-proxy,
+а reverse-proxy берут, когда `/rc` не нужен или клиент не умеет ходить через
+HTTPS-прокси. Там не сказано о цене настройки. Forward-proxy требует
+поднятого слушателя прокси и доверия клиента к корневому сертификату роутера
+через `NODE_EXTRA_CA_CERTS`, это обязательный шаг, он описан в разделе
+«Forward-proxy» ниже. Взамен базовый URL по-прежнему смотрит на
+`api.anthropic.com`, поэтому Remote Control остаётся доступен (см.
+«Подключение Claude Code» ниже). Reverse-proxy требует от клиента только
+`ANTHROPIC_BASE_URL` и работает с любым клиентом, который умеет его задать.
 
 ### Настройки совместимости провайдера
 
@@ -966,6 +978,43 @@ env -u ANTHROPIC_BASE_URL \
 `127.0.0.1:8788`), `ROUTER_PROXY_CONNECT_TIMEOUT_S` (таймаут установки
 исходящего соединения и ожидания ответа от вышестоящего прокси).
 
+## Релизы
+
+Версии в формате `major.minor.micro`, каждый релиз получает тег `vX.Y.Z`.
+Заметки о релизах лежат в `CHANGELOG.md` в корне репозитория, в формате
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/): одна секция на
+версию, новые сверху. Если файла ещё нет, его создаёт первый запуск
+`/release`.
+
+Pull request считается выпущенным, когда его номер стоит как `#N` в секции
+`CHANGELOG.md`, версия которой уже получила тег. Пока не отработал
+`/release tag`, верхняя секция остаётся черновиком, её можно пересобрать.
+Список влитых PR берётся из GitHub (`gh pr list`), а не из `git log`: после
+rebase-мержа номера в теме коммита не остаётся. Сами релизные PR (заголовок начинается с `chore(release):`) из
+списка исключены, поэтому релиз не перечисляет собственный коммит.
+
+Релизы выпускает скилл `/release` (`.claude/skills/release`, только по вызову
+пользователя) в две фазы. Фаза 1, `/release [major|minor|micro|X.Y.Z]`,
+собирает невыпущенные PR, спрашивает подтверждение версии и списка записей,
+затем создаёт ветку `chore/release-vX.Y.Z` с новой секцией CHANGELOG,
+поднятой версией в `pyproject.toml` и пересобранным `uv.lock` и открывает PR.
+Этот PR вливаете вы. Фаза 2, `/release tag`, идёт после мержа: ставит тег
+`vX.Y.Z` на merge-коммит релизного PR, пушит тег и публикует релиз на GitHub,
+где заметками служит та же секция CHANGELOG. Ни одна фаза не перезапускает
+работающий сервис.
+
+Детерминированные шаги вынесены в CLI, он полезен и сам по себе, запускается
+из корня репозитория:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m cli.release version [--bump {major,minor,micro}]
+PYTHONPATH=src .venv/bin/python -m cli.release collect [--repo OWNER/NAME] [--changelog PATH]
+PYTHONPATH=src .venv/bin/python -m cli.release changelog --version X.Y.Z \
+  [--date YYYY-MM-DD] [--input prs.json] [--changelog PATH] [--write]
+PYTHONPATH=src .venv/bin/python -m cli.release bump --to X.Y.Z
+PYTHONPATH=src .venv/bin/python -m cli.release notes --version X.Y.Z [--changelog PATH]
+```
+
 ## Разработка
 
 ```bash
@@ -993,9 +1042,11 @@ src/
   proxy/             forward-proxy: CONNECT, MITM TLS, certificates, tunnel, HTTP/1.1 session
   routing/           routing.yaml schema, matcher, loader, registry
   services/          headers, reasoning-context cache, token estimation
+.claude/skills/      Claude Code skills: add-provider, release
 bin/                 launcher for launchd: execs .venv python -m entrypoint
 routing.example.yaml example provider/rule registry (in git)
 routing.yaml         personal provider/rule registry (gitignored, cp from the example)
 certs/               your own CA bundles for upstream providers (create as needed)
 proxy-ca/            forward-proxy root CA (generated on first run)
+CHANGELOG.md         release notes, one section per version (created by the first /release)
 ```

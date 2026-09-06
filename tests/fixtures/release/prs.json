@@ -1,0 +1,44 @@
+[
+  {
+    "number": 13,
+    "title": "Ship Qwen and Grok provider templates",
+    "url": "https://github.com/kskadart/open-harness-router/pull/13",
+    "mergedAt": "2026-08-28T09:14:00Z"
+  },
+  {
+    "number": 3,
+    "title": "feat(routing): enforce model context windows",
+    "url": "https://github.com/kskadart/open-harness-router/pull/3",
+    "mergedAt": "2026-08-02T11:05:00Z"
+  },
+  {
+    "number": 15,
+    "title": "chore(release): v0.1.0",
+    "url": "https://github.com/kskadart/open-harness-router/pull/15",
+    "mergedAt": "2026-08-30T18:40:00Z"
+  },
+  {
+    "number": 9,
+    "title": "chore(deps): pin httpx to 0.28.1",
+    "url": "https://github.com/kskadart/open-harness-router/pull/9",
+    "mergedAt": "2026-08-20T07:30:00Z"
+  },
+  {
+    "number": 11,
+    "title": "refactor(providers)!: drop the legacy provider block",
+    "url": "https://github.com/kskadart/open-harness-router/pull/11",
+    "mergedAt": "2026-08-25T16:00:00Z"
+  },
+  {
+    "number": 5,
+    "title": "fix: stop leaking credentials to third parties",
+    "url": "https://github.com/kskadart/open-harness-router/pull/5",
+    "mergedAt": "2026-08-10T13:20:00Z"
+  },
+  {
+    "number": 7,
+    "title": "docs(readme): describe the forward-proxy mode",
+    "url": "https://github.com/kskadart/open-harness-router/pull/7",
+    "mergedAt": "2026-08-15T10:00:00Z"
+  }
+]
