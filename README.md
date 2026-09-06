@@ -438,7 +438,7 @@ Fields of an `openai-translate` provider (`ProviderCfg`,
   burn the budget before any visible text appears, and the upstream returns
   empty `content` with `stop_reason max_tokens`. It is the default for
   every rule on this provider; a rule may override it per model (see
-  "Routing rules").
+  "How rules work").
 - `context_window` -- optional, the deployment's total context in tokens
   (prompt plus completion). Must be greater than `max_tokens_limit` plus
   `CONTEXT_WINDOW_RESERVE_TOKENS` (512) plus `MIN_USEFUL_COMPLETION_TOKENS`
