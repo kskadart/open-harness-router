@@ -1024,6 +1024,81 @@ entrypoint starts the forward-proxy only when it is `true`, and a bare
 establishing the outgoing connection and waiting for the upstream proxy's
 response).
 
+## Dashboard
+
+`http://127.0.0.1:8787/dashboard` (the ASGI listener, in both run modes)
+shows what the router is doing without a log file: the requests in flight
+and how long they have been running, per-provider and per-model counters
+(requests, errors, average duration, tokens in/out/cache, cost), a feed of
+the last events, the routing table, and the forward-proxy facts (listen
+address, MITM allowlist, root CA expiry). The page polls
+`GET /dashboard/state`, which returns the same picture as JSON, so it can
+be read with `curl`/`jq` or scraped by anything else.
+
+What feeds it (`src/services/monitor.py`):
+
+- every routed `/v1/messages` and `/v1/messages/count_tokens` request, in
+  both entrances, from the routing decision to the last response byte. Token
+  counts are read off the Anthropic-format response on its way to the
+  client (the `usage` object of a JSON body, or the `message_start` and
+  `message_delta` events of an SSE stream) without buffering or changing a
+  byte, and the same reading works for translated responses. A gzip or
+  deflate stream (what `api.anthropic.com` sends to a client that accepts
+  it; passthrough relays it compressed) is inflated for the reading only;
+  a stream in an encoding the stdlib cannot inflate (`br`, `zstd`) is
+  relayed untouched and counts no tokens;
+- the log events worth seeing: what the forward-proxy tunnelled or relayed
+  outside the routed paths, retries, context-window clamps and rejects, and
+  every warning or error.
+
+The cost column needs prices: an optional `pricing` block on a provider
+(the default for its rules) or on a rule (that model only), in USD per
+million tokens -- `input`, `output`, and optionally `cache_write` and
+`cache_read` (unset cache prices count at the `input` price, an upper
+bound). The router never bills anything and never sends these numbers
+anywhere; on a subscription-billed passthrough route the column shows what
+the same traffic would cost at API prices. Without `pricing` the column
+reads `n/a` and the token columns still work.
+
+```yaml
+providers:
+  anthropic:
+    type: passthrough
+    base_url: https://api.anthropic.com
+    pricing: {input: 3, output: 15, cache_write: 3.75, cache_read: 0.3}
+```
+
+The counters live in the router process (they reset on restart) and the
+feed keeps the last 500 entries. The state names models, providers, request
+paths and tunnelled hosts, never bodies or credentials; like `/health`, it
+is meant for the loopback interface the listener binds by default.
+
+### Prometheus and Grafana
+
+The same counters are served as Prometheus text on `GET /metrics` (no
+client library, `src/api/metrics.py`): `ohr_requests_total`,
+`ohr_errors_total`, `ohr_request_duration_seconds` (a summary's `_sum` and
+`_count`), `ohr_tokens_total` with a `kind` label (`input`, `output`,
+`cache_write`, `cache_read`), `ohr_cost_usd_total` and
+`ohr_priced_requests_total`, all labelled by `provider` and `model`; plus
+the gauges `ohr_inflight_requests` by `provider`, `ohr_uptime_seconds`,
+`ohr_forward_proxy_enabled` and `ohr_info{version}`. Per-provider totals
+are a `sum by (provider)` away.
+
+`monitoring/` holds a ready stack for it: a `docker-compose.yml` with
+Prometheus (scraping `host.docker.internal:8787/metrics` every 5 s, 30 days
+of retention) and Grafana with the data source and a dashboard provisioned
+(requests, errors, in-flight, tokens by kind, cost, average duration, and a
+totals table). Both bind to the loopback interface.
+
+```bash
+cd monitoring && docker compose up -d
+open http://127.0.0.1:3000        # admin / admin
+```
+
+The event feed itself stays in the JSON log (see "How to check where a model
+will go"); a log viewer such as `lnav` or a Loki stack reads it as is.
+
 ## Releases
 
 Versions are `major.minor.micro`, and every release is tagged `vX.Y.Z`. The
@@ -1081,15 +1156,16 @@ src/
   const.py           constants
   dependencies.py    FastAPI DI providers (Depends)
   errors.py          domain exceptions, Anthropic error format
-  api/               /v1/messages, /v1/messages/count_tokens, /health, request adapters
+  api/               /v1/messages, /v1/messages/count_tokens, /health, /dashboard, /metrics, request adapters
   conversion/        Anthropic <-> OpenAI translation (request/response)
   models/            pydantic schemas for Anthropic requests
   providers/         passthrough, openai-translate, base interface, factory
   proxy/             forward-proxy: CONNECT, MITM TLS, certificates, tunnel, HTTP/1.1 session
   routing/           routing.yaml schema, matcher, loader, registry
-  services/          headers, reasoning-context cache, token estimation
+  services/          headers, reasoning-context cache, token estimation, dashboard monitor
 .claude/skills/      Claude Code skills: add-provider, release
 bin/                 launcher for launchd: execs .venv python -m entrypoint
+monitoring/          Prometheus + Grafana stack for /metrics (docker compose), provisioned dashboard
 routing.example.yaml example provider/rule registry (in git)
 routing.yaml         personal provider/rule registry (gitignored, cp from the example)
 certs/               your own CA bundles for upstream providers (create as needed)

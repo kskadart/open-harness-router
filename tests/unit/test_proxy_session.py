@@ -36,6 +36,7 @@ from proxy.session import (
 from proxy.tls import build_leaf_tls_context, build_upstream_tls_context
 from routing.registry import ProviderRegistry
 from routing.schema import ProviderCfg, RouteLimits
+from services.monitor import Monitor
 from unit.conftest import ConnectedStreams
 
 StreamFactory = Callable[[], Awaitable[ConnectedStreams]]
@@ -1098,3 +1099,31 @@ async def test_upstream_disconnect_mid_body_is_not_retried(
 
     server.close()
     await server.wait_closed()
+
+
+async def test_routed_request_is_tracked_by_the_monitor(
+    connect_streams: StreamFactory,
+) -> None:
+    """A routed request through the MITM session lands in the dashboard's counters."""
+    monitor = Monitor.reset()
+    usage = {"input_tokens": 11, "output_tokens": 4}
+    payload = json.dumps({"id": "msg_1", "usage": usage}).encode()
+    provider = StubProvider(ProviderResult(200, {"content-type": "application/json"}, payload))
+    streams = await connect_streams()
+    task = _start_session(streams, _registry(provider))
+    conn = h11.Connection(h11.CLIENT)
+
+    await _send_request(streams, conn, "/v1/messages", _MESSAGES_BODY)
+    response, _body = await _read_response(streams, conn)
+
+    assert response.status_code == 200
+    snapshot = monitor.snapshot()
+    assert snapshot["totals"]["requests"] == 1
+    assert snapshot["providers"]["stub"]["usage"] == {
+        "input_tokens": 11,
+        "output_tokens": 4,
+        "cache_creation_input_tokens": 0,
+        "cache_read_input_tokens": 0,
+    }
+    assert snapshot["events"][0]["endpoint"] == "messages"
+    task.cancel()

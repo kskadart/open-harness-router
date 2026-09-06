@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>open-harness-router</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f6f7f9; --panel: #ffffff; --line: #e1e4e8; --fg: #1f2328; --muted: #6a737d;
+    --ok: #1a7f37; --warn: #9a6700; --err: #cf222e; --accent: #0969da;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0d1117; --panel: #161b22; --line: #30363d; --fg: #e6edf3; --muted: #8b949e;
+            --ok: #3fb950; --warn: #d29922; --err: #f85149; --accent: #58a6ff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 var(--font); }
+  header { display: flex; flex-wrap: wrap; gap: 8px 20px; align-items: baseline;
+           padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { font-size: 16px; margin: 0; }
+  header .fact { color: var(--muted); }
+  header .fact b { color: var(--fg); font-weight: 600; }
+  #status { margin-left: auto; font-size: 12px; color: var(--muted); }
+  #status.stale { color: var(--err); }
+  main { padding: 16px 20px; display: grid; gap: 16px; max-width: 1400px; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .tile .label { color: var(--muted); font-size: 12px; }
+  .tile .value { font-size: 22px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .sub { color: var(--muted); font-size: 12px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  section h2 { font-size: 13px; margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--line);
+               color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 500; font-size: 12px; }
+  tr:last-child td { border-bottom: 0; }
+  td.num, th.num { text-align: right; }
+  .mono { font-family: var(--mono); font-size: 12px; }
+  .muted { color: var(--muted); }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .err { color: var(--err); }
+  .empty { padding: 12px; color: var(--muted); }
+  .pill { display: inline-block; padding: 0 6px; border-radius: 10px; font-size: 11px;
+          border: 1px solid var(--line); color: var(--muted); }
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>open-harness-router</h1>
+  <span class="fact">version <b id="version">…</b></span>
+  <span class="fact">pid <b id="pid">…</b></span>
+  <span class="fact">up <b id="uptime">…</b></span>
+  <span class="fact">forward-proxy <b id="proxy">…</b></span>
+  <span class="fact">root CA <b id="ca">…</b></span>
+  <span id="status">connecting…</span>
+</header>
+<main>
+  <div class="tiles" id="tiles"></div>
+  <div class="two">
+    <section><h2>Providers</h2><div class="scroll" id="providers"></div></section>
+    <section><h2>Models</h2><div class="scroll" id="models"></div></section>
+  </div>
+  <section><h2>In flight</h2><div class="scroll" id="active"></div></section>
+  <section><h2>Events</h2><div class="scroll" id="events"></div></section>
+  <section><h2>Routes</h2><div class="scroll" id="routes"></div></section>
+</main>
+<script>
+(function () {
+  "use strict";
+  var POLL_MS = 2000;
+  var $ = function (id) { return document.getElementById(id); };
+  var esc = function (v) {
+    return String(v == null ? "" : v).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  };
+  var fmtInt = function (n) { return Number(n || 0).toLocaleString("en-US"); };
+  var fmtUsd = function (n) {
+    n = Number(n || 0);
+    return "$" + (n < 0.01 ? n.toFixed(4) : n.toFixed(2));
+  };
+  var fmtMs = function (ms) {
+    ms = Number(ms || 0);
+    return ms >= 1000 ? (ms / 1000).toFixed(1) + " s" : Math.round(ms) + " ms";
+  };
+  var fmtDur = function (s) {
+    s = Math.max(0, Math.floor(Number(s || 0)));
+    var d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60);
+    if (d) return d + "d " + h + "h";
+    if (h) return h + "h " + m + "m";
+    return m + "m " + (s % 60) + "s";
+  };
+  var fmtTime = function (iso) {
+    var t = new Date(iso);
+    return isNaN(t) ? esc(iso) : t.toLocaleTimeString("en-GB");
+  };
+  var fmtDate = function (iso) {
+    if (!iso) return "—";
+    var t = new Date(iso);
+    return isNaN(t) ? esc(iso) : t.toISOString().slice(0, 10);
+  };
+  var levelClass = function (level) {
+    return level === "error" || level === "critical" ? "err" : level === "warning" ? "warn" : "";
+  };
+  var tokensCell = function (u) {
+    u = u || {};
+    var cache = (u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0);
+    return fmtInt(u.input_tokens) + " / " + fmtInt(u.output_tokens) +
+      (cache ? ' <span class="muted">+' + fmtInt(cache) + " cache</span>" : "");
+  };
+  var costCell = function (s) {
+    return s.priced_requests ? fmtUsd(s.cost_usd) : '<span class="muted">n/a</span>';
+  };
+  var tile = function (label, value, sub) {
+    return '<div class="tile"><div class="label">' + esc(label) + '</div><div class="value">' +
+      value + '</div><div class="sub">' + (sub || "&nbsp;") + "</div></div>";
+  };
+  var table = function (head, rows, emptyText) {
+    if (!rows.length) return '<div class="empty">' + esc(emptyText) + "</div>";
+    return "<table><thead><tr>" + head.map(function (h) {
+      return "<th" + (h.num ? ' class="num"' : "") + ">" + esc(h.t) + "</th>";
+    }).join("") + "</tr></thead><tbody>" + rows.join("") + "</tbody></table>";
+  };
+  var td = function (v, cls) { return "<td" + (cls ? ' class="' + cls + '"' : "") + ">" + v + "</td>"; };
+
+  function render(s) {
+    $("version").textContent = s.version || "?";
+    $("pid").textContent = s.pid;
+    $("uptime").textContent = fmtDur(s.uptime_s);
+    var p = s.proxy || {};
+    $("proxy").innerHTML = p.enabled
+      ? '<span class="ok">on</span> ' + esc(p.host + ":" + p.port) +
+        ' <span class="muted">mitm ' + esc((p.mitm_hosts || []).join(", ")) + "</span>"
+      : '<span class="muted">off</span>';
+    $("ca").innerHTML = p.root_certificate_not_after
+      ? "until " + fmtDate(p.root_certificate_not_after)
+      : '<span class="muted">not generated</span>';
+
+    var t = s.totals || {};
+    var u = t.usage || {};
+    $("tiles").innerHTML = [
+      tile("requests", fmtInt(t.requests), "avg " + fmtMs(t.avg_duration_ms)),
+      tile("errors", '<span class="' + (t.errors ? "err" : "") + '">' + fmtInt(t.errors) + "</span>",
+           "status ≥ 400 or failed"),
+      tile("in flight", fmtInt((s.active || []).length),
+           (s.active || []).filter(function (a) { return a.stream; }).length + " streaming"),
+      tile("input tokens", fmtInt(u.input_tokens), "uncached prompt"),
+      tile("output tokens", fmtInt(u.output_tokens), "completion"),
+      tile("cache tokens", fmtInt((u.cache_read_input_tokens || 0) + (u.cache_creation_input_tokens || 0)),
+           fmtInt(u.cache_read_input_tokens) + " read · " + fmtInt(u.cache_creation_input_tokens) + " write"),
+      tile("cost", t.priced_requests ? fmtUsd(t.cost_usd) : '<span class="muted">n/a</span>',
+           t.priced_requests ? t.priced_requests + " priced of " + t.requests : "set pricing in routing.yaml")
+    ].join("");
+
+    var provHead = [{t: "provider"}, {t: "requests", num: 1}, {t: "errors", num: 1},
+                    {t: "avg", num: 1}, {t: "tokens in / out", num: 1}, {t: "cost", num: 1}];
+    $("providers").innerHTML = table(provHead, Object.keys(s.providers || {}).sort().map(function (name) {
+      var r = s.providers[name];
+      return "<tr>" + td(esc(name), "mono") + td(fmtInt(r.requests), "num") +
+        td(fmtInt(r.errors), "num " + (r.errors ? "err" : "")) + td(fmtMs(r.avg_duration_ms), "num") +
+        td(tokensCell(r.usage), "num") + td(costCell(r), "num") + "</tr>";
+    }), "No routed requests yet.");
+
+    var modelHead = [{t: "model"}, {t: "provider"}, {t: "requests", num: 1}, {t: "errors", num: 1},
+                     {t: "avg", num: 1}, {t: "tokens in / out", num: 1}, {t: "cost", num: 1}];
+    $("models").innerHTML = table(modelHead, Object.keys(s.models || {}).sort().map(function (name) {
+      var r = s.models[name];
+      return "<tr>" + td(esc(name), "mono") + td(esc(r.provider), "mono muted") +
+        td(fmtInt(r.requests), "num") + td(fmtInt(r.errors), "num " + (r.errors ? "err" : "")) +
+        td(fmtMs(r.avg_duration_ms), "num") + td(tokensCell(r.usage), "num") + td(costCell(r), "num") + "</tr>";
+    }), "No routed requests yet.");
+
+    var activeHead = [{t: "id"}, {t: "started"}, {t: "endpoint"}, {t: "model"}, {t: "provider"},
+                      {t: "mode"}, {t: "age", num: 1}];
+    $("active").innerHTML = table(activeHead, (s.active || []).map(function (a) {
+      return "<tr>" + td(a.id, "mono muted") + td(fmtTime(a.started_at), "mono") + td(esc(a.endpoint)) +
+        td(esc(a.model), "mono") + td(esc(a.provider), "mono") +
+        td(a.stream ? '<span class="pill">stream</span>' : '<span class="pill">unary</span>') +
+        td(fmtDur(a.age_s), "num " + (a.age_s > 300 ? "warn" : "")) + "</tr>";
+    }), "Nothing in flight.");
+
+    var eventHead = [{t: "time"}, {t: "level"}, {t: "what"}, {t: "details"}];
+    $("events").innerHTML = table(eventHead, (s.events || []).map(function (e) {
+      var what, details;
+      if (e.kind === "request") {
+        what = e.endpoint + " " + (e.status == null ? "failed" : e.status) + (e.stream ? " stream" : "");
+        details = esc(e.model) + ' <span class="muted">→</span> ' + esc(e.provider) +
+          ' <span class="muted">' + fmtMs(e.duration_ms) + " · " + tokensCell(e.usage) +
+          (e.cost_usd != null ? " · " + fmtUsd(e.cost_usd) : "") +
+          (e.error ? " · " + esc(e.error) : "") + "</span>";
+      } else {
+        what = e.event;
+        var f = e.fields || {};
+        details = Object.keys(f).map(function (k) {
+          return '<span class="muted">' + esc(k) + "=</span>" + esc(f[k]);
+        }).join(" ");
+      }
+      return "<tr>" + td(fmtTime(e.ts), "mono muted") + td(esc(e.level), levelClass(e.level)) +
+        td(esc(what), "mono") + td(details, "mono") + "</tr>";
+    }), "No events yet.");
+
+    var routeHead = [{t: "#"}, {t: "match"}, {t: "value"}, {t: "provider"}, {t: "upstream model"},
+                     {t: "max_tokens", num: 1}, {t: "context", num: 1}];
+    $("routes").innerHTML = table(routeHead, (s.routes || []).map(function (r, i) {
+      return "<tr>" + td(i + 1, "muted") + td(esc(r.match_type)) + td(esc(r.match_value || ""), "mono") +
+        td(esc(r.provider), "mono") + td(esc(r.upstream_model || ""), "mono muted") +
+        td(r.max_tokens_limit != null ? fmtInt(r.max_tokens_limit) : "", "num") +
+        td(r.context_window != null ? fmtInt(r.context_window) : "", "num") + "</tr>";
+    }), "No routes.");
+  }
+
+  var failures = 0;
+  function poll() {
+    fetch("/dashboard/state", { cache: "no-store" })
+      .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+      .then(function (s) {
+        failures = 0;
+        render(s);
+        $("status").textContent = "updated " + new Date().toLocaleTimeString("en-GB");
+        $("status").className = "";
+      })
+      .catch(function (err) {
+        failures += 1;
+        $("status").textContent = "no data (" + err.message + ")";
+        $("status").className = "stale";
+      })
+      .then(function () { setTimeout(poll, failures ? Math.min(POLL_MS * failures, 15000) : POLL_MS); });
+  }
+  poll();
+})();
+</script>
+</body>
+</html>

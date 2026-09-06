@@ -31,6 +31,16 @@ Reverse-proxy mode (`make run`, the default: the client points
 no TLS interception; all outbound traffic to configured providers is a
 normal TLS client connection.
 
+## Dashboard
+
+`GET /dashboard` and `GET /dashboard/state` on the ASGI listener expose the
+router's activity: model ids, provider names, request paths on the MITM
+host, the hosts the forward-proxy tunnelled to, token counts and the
+configured prices. They never expose request or response bodies, headers,
+keys or tokens. The listener binds `127.0.0.1` by default; if
+`ROUTER_SERVER_HOST` is widened, put the dashboard behind the same access
+control as the rest of the API.
+
 ## Reporting a vulnerability
 
 Please report security issues by opening a GitHub issue on this repository:

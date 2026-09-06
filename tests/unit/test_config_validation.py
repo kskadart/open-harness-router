@@ -9,7 +9,7 @@ import yaml
 
 from errors import ConfigError
 from routing.config_loader import load_routing_config
-from routing.schema import RoutingConfig
+from routing.schema import PricingCfg, RoutingConfig, effective_pricing
 
 _MINIMAL_VALID: dict[str, object] = {
     "version": 1,
@@ -859,3 +859,30 @@ def test_context_window_just_above_the_sum_of_cap_reserve_and_completion_is_acce
     raw["providers"]["openai_compatible"]["context_window"] = 5109  # type: ignore[index]
     cfg = RoutingConfig.model_validate(raw)
     assert cfg.providers["openai_compatible"].context_window == 5109
+
+
+def test_pricing_is_optional_and_resolves_rule_over_provider() -> None:
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["pricing"] = {"input": 3, "output": 15}  # type: ignore[index]
+    raw["rules"][0]["pricing"] = {"input": 1, "output": 5, "cache_read": 0.1}  # type: ignore[index]
+    cfg = RoutingConfig.model_validate(raw)
+
+    provider = cfg.providers["anthropic"]
+    assert effective_pricing(provider, cfg.rules[0]).input == 1  # type: ignore[union-attr]
+    assert effective_pricing(provider, None).output == 15  # type: ignore[union-attr]
+    assert effective_pricing(cfg.providers["openai_compatible"], cfg.rules[1]) is None
+
+
+def test_pricing_rejects_negative_prices() -> None:
+    raw = _clone_valid()
+    raw["providers"]["anthropic"]["pricing"] = {"input": -1, "output": 15}  # type: ignore[index]
+    with pytest.raises(ValueError, match="greater than or equal to 0"):
+        RoutingConfig.model_validate(raw)
+
+
+def test_pricing_unset_cache_prices_fall_back_to_input() -> None:
+    pricing = PricingCfg(input=2, output=10)
+    cost = pricing.cost_usd(
+        input_tokens=0, output_tokens=0, cache_write_tokens=500_000, cache_read_tokens=500_000
+    )
+    assert cost == 2.0

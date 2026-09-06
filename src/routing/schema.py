@@ -37,6 +37,58 @@ class MatchRule(BaseModel):
     value: str
 
 
+class PricingCfg(BaseModel):
+    """List prices of one model, in USD per million tokens.
+
+    Read by the dashboard only (``services.monitor``): the router never
+    bills anything, it multiplies the ``usage`` it sees on responses by
+    these numbers so the ``/dashboard`` cost column means something. On a
+    subscription-billed passthrough route the result is what the same
+    traffic would cost at API prices. Unset cache prices count at the
+    ``input`` price -- an upper bound; set them for a vendor that discounts
+    the cache.
+
+    Attributes:
+        input: uncached prompt tokens.
+        output: completion tokens.
+        cache_write: prompt tokens written to the cache; ``None`` -> ``input``.
+        cache_read: prompt tokens served from the cache; ``None`` -> ``input``.
+    """
+
+    input: float = Field(ge=0)
+    output: float = Field(ge=0)
+    cache_write: float | None = Field(default=None, ge=0)
+    cache_read: float | None = Field(default=None, ge=0)
+
+    def cost_usd(
+        self,
+        *,
+        input_tokens: int,
+        output_tokens: int,
+        cache_write_tokens: int,
+        cache_read_tokens: int,
+    ) -> float:
+        """Price one response's usage.
+
+        Args:
+            input_tokens: uncached prompt tokens.
+            output_tokens: completion tokens.
+            cache_write_tokens: prompt tokens written to the cache.
+            cache_read_tokens: prompt tokens served from the cache.
+
+        Returns:
+            The cost in USD.
+        """
+        cache_write = self.input if self.cache_write is None else self.cache_write
+        cache_read = self.input if self.cache_read is None else self.cache_read
+        return (
+            input_tokens * self.input
+            + output_tokens * self.output
+            + cache_write_tokens * cache_write
+            + cache_read_tokens * cache_read
+        ) / 1_000_000
+
+
 class RoutingRule(BaseModel):
     """A routing rule: match -> provider (+ model substitution and limits).
 
@@ -46,6 +98,9 @@ class RoutingRule(BaseModel):
     values for the models this rule serves; ``None`` keeps the provider's,
     and both are rejected on a rule pointing at ``passthrough``. Checked by
     ``RoutingConfig._validate_client_models`` and ``_validate_rule_limits``.
+    ``pricing`` overrides the provider's prices for the dashboard's cost
+    column the same way (``effective_pricing``); it is allowed on either
+    provider type, since it changes nothing on the wire.
     """
 
     match: MatchRule
@@ -54,6 +109,23 @@ class RoutingRule(BaseModel):
     max_tokens_limit: int | None = None
     context_window: int | None = None
     client_models: list[str] = Field(default_factory=list)
+    pricing: PricingCfg | None = None
+
+
+def effective_pricing(provider: ProviderCfg, rule: RoutingRule | None) -> PricingCfg | None:
+    """Return the prices one resolved route is costed at.
+
+    Args:
+        provider: configuration of the provider the route lands on.
+        rule: the matched rule, or ``None`` for the default route.
+
+    Returns:
+        The rule's ``pricing`` when set, else the provider's, else ``None``
+        (the dashboard shows tokens only).
+    """
+    if rule is not None and rule.pricing is not None:
+        return rule.pricing
+    return provider.pricing
 
 
 def advertised_model_ids(rule: RoutingRule) -> list[str]:
@@ -222,6 +294,10 @@ class ProviderCfg(BaseModel):
     ``authorization``/``x-api-key`` -- on either type, that would silently
     override the auth header/key this provider forwards, injects, or
     resolves.
+
+    ``pricing`` -- list prices for the dashboard's cost column
+    (``PricingCfg``); the default for every rule on this provider, a rule
+    may override it. Optional on either type and never sent anywhere.
     """
 
     type: ProviderType
@@ -241,6 +317,7 @@ class ProviderCfg(BaseModel):
     tools_max: int = 0
     api_flavor: ApiFlavor = "chat"
     reasoning_effort: ReasoningEffort = "medium"
+    pricing: PricingCfg | None = None
 
     @model_validator(mode="after")
     def _validate_drop_params(self) -> ProviderCfg:

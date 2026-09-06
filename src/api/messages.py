@@ -7,6 +7,7 @@ from fastapi.responses import Response
 
 from api.adapters import parse_model, to_fastapi_response
 from dependencies import LoggerDep, RegistryDep
+from services.monitor import Monitor
 
 router = APIRouter()
 
@@ -40,14 +41,24 @@ async def create_message(
         provider=decision.provider.name,
         upstream_model=decision.upstream_model,
     )
-    # http_request structurally satisfies ClientChannel (see providers.base):
-    # the provider only needs is_disconnected(), not the whole ASGI request.
-    result = await decision.provider.handle_messages(
-        raw_body,
-        http_request.headers,
-        http_request,
-        decision.upstream_model,
-        decision.limits,
-        query=http_request.url.query,
+    tracker = Monitor.current().start_request(
+        model=model,
+        provider=decision.provider.name,
+        endpoint="messages",
+        pricing=decision.pricing,
     )
-    return to_fastapi_response(result)
+    try:
+        # http_request structurally satisfies ClientChannel (see providers.base):
+        # the provider only needs is_disconnected(), not the whole ASGI request.
+        result = await decision.provider.handle_messages(
+            raw_body,
+            http_request.headers,
+            http_request,
+            decision.upstream_model,
+            decision.limits,
+            query=http_request.url.query,
+        )
+    except BaseException as exc:
+        tracker.fail(exc)
+        raise
+    return to_fastapi_response(tracker.attach(result))

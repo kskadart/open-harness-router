@@ -7,6 +7,7 @@ from fastapi.responses import Response
 
 from api.adapters import parse_model, to_fastapi_response
 from dependencies import LoggerDep, RegistryDep
+from services.monitor import Monitor
 
 router = APIRouter()
 
@@ -40,11 +41,21 @@ async def count_tokens(
         provider=decision.provider.name,
         upstream_model=decision.upstream_model,
     )
-    result = await decision.provider.count_tokens(
-        raw_body,
-        http_request.headers,
-        decision.upstream_model,
-        decision.limits,
-        query=http_request.url.query,
+    tracker = Monitor.current().start_request(
+        model=model,
+        provider=decision.provider.name,
+        endpoint="count_tokens",
+        pricing=decision.pricing,
     )
-    return to_fastapi_response(result)
+    try:
+        result = await decision.provider.count_tokens(
+            raw_body,
+            http_request.headers,
+            decision.upstream_model,
+            decision.limits,
+            query=http_request.url.query,
+        )
+    except BaseException as exc:
+        tracker.fail(exc)
+        raise
+    return to_fastapi_response(tracker.attach(result))

@@ -43,6 +43,7 @@ from proxy.outbound import OutboundConnector, TunnelError
 from proxy.streams import pump_tunnel
 from routing.registry import ProviderRegistry
 from services.header_utils import response_headers
+from services.monitor import Monitor
 
 logger = get_logger(__name__)
 
@@ -663,20 +664,30 @@ class MitmHttpSession:
 
         headers = client_headers_mapping(request.headers)
         query = request_query(request.target)
-        if path == _COUNT_TOKENS_PATH:
-            result = await decision.provider.count_tokens(
-                raw_body, headers, decision.upstream_model, decision.limits, query=query
-            )
-        else:
-            result = await decision.provider.handle_messages(
-                raw_body,
-                headers,
-                self._channel,
-                decision.upstream_model,
-                decision.limits,
-                query=query,
-            )
-        return await self._send_result(result)
+        tracker = Monitor.current().start_request(
+            model=model,
+            provider=decision.provider.name,
+            endpoint="count_tokens" if path == _COUNT_TOKENS_PATH else "messages",
+            pricing=decision.pricing,
+        )
+        try:
+            if path == _COUNT_TOKENS_PATH:
+                result = await decision.provider.count_tokens(
+                    raw_body, headers, decision.upstream_model, decision.limits, query=query
+                )
+            else:
+                result = await decision.provider.handle_messages(
+                    raw_body,
+                    headers,
+                    self._channel,
+                    decision.upstream_model,
+                    decision.limits,
+                    query=query,
+                )
+        except BaseException as exc:
+            tracker.fail(exc)
+            raise
+        return await self._send_result(tracker.attach(result))
 
     async def _forward_upstream(self, request: h11.Request) -> int:
         """Forward the request to the real upstream byte-for-byte.

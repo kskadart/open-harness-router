@@ -25,6 +25,7 @@ import settings as settings_module
 from main import create_app
 from routing.config_loader import load_routing_config
 from routing.registry import ProviderRegistry
+from services.monitor import Monitor
 from settings import Settings
 
 TESTS_DIR = Path(__file__).resolve().parent
@@ -59,6 +60,17 @@ def _ignore_dotenv(monkeypatch: pytest.MonkeyPatch) -> None:
     for cls in _settings_classes():
         monkeypatch.setitem(cls.model_config, "env_file", None)
     monkeypatch.setattr(main_module, "load_dotenv", lambda *_args, **_kwargs: False)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_monitor() -> None:
+    """Give every test an empty process-wide monitor.
+
+    ``services.monitor.Monitor`` is one object per process by design (the
+    dashboard's uptime and counters are process facts), so without a reset
+    a test would see the requests and log events of the tests before it.
+    """
+    Monitor.reset()
 
 
 @pytest.fixture(autouse=True)
