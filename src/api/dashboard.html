@@ -25,7 +25,7 @@
   header .fact b { color: var(--fg); font-weight: 600; }
   #status { margin-left: auto; font-size: 12px; color: var(--muted); }
   #status.stale { color: var(--err); }
-  main { padding: 16px 20px; display: grid; gap: 16px; max-width: 1400px; }
+  main { padding: 16px 20px; display: grid; gap: 16px; max-width: 1800px; }
   .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; }
   .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
   .tile .label { color: var(--muted); font-size: 12px; }
@@ -35,6 +35,10 @@
   section h2 { font-size: 13px; margin: 0; padding: 8px 12px; border-bottom: 1px solid var(--line);
                color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
   .scroll { overflow-x: auto; }
+  /* The feed is a window onto the last events, not a page-long table: the
+     routing table below it must stay reachable without scrolling past 500 rows. */
+  #events { max-height: 40vh; overflow: auto; }
+  #events thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
   table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
   th, td { text-align: left; padding: 6px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
   th { color: var(--muted); font-weight: 500; font-size: 12px; }
@@ -46,7 +50,8 @@
   .empty { padding: 12px; color: var(--muted); }
   .pill { display: inline-block; padding: 0 6px; border-radius: 10px; font-size: 11px;
           border: 1px solid var(--line); color: var(--muted); }
-  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); gap: 16px; }
+  /* Providers and Models side by side only when both fit without clipping. */
+  .two { display: grid; grid-template-columns: repeat(auto-fit, minmax(880px, 1fr)); gap: 16px; }
 </style>
 </head>
 <body>

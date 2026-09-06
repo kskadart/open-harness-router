@@ -1026,6 +1026,8 @@ response).
 
 ## Dashboard
 
+![The dashboard: request, error, in-flight, token and cost tiles, per-provider and per-model tables, the requests in flight, the event feed and the routing table](docs/dashboard.png)
+
 `http://127.0.0.1:8787/dashboard` (the ASGI listener, in both run modes)
 shows what the router is doing without a log file: the requests in flight
 and how long they have been running, per-provider and per-model counters
@@ -1171,4 +1173,5 @@ routing.yaml         personal provider/rule registry (gitignored, cp from the ex
 certs/               your own CA bundles for upstream providers (create as needed)
 proxy-ca/            forward-proxy root CA (generated on first run)
 CHANGELOG.md         release notes, one section per version (created by the first /release)
+docs/                README assets (dashboard screenshot)
 ```
