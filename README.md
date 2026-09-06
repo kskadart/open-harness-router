@@ -15,25 +15,13 @@ The Claude Code orchestrator always stays on native Anthropic models: the
 `claude-*` and alias rules route to passthrough, and the default route must be
 passthrough (enforced by the config validator).
 
-Two launch modes share the same provider registry and route custom models
-identically. Forward-proxy (`make run-proxy`) is the primary mode: the client
-keeps the default `ANTHROPIC_BASE_URL` and sets only `HTTPS_PROXY` and
-`NODE_EXTRA_CA_CERTS`, so the CLI still believes it talks to
-`api.anthropic.com` and every Claude Code feature works as on a direct
-connection, Remote Control (`/rc`) included. Only `/v1/messages` and
-`/v1/messages/count_tokens` go through the provider registry; every other
-path on that host passes to the real upstream untouched. The price is
-trusting the router's root CA once through `NODE_EXTRA_CA_CERTS` and running
-the proxy listener (`ROUTER_PROXY_ENABLED=true`, both listeners in one
-process), described in the "Forward-proxy" section below. Reverse-proxy
-(`make run`) is the lighter alternative: the client points
-`ANTHROPIC_BASE_URL` at the router, there is no certificate step, custom
-models route the same way, but the CLI disables Remote Control under a custom
-`ANTHROPIC_BASE_URL`. Point a client at it when `/rc` is not needed, or when
-the client cannot use an HTTPS proxy. It is also the router's plain HTTP
-interface: `/health`, direct `curl` checks against `/v1/messages`, and any
-SDK or tool that only knows a base URL use it, so the combined process
-always keeps this listener on alongside the proxy one.
+One provider registry, two entrances. Forward-proxy (`make run-proxy`) is the
+primary mode for Claude Code: the client keeps the default
+`ANTHROPIC_BASE_URL` and sets only `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS`, so
+every CLI feature works as on a direct connection, Remote Control (`/rc`)
+included. Reverse-proxy (`make run`) is the router's plain HTTP API on
+`ANTHROPIC_BASE_URL=http://127.0.0.1:8787`, for `/health`, `curl` and any
+client that only knows a base URL. Both are described in "Run modes" below.
 
 > **Platform support.** The router is developed and used daily on macOS, but
 > the router itself and its CLI helpers (`cli.validate_routing`,
@@ -54,6 +42,82 @@ uv sync
 cp .env.example .env                    # no required key to start, see below
 cp routing.example.yaml routing.yaml    # personal provider registry, not committed to the repo
 ```
+
+## Run modes
+
+Both entrances share one provider registry and route custom models identically.
+
+### Forward-proxy
+
+`make run-proxy`. The client sets `HTTPS_PROXY=http://127.0.0.1:8788` and
+`NODE_EXTRA_CA_CERTS` to the router's root CA, and leaves `ANTHROPIC_BASE_URL`
+at its default. The router terminates TLS for `api.anthropic.com` and sends only
+`POST /v1/messages` and `POST /v1/messages/count_tokens` into the provider
+registry; other paths on that host reach the real upstream untouched, and other
+hosts get a blind tunnel.
+
+Use it for Claude Code as the daily tool: the CLI still believes it talks to
+`api.anthropic.com`, so the full feature set works. Remote Control (`/rc`),
+server-managed settings, MCP tool search and fine-grained tool streaming on
+their defaults, session sync, usage display, everything the CLI does there.
+
+The price: trust the root CA once and run the proxy listener with
+`ROUTER_PROXY_ENABLED=true`. `HTTPS_PROXY` covers ALL outbound traffic of the
+CLI process, so a router that is down takes the whole CLI off the network, not
+only inference. The setup steps are in the "Forward-proxy" section below.
+
+### Reverse-proxy
+
+`make run`. The client sets `ANTHROPIC_BASE_URL=http://127.0.0.1:8787` and
+needs no certificate. On 8787 the router serves `/health`, `/v1/messages` and
+`/v1/messages/count_tokens`; any other path answers 404. There is no
+`/v1/models`, so the model picker is built by `make sync-client-config`.
+
+This is the router's plain HTTP API: any client that only takes a base URL
+(Anthropic SDK scripts, other agent frameworks, IDE plugins), `curl`,
+`/health`, the end-to-end checks and the restart script. It runs on Linux, in
+containers and in CI without a MITM step, and it is the fallback when the proxy
+layer misbehaves. Claude Code works here too when `/rc` is not needed.
+
+Not supported or changed for Claude Code in this mode:
+
+- Remote Control (`/rc`): disabled by the CLI whenever `ANTHROPIC_BASE_URL` is
+  not `api.anthropic.com` (Claude Code docs, remote-control, Requirements;
+  since v2.1.196).
+- Server-managed settings: not applied for a non-first-party host (docs,
+  feature-availability).
+- MCP tool search: off by default for a non-first-party host; managed settings
+  can turn it back on since v2.1.227 (docs, feature-availability, MCP servers).
+- Fine-grained tool streaming: off by default behind a custom base URL;
+  `CLAUDE_CODE_ENABLE_FINE_GRAINED_TOOL_STREAMING=1` turns it on (docs,
+  llm-gateway-protocol, Feature pass-through).
+- A startup probe `HEAD /api/hello` gets 404 from the router. Harmless, the
+  session runs normally.
+
+Still works, measured on 2026-09-06 with a non-interactive `claude -p` run
+against 8787: the CLI sends only inference to the base URL, so account and
+usage, telemetry, bootstrap and feature flags, the MCP registry and session
+sync go to `api.anthropic.com` directly and keep working. OAuth subscription
+login and token refresh, prompt caching and `anthropic-beta` headers (passthrough
+forwards them), `count_tokens` (served by the router) and the fast-mode
+availability check (goes direct) work in both modes.
+
+| | Forward-proxy | Reverse-proxy |
+| --- | --- | --- |
+| Client setting | `HTTPS_PROXY` -> 8788 | `ANTHROPIC_BASE_URL` -> 8787 |
+| Certificate step | `NODE_EXTRA_CA_CERTS`, mandatory | none |
+| Custom-model routing | same registry | same registry |
+| Remote Control | works | disabled by the CLI |
+| Server-managed settings | applied | not applied |
+| MCP tool search / fine-grained streaming | defaults kept | off by default |
+| `/health` and `curl` | not on this port | yes, on 8787 |
+| Clients other than Claude Code | need HTTPS proxy support | any base-URL client |
+| When the router is down | CLI loses all network | only inference fails |
+| Where the setup is described | "Forward-proxy" | "Connecting Claude Code" |
+
+How to choose: forward-proxy for Claude Code, unless `/rc` is not needed or the
+client cannot use an HTTPS proxy. `make run-proxy` keeps both listeners in one
+process, so both serve at once: a session through 8788, checks through 8787.
 
 ## Configuration
 
@@ -426,19 +490,6 @@ their own numbers; fields the route does not have are omitted.
 Useful after editing the config: if the expected rule is missing from the
 list, or sits below a broader one, either the router restarted with a stale
 file or the rule order is wrong.
-
-### The two modes and choosing between them
-
-The rule is in the intro at the top of this file: forward-proxy by default,
-reverse-proxy when `/rc` is not needed or the client cannot use an HTTPS
-proxy. What the intro leaves out is what each mode costs to set up.
-Forward-proxy needs the proxy listener enabled and the client to trust the
-router's own root certificate through `NODE_EXTRA_CA_CERTS`, a mandatory step
-described in the "Forward-proxy" section below; in exchange the base URL
-still points at `api.anthropic.com`, which is what keeps Remote Control
-available (see "Connecting Claude Code" below). Reverse-proxy asks nothing of
-the client beyond `ANTHROPIC_BASE_URL` and works with any client that can set
-it.
 
 ### Provider compatibility settings
 
@@ -838,10 +889,8 @@ the frontmatter of individual agents under `.claude/agents/*.md`. That directory
 and its files are your own Claude Code configuration, not part of this
 repository -- create them yourself if they don't exist yet.
 
-A limitation of the CLI itself: as long as `ANTHROPIC_BASE_URL` doesn't point
-at `api.anthropic.com`, Remote Control is unavailable (as of v2.1.196). This
-limitation is specific to reverse-proxy mode -- forward-proxy works around it
-without losing routing, see below.
+This is reverse-proxy mode; what the CLI turns off under a custom
+`ANTHROPIC_BASE_URL`, Remote Control included, is listed in "Run modes" above.
 
 ### Model picker and client settings
 
@@ -898,13 +947,10 @@ env -u ANTHROPIC_API_KEY \
 
 ## Forward-proxy
 
-The second launch mode: the router works not as a reverse-proxy
-(`ANTHROPIC_BASE_URL` pointing at the router), but as an HTTP proxy (the
-client uses `HTTPS_PROXY`). It exists because of the CLI limitation above:
-Claude Code disables Remote Control whenever `ANTHROPIC_BASE_URL` doesn't
-point at `api.anthropic.com` (since CLI 2.1.196), but it survives the
-`HTTPS_PROXY` variable. In this mode the client starts with its base URL
-untouched, and routing happens at the proxy level.
+Setup for the mode described in "Run modes" above: the router works not as a
+reverse-proxy (`ANTHROPIC_BASE_URL` pointing at the router), but as an HTTP
+proxy (the client uses `HTTPS_PROXY`), so the client starts with its base URL
+untouched and routing happens at the proxy level.
 
 How it works: the router accepts `CONNECT`; for hosts on the allowlist
 (`ROUTER_PROXY_MITM_HOSTS`, by default only `api.anthropic.com`) it
