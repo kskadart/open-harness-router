@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are `major.minor.micro`
 and every release is tagged `vX.Y.Z`.
 
+## [0.1.1] - 2026-09-07
+
+### Added
+
+- live activity page, Prometheus metrics, Grafana stack ([#21](https://github.com/kskadart/open-harness-router/pull/21))
+- window the events feed, widen the tables, show the page in the README ([#22](https://github.com/kskadart/open-harness-router/pull/22))
+
+### Fixed
+
+- keep the working .env out of the test run ([#19](https://github.com/kskadart/open-harness-router/pull/19))
+- forward the request target's query string upstream ([#20](https://github.com/kskadart/open-harness-router/pull/20))
+
+### Documentation
+
+- open with the dashboard screenshot ([#23](https://github.com/kskadart/open-harness-router/pull/23))
+
 ## [0.1.0] - 2026-09-06
 
 ### Added
