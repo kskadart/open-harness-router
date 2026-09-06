@@ -21,6 +21,7 @@ from log import get_logger, setup_logging
 from routing.config_loader import load_routing_config
 from routing.registry import ProviderRegistry
 from settings import Settings
+from version import project_version
 
 
 def build_runtime() -> tuple[Settings, ProviderRegistry]:
@@ -133,7 +134,7 @@ def create_app(
                 await registry.close_all()
             logger.info("shutdown")
 
-    app = FastAPI(title="open-harness-router", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="open-harness-router", version=project_version(), lifespan=lifespan)
     app.include_router(build_root_router())
     install_exception_handlers(app)
     return app
