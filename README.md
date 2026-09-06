@@ -1155,6 +1155,7 @@ src/
   main.py            create_app() factory + lifespan; build_runtime() builds settings + registry
   settings.py        pydantic-settings by domain (server, routing, proxy, logging, secrets)
   log.py             structlog JSON
+  version.py         the application version, read from pyproject.toml (the file cli.release bumps)
   const.py           constants
   dependencies.py    FastAPI DI providers (Depends)
   errors.py          domain exceptions, Anthropic error format

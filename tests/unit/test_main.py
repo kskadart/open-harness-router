@@ -16,6 +16,7 @@ import main
 from routing.config_loader import load_routing_config
 from routing.registry import ProviderRegistry
 from settings import Settings
+from version import UNKNOWN_VERSION, project_version
 
 
 def _spy_close_all(registry: ProviderRegistry) -> list[int]:
@@ -86,5 +87,17 @@ async def test_create_app_rejects_partial_arguments(_env: None) -> None:
             main.create_app(settings=settings)
         with pytest.raises(ValueError, match="together"):
             main.create_app(registry=registry)
+    finally:
+        await registry.close_all()
+
+
+async def test_create_app_reports_the_pyproject_version(_env: None) -> None:
+    """The application version is the one the release tooling bumps, not a literal."""
+    settings = Settings()
+    registry = _build_registry(settings)
+    try:
+        app = main.create_app(settings=settings, registry=registry)
+        assert app.version == project_version()
+        assert app.version != UNKNOWN_VERSION
     finally:
         await registry.close_all()
