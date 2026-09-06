@@ -974,6 +974,43 @@ entrypoint starts the forward-proxy only when it is `true`, and a bare
 establishing the outgoing connection and waiting for the upstream proxy's
 response).
 
+## Releases
+
+Versions are `major.minor.micro`, and every release is tagged `vX.Y.Z`. The
+release notes live in `CHANGELOG.md` at the repository root, in
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format: one section
+per version, newest first. When the file does not exist yet, the first
+`/release` run creates it.
+
+A pull request counts as released once its number appears as `#N` in a
+`CHANGELOG.md` section whose version has been tagged; until `/release tag`
+runs, the newest section is a draft and can be regenerated. The merged list
+comes from GitHub (`gh pr list`), not from `git log`, because a rebase merge
+leaves no `#N` in the commit subject. Release PRs themselves (titles starting
+with `chore(release):`) are excluded, so a release never lists its own commit.
+
+Releases are cut by the `/release` skill (`.claude/skills/release`,
+user-invoked only) in two phases. Phase 1, `/release [major|minor|micro|X.Y.Z]`,
+collects the unreleased PRs, asks you to confirm the version and the entry
+list, then creates the branch `chore/release-vX.Y.Z` with the new changelog
+section, the bumped `pyproject.toml` version and a refreshed `uv.lock`, and
+opens a PR. You merge that PR yourself. Phase 2, `/release tag`, runs after
+the merge: it tags the release PR's merge commit `vX.Y.Z`, pushes the tag and
+publishes a GitHub release with that changelog section as the notes. Neither
+phase restarts the running service.
+
+The deterministic steps are a CLI, useful on their own from the repository
+root:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m cli.release version [--bump {major,minor,micro}]
+PYTHONPATH=src .venv/bin/python -m cli.release collect [--repo OWNER/NAME] [--changelog PATH]
+PYTHONPATH=src .venv/bin/python -m cli.release changelog --version X.Y.Z \
+  [--date YYYY-MM-DD] [--input prs.json] [--changelog PATH] [--write]
+PYTHONPATH=src .venv/bin/python -m cli.release bump --to X.Y.Z
+PYTHONPATH=src .venv/bin/python -m cli.release notes --version X.Y.Z [--changelog PATH]
+```
+
 ## Development
 
 ```bash
@@ -1001,9 +1038,11 @@ src/
   proxy/             forward-proxy: CONNECT, MITM TLS, certificates, tunnel, HTTP/1.1 session
   routing/           routing.yaml schema, matcher, loader, registry
   services/          headers, reasoning-context cache, token estimation
+.claude/skills/      Claude Code skills: add-provider, release
 bin/                 launcher for launchd: execs .venv python -m entrypoint
 routing.example.yaml example provider/rule registry (in git)
 routing.yaml         personal provider/rule registry (gitignored, cp from the example)
 certs/               your own CA bundles for upstream providers (create as needed)
 proxy-ca/            forward-proxy root CA (generated on first run)
+CHANGELOG.md         release notes, one section per version (created by the first /release)
 ```

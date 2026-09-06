@@ -1,0 +1,10 @@
+[project]
+name = "demo-project"
+version = "0.1.0"
+description = "sample project file for the release CLI tests"
+dependencies = [
+    "httpx==0.28.1",
+]
+
+[tool.demo]
+version = "9.9.9"

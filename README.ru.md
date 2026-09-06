@@ -978,6 +978,43 @@ env -u ANTHROPIC_BASE_URL \
 `127.0.0.1:8788`), `ROUTER_PROXY_CONNECT_TIMEOUT_S` (таймаут установки
 исходящего соединения и ожидания ответа от вышестоящего прокси).
 
+## Релизы
+
+Версии в формате `major.minor.micro`, каждый релиз получает тег `vX.Y.Z`.
+Заметки о релизах лежат в `CHANGELOG.md` в корне репозитория, в формате
+[Keep a Changelog](https://keepachangelog.com/en/1.1.0/): одна секция на
+версию, новые сверху. Если файла ещё нет, его создаёт первый запуск
+`/release`.
+
+Pull request считается выпущенным, когда его номер стоит как `#N` в секции
+`CHANGELOG.md`, версия которой уже получила тег. Пока не отработал
+`/release tag`, верхняя секция остаётся черновиком, её можно пересобрать.
+Список влитых PR берётся из GitHub (`gh pr list`), а не из `git log`: после
+rebase-мержа номера в теме коммита не остаётся. Сами релизные PR (заголовок начинается с `chore(release):`) из
+списка исключены, поэтому релиз не перечисляет собственный коммит.
+
+Релизы выпускает скилл `/release` (`.claude/skills/release`, только по вызову
+пользователя) в две фазы. Фаза 1, `/release [major|minor|micro|X.Y.Z]`,
+собирает невыпущенные PR, спрашивает подтверждение версии и списка записей,
+затем создаёт ветку `chore/release-vX.Y.Z` с новой секцией CHANGELOG,
+поднятой версией в `pyproject.toml` и пересобранным `uv.lock` и открывает PR.
+Этот PR вливаете вы. Фаза 2, `/release tag`, идёт после мержа: ставит тег
+`vX.Y.Z` на merge-коммит релизного PR, пушит тег и публикует релиз на GitHub,
+где заметками служит та же секция CHANGELOG. Ни одна фаза не перезапускает
+работающий сервис.
+
+Детерминированные шаги вынесены в CLI, он полезен и сам по себе, запускается
+из корня репозитория:
+
+```bash
+PYTHONPATH=src .venv/bin/python -m cli.release version [--bump {major,minor,micro}]
+PYTHONPATH=src .venv/bin/python -m cli.release collect [--repo OWNER/NAME] [--changelog PATH]
+PYTHONPATH=src .venv/bin/python -m cli.release changelog --version X.Y.Z \
+  [--date YYYY-MM-DD] [--input prs.json] [--changelog PATH] [--write]
+PYTHONPATH=src .venv/bin/python -m cli.release bump --to X.Y.Z
+PYTHONPATH=src .venv/bin/python -m cli.release notes --version X.Y.Z [--changelog PATH]
+```
+
 ## Разработка
 
 ```bash
@@ -1005,9 +1042,11 @@ src/
   proxy/             forward-proxy: CONNECT, MITM TLS, certificates, tunnel, HTTP/1.1 session
   routing/           routing.yaml schema, matcher, loader, registry
   services/          headers, reasoning-context cache, token estimation
+.claude/skills/      Claude Code skills: add-provider, release
 bin/                 launcher for launchd: execs .venv python -m entrypoint
 routing.example.yaml example provider/rule registry (in git)
 routing.yaml         personal provider/rule registry (gitignored, cp from the example)
 certs/               your own CA bundles for upstream providers (create as needed)
 proxy-ca/            forward-proxy root CA (generated on first run)
+CHANGELOG.md         release notes, one section per version (created by the first /release)
 ```
