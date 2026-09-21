@@ -38,7 +38,12 @@ from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any
 
-from const import MONITOR_EVENT_BUFFER, MONITOR_EVENT_TEXT_LIMIT, MONITOR_SSE_LINE_LIMIT
+from const import (
+    CAPABILITY_REJECTED_HEADER,
+    MONITOR_EVENT_BUFFER,
+    MONITOR_EVENT_TEXT_LIMIT,
+    MONITOR_SSE_LINE_LIMIT,
+)
 from providers.base import ProviderResult
 from routing.schema import PricingCfg
 
@@ -331,10 +336,14 @@ class RequestTracker:
             self._scanner = UsageScanner()
             if self._active.endpoint == "messages":
                 self._scanner.feed_json(result.body)
-            self._finish(status=result.status_code, error=None)
+            self._finish(
+                status=result.status_code,
+                error=None,
+                rejected=_header_value(result.headers, CAPABILITY_REJECTED_HEADER),
+            )
             return result
         self._active.stream = True
-        self._scanner = UsageScanner(_content_encoding(result.headers))
+        self._scanner = UsageScanner(_header_value(result.headers, "content-encoding") or "")
         return replace(result, body=self._wrap(result.body, result.status_code))
 
     def fail(self, exc: BaseException) -> None:
@@ -358,7 +367,9 @@ class RequestTracker:
             if isinstance(body, AsyncGenerator):
                 await body.aclose()
 
-    def _finish(self, *, status: int | None, error: str | None) -> None:
+    def _finish(
+        self, *, status: int | None, error: str | None, rejected: str | None = None
+    ) -> None:
         """Hand the outcome to the monitor once."""
         if self._done:
             return
@@ -375,7 +386,12 @@ class RequestTracker:
             else None
         )
         self._monitor.finish_request(
-            self._active, status=status, error=error, usage=usage, cost_usd=cost
+            self._active,
+            status=status,
+            error=error,
+            usage=usage,
+            cost_usd=cost,
+            rejected=rejected,
         )
 
 
@@ -448,11 +464,20 @@ class Monitor:
         error: str | None,
         usage: Usage,
         cost_usd: float | None,
+        rejected: str | None = None,
     ) -> None:
-        """Move a request from in-flight to the counters and the feed."""
+        """Move a request from in-flight to the counters and the feed.
+
+        ``rejected`` names a capability the provider turned down on purpose
+        (the ``CAPABILITY_REJECTED_HEADER`` value): that 4xx is part of the
+        protocol with the client, so it is a request, not an error, and the
+        feed entry carries the name.
+        """
         self._active.pop(active.request_id, None)
         duration_ms = (time.monotonic() - active.started_monotonic) * 1000.0
-        failed = error is not None or (status is not None and status >= 400)
+        failed = error is not None or (
+            status is not None and status >= 400 and rejected is None
+        )
         for bucket in (
             self._totals,
             self._providers.setdefault(active.provider, _Stats()),
@@ -474,6 +499,8 @@ class Monitor:
         }
         if error is not None:
             entry["error"] = error
+        if rejected is not None:
+            entry["rejected"] = rejected
         if cost_usd is not None:
             entry["cost_usd"] = round(cost_usd, 6)
         self._events.append(entry)
@@ -557,12 +584,13 @@ class Monitor:
         }
 
 
-def _content_encoding(headers: Mapping[str, str]) -> str:
-    """Return the ``content-encoding`` header value, whatever its case."""
-    for name, value in headers.items():
-        if name.lower() == "content-encoding":
+def _header_value(headers: Mapping[str, str], name: str) -> str | None:
+    """Return the value of header ``name``, whatever its case, or None when absent."""
+    wanted = name.lower()
+    for key, value in headers.items():
+        if key.lower() == wanted:
             return value
-    return ""
+    return None
 
 
 def capture_for_monitor(

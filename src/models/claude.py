@@ -97,6 +97,21 @@ class ClaudeOutputConfig(BaseModel):
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
 
 
+class ClaudeThread(BaseModel):
+    """Message-thread control (``thread``): Claude Code v2.1.278+ on a first-party host.
+
+    ``{"type": "create"}`` accompanies a request that carries the whole
+    conversation; ``{"type": "continue", "previous_message_id": ...}`` one
+    that carries only the turn's delta and expects the upstream to hold the
+    rest under that id. ``type`` is not narrowed to a ``Literal``: an
+    unfamiliar value must not fail the request as a whole -- the provider
+    decides what it can serve.
+    """
+
+    type: str
+    previous_message_id: str | None = None
+
+
 class ClaudeMessagesRequest(BaseModel):
     """Anthropic Messages API ``POST /v1/messages`` request."""
 
@@ -114,6 +129,7 @@ class ClaudeMessagesRequest(BaseModel):
     tool_choice: dict[str, Any] | None = None
     thinking: ClaudeThinkingConfig | None = None
     output_config: ClaudeOutputConfig | None = None
+    thread: ClaudeThread | None = None
 
 
 class ClaudeTokenCountRequest(BaseModel):
@@ -125,3 +141,4 @@ class ClaudeTokenCountRequest(BaseModel):
     tools: list[ClaudeTool] | None = None
     thinking: ClaudeThinkingConfig | None = None
     tool_choice: dict[str, Any] | None = None
+    thread: ClaudeThread | None = None

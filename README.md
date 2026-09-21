@@ -65,6 +65,35 @@ Use it for Claude Code as the daily tool: the CLI still believes it talks to
 server-managed settings, MCP tool search and fine-grained tool streaming on
 their defaults, session sync, usage display, everything the CLI does there.
 
+That belief also switches on one first-party protocol feature the router has
+to serve itself: message threads (Claude Code v2.1.278+, beta
+`message-threads-2026-08-12`). The first request of a turn carries the whole
+conversation with `thread: {"type": "create"}`; the tool-result steps that
+follow carry only the delta -- the attribution block as the entire `system`,
+the new tool results, no earlier messages, no tools -- with `thread: {"type":
+"continue", "previous_message_id": ...}`, expecting the upstream to hold the
+rest under the id of the previous response. Passthrough forwards both
+untouched: Anthropic holds the thread. For `openai-translate` the router
+holds it (`src/services/thread_store.py`): every response handed out under a
+`thread` field is recorded together with the request that produced it, and a
+continuation is rebuilt, before translation, into the full request the client
+would have sent without threads -- the held system prompt with the
+attribution block refreshed from the delta, the held messages, the recorded
+assistant turn, the delta's messages, the held tools. The store keeps the
+last 64 responses for an hour (`THREAD_STORE_*` in `src/const.py`; the client
+only ever continues from its latest one). A continuation it cannot resume --
+after a restart, an eviction or the TTL -- is answered with `400
+invalid_request_error` without calling the upstream, and the CLI resends the
+same step as a full `create` request (measured on 2.1.278, whatever the error
+wording). Forwarding such a delta instead would make the upstream answer a
+request with no system prompt and no question: a gateway that fills in a
+default prompt of its own greets the user in the middle of a tool loop. The
+log shows `thread_resumed` for every rebuilt request and
+`thread_continue_rejected` with a `reason` for every miss; the reject carries
+`x-ohr-capability-rejected: thread_continue` and shows in the dashboard feed
+as `rejected`, not as an error. Behind a custom `ANTHROPIC_BASE_URL` the CLI
+never sends threads.
+
 The price: trust the root CA once and run the proxy listener with
 `ROUTER_PROXY_ENABLED=true`. `HTTPS_PROXY` covers ALL outbound traffic of the
 CLI process, so a router that is down takes the whole CLI off the network, not
@@ -1048,7 +1077,10 @@ What feeds it (`src/services/monitor.py`):
   deflate stream (what `api.anthropic.com` sends to a client that accepts
   it; passthrough relays it compressed) is inflated for the reading only;
   a stream in an encoding the stdlib cannot inflate (`br`, `zstd`) is
-  relayed untouched and counts no tokens;
+  relayed untouched and counts no tokens. A `400` the translated provider
+  answers on purpose (a message-thread continuation it cannot resume, see
+  "Forward-proxy" under "Run modes") is listed with a `rejected` field and
+  counted as a request, not an error;
 - the log events worth seeing: what the forward-proxy tunnelled or relayed
   outside the routed paths, retries, context-window clamps and rejects, and
   every warning or error.
@@ -1165,7 +1197,7 @@ src/
   providers/         passthrough, openai-translate, base interface, factory
   proxy/             forward-proxy: CONNECT, MITM TLS, certificates, tunnel, HTTP/1.1 session
   routing/           routing.yaml schema, matcher, loader, registry
-  services/          headers, reasoning-context cache, token estimation, dashboard monitor
+  services/          headers, reasoning-context cache, message-thread store, token estimation, dashboard monitor
 .claude/skills/      Claude Code skills: add-provider, release
 bin/                 launcher for launchd: execs .venv python -m entrypoint
 monitoring/          Prometheus + Grafana stack for /metrics (docker compose), provisioned dashboard
