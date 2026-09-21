@@ -97,6 +97,41 @@ async def test_translate_returns_anthropic_shaped_response(
     assert len(outbound) == 1
 
 
+async def test_translate_hides_deferred_tools_until_the_conversation_surfaces_them(
+    client: httpx.AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    """Claude Code's tool_addition block parses; only visible tools go upstream."""
+    httpx_mock.add_response(url=_OPENAI_COMPATIBLE_CHAT_URL, method="POST", json=_OPENAI_RESPONSE)
+    schema = {"type": "object", "properties": {}}
+    payload = {
+        "model": "zai-org/GLM-5.2-FP8",
+        "max_tokens": 128,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "system",
+                "content": [
+                    {"type": "tool_addition", "tool": {"type": "tool_reference", "name": "mcp__a"}}
+                ],
+            },
+        ],
+        "tools": [
+            {"name": "Bash", "input_schema": schema},
+            {"name": "mcp__a", "input_schema": schema, "defer_loading": True},
+            {"name": "mcp__b", "input_schema": schema, "defer_loading": True},
+            {"name": "DeferredToolPlaceholder", "input_schema": schema, "defer_loading": True},
+        ],
+    }
+
+    response = await client.post(
+        "/v1/messages", json=payload, headers={"x-api-key": "irrelevant-openai-uses-server-key"}
+    )
+
+    assert response.status_code == 200
+    sent = json.loads(httpx_mock.get_requests(url=_OPENAI_COMPATIBLE_CHAT_URL)[0].content)
+    assert [tool["function"]["name"] for tool in sent["tools"]] == ["Bash", "mcp__a"]
+
+
 async def test_translate_rejects_a_thread_continuation_without_calling_upstream(
     client: httpx.AsyncClient, httpx_mock: HTTPXMock
 ) -> None:

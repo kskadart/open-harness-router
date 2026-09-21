@@ -51,6 +51,8 @@ from conversion.response_converter import (
 from errors import ProviderError, anthropic_error_body
 from log import get_logger
 from models.claude import (
+    ClaudeContentBlockToolAddition,
+    ClaudeMessage,
     ClaudeMessagesRequest,
     ClaudeThread,
     ClaudeTokenCountRequest,
@@ -146,6 +148,83 @@ def apply_param_compat(
     for name in cfg.drop_params:
         openai_request.pop(name, None)
     return openai_request
+
+
+def visible_tools(
+    tools: list[ClaudeTool] | None,
+    messages: list[ClaudeMessage],
+    provider_name: str,
+    *,
+    log_unresolved: bool = True,
+) -> list[ClaudeTool] | None:
+    """Keep the tools the model could see on the Claude API.
+
+    Claude Code's MCP tool search marks most MCP tools ``defer_loading``:
+    the Claude API hides such a tool from the model until the conversation
+    carries a ``tool_addition`` block referencing it by name (beta
+    ``mid-conversation-tool-changes-2026-07-01``; Claude Code puts the block
+    into a system-role message at the point where ToolSearch surfaced the
+    tool), and the ``DeferredToolPlaceholder`` entry -- deferred and never
+    referenced -- only keeps that machinery active. An OpenAI-format
+    upstream has no deferral, so the same visibility rule is applied here:
+    a non-deferred tool always goes upstream, a deferred one once
+    referenced, the placeholder never. Sending everything instead shows the
+    model every deferred schema and lets it call a tool Claude Code has not
+    loaded, which the CLI rejects. A block that carries a full definition
+    rather than a reference (a newer shape) is added as it is; a reference
+    to a name the request does not define is logged and skipped.
+
+    Args:
+        tools: the request's ``tools`` (or None).
+        messages: the conversation, scanned for ``tool_addition`` blocks.
+        provider_name: provider name for logging.
+        log_unresolved: whether an unresolved reference is worth a warning;
+            ``False`` for ``count_tokens``, which follows the same path.
+
+    Returns:
+        The tools to send upstream, in the request's order, with the
+        definitions carried by ``tool_addition`` blocks appended; ``None``
+        when the request had none.
+    """
+    if tools is None:
+        return None
+
+    referenced: set[str] = set()
+    defined: list[ClaudeTool] = []
+    for message in messages:
+        if not isinstance(message.content, list):
+            continue
+        for block in message.content:
+            if not isinstance(block, ClaudeContentBlockToolAddition):
+                continue
+            name = block.tool.get("name")
+            if not isinstance(name, str):
+                continue
+            input_schema = block.tool.get("input_schema")
+            if isinstance(input_schema, dict):
+                defined.append(
+                    ClaudeTool(
+                        name=name,
+                        description=block.tool.get("description"),
+                        input_schema=input_schema,
+                    )
+                )
+            else:
+                referenced.add(name)
+
+    visible = [tool for tool in tools if not tool.defer_loading or tool.name in referenced]
+    known = {tool.name for tool in tools}
+    visible.extend(tool for tool in defined if tool.name not in known)
+
+    unresolved = sorted(referenced - known - {tool.name for tool in defined})
+    if unresolved and log_unresolved:
+        logger.warning(
+            "tool_addition_unresolved",
+            provider=provider_name,
+            names=unresolved[:DROPPED_TOOLS_LOG_SAMPLE],
+            unresolved_count=len(unresolved),
+        )
+    return visible
 
 
 def cap_tools(
@@ -795,6 +874,13 @@ class OpenAITranslateProvider:
         Returns:
             OpenAI request dict (Chat Completions or Responses).
         """
+        # What the model could see on the Claude API: a deferred tool stays
+        # hidden until a tool_addition block in the conversation surfaces it
+        # (see visible_tools). Applied before the cap, so the cap counts
+        # only tools that go upstream.
+        parsed.tools = visible_tools(
+            parsed.tools, parsed.messages, self.name, log_unresolved=log_dropped_tools
+        )
         # Tools array truncated to the openai upstream limit (128 for
         # OpenAI). Applied BEFORE conversion: works with ClaudeTool models
         # (the .name field); the logic does not touch the passthrough

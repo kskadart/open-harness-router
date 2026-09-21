@@ -182,7 +182,14 @@ provider/model is a YAML edit, no code changes. Provider types:
   the `chat` flavor, `system`-role messages that the client appends inside
   `messages` (not the top-level `system` prompt) are forwarded as user
   text: some open-model chat templates stop generating on a trailing
-  system message and return an empty completion.
+  system message and return an empty completion. Deferred tools stay
+  hidden as they do on the Claude API: a tool marked `defer_loading`
+  (Claude Code's MCP tool search) goes upstream only once a
+  `tool_addition` block in the conversation references it, and the
+  `DeferredToolPlaceholder` entry never does -- so a translated model sees
+  the tools it could actually call, not every MCP schema, and cannot call
+  a tool Claude Code has not loaded. A reference to a tool the request
+  does not define is logged as `tool_addition_unresolved` and skipped.
 
 `passthrough` has two mutually exclusive auth modes, set by
 `forward_client_auth` (`ProviderCfg`, `src/routing/schema.py`):
