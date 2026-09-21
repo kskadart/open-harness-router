@@ -35,6 +35,7 @@ from const import (
     CAPABILITY_REJECTED_HEADER,
     CLAUDE_BUILTIN_TOOL_NAMES,
     CONTEXT_WINDOW_RESERVE_TOKENS,
+    DEFERRED_TOOL_PLACEHOLDER,
     DROPPED_TOOLS_LOG_SAMPLE,
     MIN_COMPLETION_TOKENS,
     MIN_USEFUL_COMPLETION_TOKENS,
@@ -155,7 +156,7 @@ def visible_tools(
     messages: list[ClaudeMessage],
     provider_name: str,
     *,
-    log_unresolved: bool = True,
+    log_issues: bool = True,
 ) -> list[ClaudeTool] | None:
     """Keep the tools the model could see on the Claude API.
 
@@ -168,29 +169,34 @@ def visible_tools(
     referenced -- only keeps that machinery active. An OpenAI-format
     upstream has no deferral, so the same visibility rule is applied here:
     a non-deferred tool always goes upstream, a deferred one once
-    referenced, the placeholder never. Sending everything instead shows the
-    model every deferred schema and lets it call a tool Claude Code has not
-    loaded, which the CLI rejects. A block that carries a full definition
-    rather than a reference (a newer shape) is added as it is; a reference
-    to a name the request does not define is logged and skipped.
+    referenced, the placeholder never (by name, not only by its flag).
+    Sending everything instead shows the model every deferred schema and
+    lets it call a tool Claude Code has not loaded, which the CLI rejects.
+
+    A block that carries a full definition rather than a reference (a newer
+    shape) counts as a reference to its name, and its definition is used
+    only for a tool the request does not define; an invalid definition, and
+    a reference to a name the request does not define, are logged and
+    skipped rather than failing the request.
 
     Args:
         tools: the request's ``tools`` (or None).
         messages: the conversation, scanned for ``tool_addition`` blocks.
         provider_name: provider name for logging.
-        log_unresolved: whether an unresolved reference is worth a warning;
-            ``False`` for ``count_tokens``, which follows the same path.
+        log_issues: whether an unresolved reference or an invalid definition
+            is worth a warning; ``False`` for ``count_tokens``, which follows
+            the same path.
 
     Returns:
         The tools to send upstream, in the request's order, with the
-        definitions carried by ``tool_addition`` blocks appended; ``None``
-        when the request had none.
+        definitions carried by ``tool_addition`` blocks for tools the
+        request does not define appended; ``None`` when the request had none.
     """
     if tools is None:
         return None
 
     referenced: set[str] = set()
-    defined: list[ClaudeTool] = []
+    defined: dict[str, ClaudeTool] = {}
     for message in messages:
         if not isinstance(message.content, list):
             continue
@@ -200,24 +206,26 @@ def visible_tools(
             name = block.tool.get("name")
             if not isinstance(name, str):
                 continue
-            input_schema = block.tool.get("input_schema")
-            if isinstance(input_schema, dict):
-                defined.append(
-                    ClaudeTool(
-                        name=name,
-                        description=block.tool.get("description"),
-                        input_schema=input_schema,
-                    )
-                )
-            else:
-                referenced.add(name)
+            referenced.add(name)
+            if "input_schema" not in block.tool:
+                continue
+            try:
+                defined[name] = ClaudeTool.model_validate(block.tool)
+            except ValidationError:
+                if log_issues:
+                    logger.warning("tool_addition_invalid", provider=provider_name, name=name)
 
-    visible = [tool for tool in tools if not tool.defer_loading or tool.name in referenced]
     known = {tool.name for tool in tools}
-    visible.extend(tool for tool in defined if tool.name not in known)
+    visible = [
+        tool
+        for tool in tools
+        if tool.name != DEFERRED_TOOL_PLACEHOLDER
+        and (not tool.defer_loading or tool.name in referenced)
+    ]
+    visible.extend(tool for name, tool in defined.items() if name not in known)
 
-    unresolved = sorted(referenced - known - {tool.name for tool in defined})
-    if unresolved and log_unresolved:
+    unresolved = sorted(referenced - known - set(defined))
+    if unresolved and log_issues:
         logger.warning(
             "tool_addition_unresolved",
             provider=provider_name,
@@ -879,7 +887,7 @@ class OpenAITranslateProvider:
         # (see visible_tools). Applied before the cap, so the cap counts
         # only tools that go upstream.
         parsed.tools = visible_tools(
-            parsed.tools, parsed.messages, self.name, log_unresolved=log_dropped_tools
+            parsed.tools, parsed.messages, self.name, log_issues=log_dropped_tools
         )
         # Tools array truncated to the openai upstream limit (128 for
         # OpenAI). Applied BEFORE conversion: works with ClaudeTool models

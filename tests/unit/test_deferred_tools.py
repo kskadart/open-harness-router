@@ -91,7 +91,9 @@ def test_schema_accepts_tool_addition_in_system_and_user_messages() -> None:
         "tools": [{**_PLACEHOLDER}],
     })
 
-    assert request.messages[1].content[1].type == "tool_addition"  # type: ignore[union-attr]
+    reminder = request.messages[1].content
+    assert isinstance(reminder, list)
+    assert reminder[1].type == "tool_addition"
     assert request.tools is not None
     assert request.tools[0].defer_loading is True
 
@@ -125,6 +127,41 @@ def test_a_full_definition_in_the_block_is_appended() -> None:
     assert visible[-1].description == "new"
 
 
+def test_a_definition_for_a_tool_the_request_defines_counts_as_a_reference() -> None:
+    """The request's own definition wins; the tool must not vanish."""
+    block = {
+        "type": "tool_addition",
+        "tool": {"name": "mcp__docs__guide", "description": "from block", "input_schema": _SCHEMA},
+    }
+
+    visible = visible_tools(_TOOLS, [_system_message(block)], "gateway")
+
+    assert visible is not None
+    assert [tool.name for tool in visible] == ["Bash", "mcp__docs__guide", "Read"]
+    assert visible[1].description is None
+
+
+def test_an_invalid_definition_is_logged_and_skipped(caplog: pytest.LogCaptureFixture) -> None:
+    """A malformed block must not fail the request with an internal error."""
+    block = {"type": "tool_addition", "tool": {"name": "mcp__bad", "input_schema": "nope"}}
+
+    with caplog.at_level(logging.WARNING):
+        visible = visible_tools(_TOOLS, [_system_message(block)], "gateway")
+
+    assert visible is not None
+    assert [tool.name for tool in visible] == ["Bash", "Read"]
+    assert "tool_addition_invalid" in caplog.text
+
+
+def test_the_placeholder_is_hidden_even_without_the_flag() -> None:
+    tools = [_tool("Bash"), _tool("DeferredToolPlaceholder"), _tool("Read")]
+
+    visible = visible_tools(tools, [], "gateway")
+
+    assert visible is not None
+    assert [tool.name for tool in visible] == ["Bash", "Read"]
+
+
 def test_an_unresolved_reference_is_logged_and_skipped(caplog: pytest.LogCaptureFixture) -> None:
     messages = [_system_message(_addition("mcp__gone__tool"))]
 
@@ -137,7 +174,7 @@ def test_an_unresolved_reference_is_logged_and_skipped(caplog: pytest.LogCapture
 
     caplog.clear()
     with caplog.at_level(logging.WARNING):
-        visible_tools(_TOOLS, messages, "gateway", log_unresolved=False)
+        visible_tools(_TOOLS, messages, "gateway", log_issues=False)
     assert "tool_addition_unresolved" not in caplog.text
 
 
@@ -145,12 +182,13 @@ def test_no_tools_stays_none() -> None:
     assert visible_tools(None, [_system_message(_addition("x"))], "gateway") is None
 
 
-def _provider() -> OpenAITranslateProvider:
+def _provider(tools_max: int = 0) -> OpenAITranslateProvider:
     cfg = ProviderCfg(
         type="openai-translate",
         base_url=_BASE_URL,
         api_key_env="GATEWAY_API_KEY",
         max_tokens_limit=8192,
+        tools_max=tools_max,
     )
     return OpenAITranslateProvider(
         name="gateway",
@@ -225,3 +263,34 @@ async def test_the_first_request_of_a_session_is_served_with_the_visible_tools(
     # The system-role message still reaches the upstream as user text.
     assert sent["messages"][-1]["role"] == "user"
     assert "tools surfaced" in sent["messages"][-1]["content"]
+
+
+async def test_visibility_is_applied_before_the_tools_cap(httpx_mock: HTTPXMock) -> None:
+    """A referenced deferred tool survives a cap that a hidden one would have used up."""
+    httpx_mock.add_response(url=_CHAT_URL, method="POST", json=_COMPLETION)
+    body = json.dumps({
+        "model": "ag-GLM-5.3-Flash",
+        "max_tokens": 128,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [_addition("mcp__b")]},
+        ],
+        "tools": [
+            {"name": "Bash", "input_schema": _SCHEMA},
+            {"name": "mcp__a", "input_schema": _SCHEMA, "defer_loading": True},
+            {"name": "mcp__b", "input_schema": _SCHEMA, "defer_loading": True},
+        ],
+    }).encode()
+    provider = _provider(tools_max=2)
+    try:
+        result = await provider.handle_messages(
+            body, {}, _ConnectedChannel(), _MODEL, RouteLimits.resolve(provider.cfg, None)
+        )
+    finally:
+        await provider.aclose()
+
+    assert result.status_code == 200
+    upstream_request = httpx_mock.get_request()
+    assert upstream_request is not None
+    sent = json.loads(upstream_request.content)
+    assert [tool["function"]["name"] for tool in sent["tools"]] == ["Bash", "mcp__b"]

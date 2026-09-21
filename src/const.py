@@ -56,6 +56,13 @@ CLAUDE_BUILTIN_TOOL_NAMES: frozenset[str] = frozenset({
 # them, to avoid spamming the log when dozens of tools get truncated).
 DROPPED_TOOLS_LOG_SAMPLE: int = 10
 
+# The entry Claude Code keeps in ``tools`` to hold its deferred tool loading
+# open ("Reserved placeholder that keeps deferred tool loading active; never
+# call this tool"). Deferred and never referenced, so the visibility rule in
+# ``providers.openai_translate.visible_tools`` hides it anyway; the name
+# keeps the exclusion in place should the flag ever change.
+DEFERRED_TOOL_PLACEHOLDER: str = "DeferredToolPlaceholder"
+
 # Fields of a ``reasoning`` item that are allowed in the Responses API's
 # ``input`` array. The set was determined empirically against a live
 # /v1/responses: the item returned as-is is rejected by the upstream (the
