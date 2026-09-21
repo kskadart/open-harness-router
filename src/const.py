@@ -125,6 +125,26 @@ MONITOR_EVENT_BUFFER: int = 500
 MONITOR_EVENT_TEXT_LIMIT: int = 300
 MONITOR_SSE_LINE_LIMIT: int = 1 << 20
 
+# Bounds of the message-thread store (``services.thread_store``): one entry
+# per response the translated provider hands out under a ``thread`` field,
+# holding the whole conversation that produced it -- hundreds of KB for a
+# Claude Code turn once parsed. The client only ever continues from its
+# latest response, so the older entries of a conversation are dead weight
+# the cap sweeps out; 64 covers the recent minutes of several parallel
+# sessions at ~20 MB worst case, and the TTL drops conversations no one is
+# coming back to. Neither is a setting: a miss degrades to the 400 that
+# makes the client resend the full conversation (see the provider).
+THREAD_STORE_MAX_ENTRIES: int = 64
+THREAD_STORE_TTL_S: float = 3600.0
+
+# Response header the openai-translate provider sets on a 400 it answers on
+# purpose, without an upstream call, to make the client resend the request
+# in a shape the provider can serve (a message-thread continuation it holds
+# nothing for, see ``providers.openai_translate``). The value names what
+# was rejected. The monitor reads the header to keep such a reply out of
+# the error counters: it is protocol, not a failure.
+CAPABILITY_REJECTED_HEADER: str = "x-ohr-capability-rejected"
+
 
 class Constants:
     """String constants for the Anthropic/OpenAI protocols."""

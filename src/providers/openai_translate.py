@@ -32,6 +32,7 @@ from openai.types.responses import ResponseStreamEvent
 from pydantic import BaseModel, SecretStr, ValidationError
 
 from const import (
+    CAPABILITY_REJECTED_HEADER,
     CLAUDE_BUILTIN_TOOL_NAMES,
     CONTEXT_WINDOW_RESERVE_TOKENS,
     DROPPED_TOOLS_LOG_SAMPLE,
@@ -49,11 +50,17 @@ from conversion.response_converter import (
 )
 from errors import ProviderError, anthropic_error_body
 from log import get_logger
-from models.claude import ClaudeMessagesRequest, ClaudeTokenCountRequest, ClaudeTool
+from models.claude import (
+    ClaudeMessagesRequest,
+    ClaudeThread,
+    ClaudeTokenCountRequest,
+    ClaudeTool,
+)
 from providers.base import ClientChannel, ProviderResult
 from routing.schema import ProviderCfg, RouteLimits
 from services.http_transport import build_upstream_transport, build_upstream_verify
 from services.reasoning_cache import ReasoningCache
+from services.thread_store import ThreadMissError, ThreadStore
 from services.token_estimator import estimate_openai_request_tokens
 from settings import UpstreamSettings
 
@@ -82,6 +89,31 @@ _CONTEXT_LENGTH_ERROR_MARKERS: tuple[str, ...] = (
 # Stable token from the Claude Code gateway protocol: its recovery path
 # (retry with a smaller max_tokens, then compact) keys on this substring.
 _PROMPT_TOO_LONG_TOKEN = "capability_rejected: prompt_too_long"
+
+# Message threads (Claude Code v2.1.278+, beta message-threads-2026-08-12):
+# sent whenever the CLI believes it talks to api.anthropic.com, i.e. through
+# the forward-proxy, never behind a custom ANTHROPIC_BASE_URL. The first
+# request of a turn carries the whole conversation with ``thread: {"type":
+# "create"}``; the tool-result steps that follow carry only the delta -- the
+# attribution block as the entire ``system``, the new tool results, no
+# earlier messages, no tools -- with ``thread: {"type": "continue",
+# "previous_message_id": ...}``, expecting the upstream to hold the rest
+# under the id of the previous response. Anthropic does; here the router
+# does (``services.thread_store``): every response handed out under a
+# ``thread`` field is recorded, and a continuation is rebuilt into the full
+# request before translation. Forwarding the delta as a conversation of its
+# own would make the upstream answer a request with no system prompt and no
+# question -- on a gateway that fills in a default prompt of its own, a
+# greeting in the middle of a tool loop. A continuation the store cannot
+# resume (restart, eviction, TTL) is answered with this 400 instead:
+# measured on 2.1.278, it makes the CLI resend the same step as a full
+# ``create`` request at once, whatever the error wording, and finish the
+# turn.
+_THREAD_CONTINUE_REJECTED = "thread_continue"
+_THREAD_CONTINUE_MESSAGE = (
+    "message-thread continuation (thread.type=continue) names a response this "
+    "router no longer holds: resend the full conversation"
+)
 
 
 def apply_param_compat(
@@ -167,7 +199,12 @@ def cap_tools(
     return builtins + kept_mcp
 
 
-def _json_result(status_code: int, content: dict[str, Any]) -> ProviderResult:
+def _json_result(
+    status_code: int,
+    content: dict[str, Any],
+    *,
+    extra_headers: Mapping[str, str] | None = None,
+) -> ProviderResult:
     """Build a ProviderResult with a JSON body, matching fastapi.JSONResponse serialization.
 
     The ``json.dumps`` parameters match ``starlette.responses.JSONResponse``,
@@ -177,6 +214,7 @@ def _json_result(status_code: int, content: dict[str, Any]) -> ProviderResult:
     Args:
         status_code: HTTP status of the response.
         content: response body (Anthropic-compatible JSON).
+        extra_headers: response headers beyond ``content-type``.
 
     Returns:
         ProviderResult with a UTF-8 JSON body and a ``content-type`` header.
@@ -185,8 +223,15 @@ def _json_result(status_code: int, content: dict[str, Any]) -> ProviderResult:
         content, ensure_ascii=False, allow_nan=False, indent=None, separators=(",", ":")
     ).encode("utf-8")
     return ProviderResult(
-        status_code=status_code, headers={"content-type": "application/json"}, body=body
+        status_code=status_code,
+        headers={"content-type": "application/json", **(extra_headers or {})},
+        body=body,
     )
+
+
+def _invalid_request(exc: ValidationError) -> ProviderResult:
+    """The 400 for a client body the Anthropic request schema rejects."""
+    return _json_result(400, anthropic_error_body("invalid_request_error", str(exc)))
 
 
 async def _encode_sse(chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
@@ -252,6 +297,9 @@ class OpenAITranslateProvider:
         # startup), so a tool call chain outlives individual requests.
         # Populated only on the Responses API path.
         self._reasoning_cache = ReasoningCache()
+        # Same lifetime: a client continues a thread across requests, and
+        # both listeners share the registry, so they share the store.
+        self._threads = ThreadStore(name)
 
     async def create_chat_completion(
         self, request: dict[str, Any], request_id: str | None = None
@@ -520,7 +568,49 @@ class OpenAITranslateProvider:
             return True
         return False
 
-    async def handle_messages(
+    def _resume_continuation(
+        self, raw_body: bytes, thread: ClaudeThread, model: str
+    ) -> tuple[bytes, dict[str, Any]] | ProviderResult:
+        """Rebuild a thread continuation into the full request it stands for.
+
+        Args:
+            raw_body: the continuation as the client sent it.
+            thread: its ``thread`` field.
+            model: the model the client named, for the log.
+
+        Returns:
+            The rebuilt request, as bytes for validation and as the mapping
+            to record the response under -- or, when the store holds nothing
+            under ``previous_message_id``, the 400 that makes the client
+            resend the full conversation (see ``_THREAD_CONTINUE_MESSAGE``).
+            The marker header keeps that reply out of the monitor's error
+            counters.
+        """
+        try:
+            held = self._threads.resume(thread.previous_message_id, json.loads(raw_body))
+        except ThreadMissError as miss:
+            logger.info(
+                "thread_continue_rejected",
+                provider=self.name,
+                model=model,
+                previous_message_id=thread.previous_message_id,
+                reason=miss.reason,
+            )
+            return _json_result(
+                400,
+                anthropic_error_body("invalid_request_error", _THREAD_CONTINUE_MESSAGE),
+                extra_headers={CAPABILITY_REJECTED_HEADER: _THREAD_CONTINUE_REJECTED},
+            )
+        logger.info(
+            "thread_resumed",
+            provider=self.name,
+            model=model,
+            previous_message_id=thread.previous_message_id,
+            messages=len(held.get("messages") or []),
+        )
+        return json.dumps(held, ensure_ascii=False).encode("utf-8"), held
+
+    async def handle_messages(  # noqa: PLR0911
         self,
         raw_body: bytes,
         client_headers: Mapping[str, str],
@@ -539,9 +629,26 @@ class OpenAITranslateProvider:
         try:
             parsed = ClaudeMessagesRequest.model_validate_json(raw_body)
         except ValidationError as exc:
-            return _json_result(
-                400, anthropic_error_body("invalid_request_error", str(exc))
-            )
+            return _invalid_request(exc)
+
+        # The conversation to record the response under, when the client
+        # threads: the body itself on ``create``, the rebuilt one on
+        # ``continue`` (validated again -- it is what goes upstream). Parsed
+        # from the bytes rather than dumped from the model: the record must
+        # be what the client sent, extra fields the schema ignores included.
+        held: dict[str, Any] | None = None
+        if parsed.thread is not None:
+            if parsed.thread.type == "continue":
+                resumed = self._resume_continuation(raw_body, parsed.thread, parsed.model)
+                if isinstance(resumed, ProviderResult):
+                    return resumed
+                raw_body, held = resumed
+                try:
+                    parsed = ClaudeMessagesRequest.model_validate_json(raw_body)
+                except ValidationError as exc:
+                    return _invalid_request(exc)
+            else:
+                held = json.loads(raw_body)
 
         request_id = str(uuid.uuid4())
         is_responses = self.cfg.api_flavor == "responses"
@@ -606,6 +713,8 @@ class OpenAITranslateProvider:
                     stream, parsed, logger, client_channel, self, request_id
                 )
             )
+            if held is not None:
+                converted = self._threads.record_stream(held, converted)
             return ProviderResult(
                 status_code=200,
                 headers={
@@ -636,6 +745,8 @@ class OpenAITranslateProvider:
             if is_responses
             else convert_openai_to_claude_response(openai_response, parsed)
         )
+        if held is not None:
+            self._threads.record(claude_response["id"], held, claude_response["content"])
         # An upstream that closes the turn with no text and no tool call
         # (DeepSeek on a chat array ending in a system message) is otherwise
         # indistinguishable from a normal end_turn in the log. Text that is
@@ -804,9 +915,17 @@ class OpenAITranslateProvider:
         try:
             parsed = ClaudeTokenCountRequest.model_validate_json(raw_body)
         except ValidationError as exc:
-            return _json_result(
-                400, anthropic_error_body("invalid_request_error", str(exc))
-            )
+            return _invalid_request(exc)
+        # A continuation counts as the conversation it stands for; a delta
+        # on its own would put a tiny number on the client's /context.
+        if parsed.thread is not None and parsed.thread.type == "continue":
+            resumed = self._resume_continuation(raw_body, parsed.thread, parsed.model)
+            if isinstance(resumed, ProviderResult):
+                return resumed
+            try:
+                parsed = ClaudeTokenCountRequest.model_validate_json(resumed[0])
+            except ValidationError as exc:
+                return _invalid_request(exc)
         messages_request = ClaudeMessagesRequest(
             max_tokens=MIN_COMPLETION_TOKENS, **parsed.model_dump()
         )

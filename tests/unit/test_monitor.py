@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator
 
 import pytest
 
+from const import CAPABILITY_REJECTED_HEADER
 from providers.base import ProviderResult
 from routing.schema import PricingCfg
 from services.monitor import Monitor, Usage, UsageScanner, capture_for_monitor
@@ -182,6 +183,21 @@ def test_tracker_counts_a_4xx_status_as_an_error() -> None:
     tracker.attach(ProviderResult(429, _JSON_HEADERS, b'{"type": "error"}'))
     assert monitor.snapshot()["totals"]["errors"] == 1
     assert monitor.snapshot()["events"][0]["level"] == "error"
+
+
+def test_tracker_keeps_a_deliberate_rejection_out_of_the_error_count() -> None:
+    """A 400 the provider answers on purpose (marker header) is protocol, not a failure."""
+    monitor = Monitor()
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    headers = {**_JSON_HEADERS, CAPABILITY_REJECTED_HEADER.upper(): "thread_continue"}
+    tracker.attach(ProviderResult(400, headers, b'{"type": "error"}'))
+    snapshot = monitor.snapshot()
+    assert snapshot["totals"]["requests"] == 1
+    assert snapshot["totals"]["errors"] == 0
+    entry = snapshot["events"][0]
+    assert entry["level"] == "info"
+    assert entry["status"] == 400
+    assert entry["rejected"] == "thread_continue"
 
 
 def test_tracker_fail_records_the_exception_type() -> None:
