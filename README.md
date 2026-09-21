@@ -162,6 +162,13 @@ provider/model is a YAML edit, no code changes. Provider types:
   passthrough provider is a startup error: byte-for-byte proxying forwards
   the request body, including the `model` field, unchanged and cannot
   rewrite it (`upstream_model` is only meaningful for `openai-translate`).
+  Responses are relayed as received, streaming and regular alike: the body
+  bytes and the upstream's `content-encoding` reach the client untouched,
+  so the encoding the client negotiated (Brotli, for Claude Code) is the
+  client's to decode. Decoding in the router would leave the body encoded
+  whenever the upstream picks a codec the router lacks, which is exactly
+  what used to turn the auto-mode classifier's unary verdicts into
+  unreadable JSON.
   The request target's query string travels with the body: Claude Code
   posts to `/v1/messages?beta=true`, and the upstream sees the same target.
   Supports `ca_bundle` (for a corporate/self-hosted Anthropic-compatible
@@ -1074,9 +1081,10 @@ What feeds it (`src/services/monitor.py`):
   client (the `usage` object of a JSON body, or the `message_start` and
   `message_delta` events of an SSE stream) without buffering or changing a
   byte, and the same reading works for translated responses. A gzip or
-  deflate stream (what `api.anthropic.com` sends to a client that accepts
-  it; passthrough relays it compressed) is inflated for the reading only;
-  a stream in an encoding the stdlib cannot inflate (`br`, `zstd`) is
+  deflate body, stream or not (what `api.anthropic.com` sends to a client
+  that accepts it; passthrough relays it compressed), is inflated for the
+  reading only; one in an encoding the stdlib cannot inflate (`br`, `zstd`
+  -- what `api.anthropic.com` picks for Claude Code's unary requests) is
   relayed untouched and counts no tokens. A `400` the translated provider
   answers on purpose (a message-thread continuation it cannot resume, see
   "Forward-proxy" under "Run modes") is listed with a `rejected` field and

@@ -169,6 +169,34 @@ def test_tracker_without_pricing_counts_tokens_only() -> None:
     assert "cost_usd" not in monitor.snapshot()["events"][0]
 
 
+def test_tracker_inflates_a_compressed_unary_body_for_reading() -> None:
+    """A passthrough JSON body keeps the upstream's gzip; the usage is still read."""
+    monitor = Monitor()
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    usage = {"usage": {"input_tokens": 28154, "output_tokens": 9}}
+    body = gzip.compress(json.dumps(usage).encode())
+    headers = {"Content-Type": "application/json", "Content-Encoding": "gzip"}
+
+    result = tracker.attach(ProviderResult(200, headers, body))
+
+    assert result.body is body  # relayed compressed, as received
+    assert monitor.snapshot()["totals"]["usage"]["input_tokens"] == 28154
+    assert monitor.snapshot()["totals"]["usage"]["output_tokens"] == 9
+
+
+def test_tracker_leaves_usage_unknown_for_a_unary_body_it_cannot_inflate() -> None:
+    monitor = Monitor()
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    headers = {"content-type": "application/json", "content-encoding": "br"}
+
+    tracker.attach(ProviderResult(200, headers, b"\x83#\x01\x00opaque brotli bytes"))
+
+    snapshot = monitor.snapshot()
+    assert snapshot["totals"]["requests"] == 1
+    assert snapshot["totals"]["errors"] == 0
+    assert snapshot["totals"]["usage"]["input_tokens"] == 0
+
+
 def test_tracker_does_not_read_count_tokens_bodies_as_usage() -> None:
     monitor = Monitor()
     tracker = monitor.start_request(model="m", provider="p", endpoint="count_tokens", pricing=None)

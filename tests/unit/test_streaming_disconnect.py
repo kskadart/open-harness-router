@@ -664,7 +664,7 @@ async def test_passthrough_timeout_before_stream_raises_gateway_timeout() -> Non
 async def test_passthrough_unary_disconnect_raises_upstream_error() -> None:
     """An upstream abort on a non-streaming request -> UpstreamError 502."""
     provider = _passthrough_provider()
-    provider._client.post = AsyncMock(
+    provider._client.send = AsyncMock(
         side_effect=httpx.RemoteProtocolError("Server disconnected without sending a response.")
     )
 
@@ -678,7 +678,7 @@ async def test_passthrough_unary_disconnect_raises_upstream_error() -> None:
 async def test_passthrough_unary_timeout_raises_gateway_timeout() -> None:
     """A non-streaming request timeout -> UpstreamError 504."""
     provider = _passthrough_provider()
-    provider._client.post = AsyncMock(side_effect=httpx.ReadTimeout("read timed out"))
+    provider._client.send = AsyncMock(side_effect=httpx.ReadTimeout("read timed out"))
 
     with pytest.raises(UpstreamError) as exc_info:
         await provider._proxy_unary("/v1/messages", b"{}", {})
@@ -687,10 +687,39 @@ async def test_passthrough_unary_timeout_raises_gateway_timeout() -> None:
     assert exc_info.value.message == "Upstream request timed out. Retry the request."
 
 
+async def test_passthrough_unary_body_abort_raises_upstream_error() -> None:
+    """The upstream dropping mid-body on a non-streaming request -> UpstreamError 502.
+
+    The body is read raw after the headers arrived (``_proxy_unary`` relays
+    it as received); the response to the client has not started, so a
+    gateway error is still the answer, and the upstream response is closed
+    either way.
+    """
+    provider = _passthrough_provider()
+    upstream = MagicMock()
+    upstream.status_code = 200
+    upstream.headers = httpx.Headers({"content-type": "application/json"})
+    upstream.aclose = AsyncMock()
+
+    async def broken_body() -> AsyncIterator[bytes]:
+        yield b'{"partial'
+        raise httpx.RemoteProtocolError("peer closed connection without a complete body")
+
+    upstream.aiter_raw = broken_body
+    provider._client.send = AsyncMock(return_value=upstream)
+
+    with pytest.raises(UpstreamError) as exc_info:
+        await provider._proxy_unary("/v1/messages", b"{}", {})
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.message == "Upstream request failed. Retry the request."
+    upstream.aclose.assert_awaited_once()
+
+
 async def test_passthrough_count_tokens_disconnect_raises_upstream_error() -> None:
     """An upstream abort on count_tokens -> UpstreamError 502."""
     provider = _passthrough_provider()
-    provider._client.post = AsyncMock(
+    provider._client.send = AsyncMock(
         side_effect=httpx.RemoteProtocolError("Server disconnected without sending a response.")
     )
 
