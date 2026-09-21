@@ -4,9 +4,10 @@ The request body is proxied unchanged; how the auth headers are handled
 depends on ``cfg.forward_client_auth``: forwarded as-is for native Anthropic
 (billed on the client's subscription), or replaced with the provider's own
 key for a third-party upstream, under an allowlist rather than the client's
-full header set (see ``_build_headers``). Streaming is served via
-``aiter_raw`` without decompression, so the ``content-encoding`` header is
-forwarded to the client as-is.
+full header set (see ``_build_headers``). Responses are relayed as received,
+streaming and regular alike: the body via ``aiter_raw`` without
+decompression, with the ``content-encoding`` header forwarded to the client
+as-is -- the client negotiated the encoding and decodes it itself.
 """
 
 from __future__ import annotations
@@ -291,10 +292,27 @@ class PassthroughProvider:
     async def _proxy_unary(
         self, path: str, raw_body: bytes, fwd: dict[str, str]
     ) -> ProviderResult:
-        """Proxy a regular (non-streaming) request."""
+        """Proxy a regular (non-streaming) request, relaying the body as received.
+
+        The body is read raw and the upstream's ``content-encoding`` is kept,
+        exactly as on the streaming path: the client negotiated the encoding
+        (its ``accept-encoding`` travels with the forwarded headers) and
+        decodes it itself. Reading the decoded ``response.content`` instead
+        hands over the still-encoded bytes whenever the upstream picks an
+        encoding httpx has no decoder for -- Brotli, which api.anthropic.com
+        uses for a client that offers it, as Claude Code does -- and
+        dropping the header alongside turned such a body into unreadable
+        JSON for the client: the auto-mode classifier's verdicts on Sonnet
+        never parsed, and the session fell back to its own model for them.
+        """
         try:
             upstream = await self._send_with_retry(
-                lambda: self._client.post(path, content=raw_body, headers=fwd)
+                lambda: self._client.send(
+                    self._client.build_request(
+                        "POST", path, content=raw_body, headers=fwd
+                    ),
+                    stream=True,
+                )
             )
         except (httpx.HTTPError, httpx.StreamError) as exc:
             logger.error(
@@ -304,11 +322,24 @@ class PassthroughProvider:
                 error=str(exc),
             )
             raise _upstream_transport_error(exc) from exc
-        headers = response_headers(upstream.headers)
-        # httpx has already decompressed content, so content-encoding is invalid.
-        headers.pop("content-encoding", None)
+        try:
+            body = b"".join([chunk async for chunk in upstream.aiter_raw()])
+        except (httpx.HTTPError, httpx.StreamError) as exc:
+            # The response to the client has not started yet, so a regular
+            # gateway error is still possible.
+            logger.error(
+                "passthrough_read_error",
+                provider=self.name,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise _upstream_transport_error(exc) from exc
+        finally:
+            await upstream.aclose()
         return ProviderResult(
-            status_code=upstream.status_code, headers=headers, body=upstream.content
+            status_code=upstream.status_code,
+            headers=response_headers(upstream.headers),
+            body=body,
         )
 
     async def _proxy_stream(

@@ -179,8 +179,9 @@ class UsageScanner:
     Handles both shapes the client can receive: a JSON body (unary) and an
     SSE stream, fed chunk by chunk with lines split anywhere. Neither path
     keeps the response: only the current incomplete line is buffered, and a
-    line longer than ``MONITOR_SSE_LINE_LIMIT`` is dropped. A stream in a
-    ``content-encoding`` the scanner cannot inflate is skipped altogether.
+    line longer than ``MONITOR_SSE_LINE_LIMIT`` is dropped. A body in a
+    ``content-encoding`` the scanner cannot inflate is skipped altogether,
+    whichever shape it has.
     """
 
     def __init__(self, content_encoding: str = "") -> None:
@@ -196,7 +197,11 @@ class UsageScanner:
         self.readable = encoding in _PLAIN_ENCODINGS or self._inflater is not None
 
     def feed_json(self, body: bytes) -> None:
-        """Read the ``usage`` object of a complete JSON response body."""
+        """Read the ``usage`` object of a complete JSON response body, inflated if need be."""
+        if not self.readable:
+            return
+        if self._inflater is not None:
+            body = self._inflater.feed(body)
         try:
             payload = json.loads(body)
         except ValueError:
@@ -330,10 +335,11 @@ class RequestTracker:
             the stream ends or breaks.
         """
         if isinstance(result.body, bytes):
-            # A unary passthrough body is already decompressed by httpx (its
-            # content-encoding header is dropped there) and a translated one
-            # is built in the router: plain JSON either way.
-            self._scanner = UsageScanner()
+            # A unary body arrives as the client will receive it: a
+            # translated one is plain JSON built here, a passthrough one
+            # keeps the upstream's content-encoding and is inflated for the
+            # reading like a stream is.
+            self._scanner = UsageScanner(_header_value(result.headers, "content-encoding") or "")
             if self._active.endpoint == "messages":
                 self._scanner.feed_json(result.body)
             self._finish(
