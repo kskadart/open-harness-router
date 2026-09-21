@@ -43,6 +43,22 @@ class ClaudeContentBlockToolResult(BaseModel):
     content: str | list[dict[str, Any]] | dict[str, Any]
 
 
+class ClaudeContentBlockToolAddition(BaseModel):
+    """A tool that became available at this point of the conversation.
+
+    Claude Code v2.1.278+ on a first-party host (beta
+    ``mid-conversation-tool-changes-2026-07-01``) announces a deferred tool
+    (``defer_loading`` in ``tools``) the model may now see as a reference,
+    ``{"type": "tool_reference", "name": ...}``, inside a system-role
+    message at the position where ToolSearch surfaced it. ``tool`` is kept
+    as sent: a full definition in its place would be a newer shape, and the
+    provider handles both (``providers.openai_translate.visible_tools``).
+    """
+
+    type: Literal["tool_addition"]
+    tool: dict[str, Any]
+
+
 class ClaudeSystemContent(BaseModel):
     """Element of an Anthropic array-form system prompt."""
 
@@ -65,16 +81,23 @@ class ClaudeMessage(BaseModel):
             | ClaudeContentBlockImage
             | ClaudeContentBlockToolUse
             | ClaudeContentBlockToolResult
+            | ClaudeContentBlockToolAddition
         ]
     )
 
 
 class ClaudeTool(BaseModel):
-    """Description of a tool available to the model."""
+    """Description of a tool available to the model.
+
+    ``defer_loading`` is Claude Code's MCP tool search marker: on the Claude
+    API such a tool stays hidden from the model until the conversation
+    surfaces it (see ``ClaudeContentBlockToolAddition``).
+    """
 
     name: str
     description: str | None = None
     input_schema: dict[str, Any]
+    defer_loading: bool | None = None
 
 
 class ClaudeThinkingConfig(BaseModel):
