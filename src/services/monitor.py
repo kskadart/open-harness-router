@@ -64,6 +64,7 @@ _FEED_EVENTS = frozenset({
     "passthrough_connect_retry",
     "context_window_clamp",
     "context_window_reject",
+    "stream_keepalive",
 })
 
 # Log fields never copied into the feed: bulky (the routing table) or
