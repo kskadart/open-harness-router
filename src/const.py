@@ -132,6 +132,18 @@ MONITOR_EVENT_BUFFER: int = 500
 MONITOR_EVENT_TEXT_LIMIT: int = 300
 MONITOR_SSE_LINE_LIMIT: int = 1 << 20
 
+# How long a translated stream may stay silent before the router sends the
+# client an Anthropic ``ping`` event (``services.keepalive``). A reasoning
+# upstream streams nothing visible while it thinks (its reasoning deltas are
+# not forwarded), and a busy gateway queues a request for minutes; Claude
+# Code counts the bytes it receives and aborts a stream that stays silent
+# (measured 2026-09-21 on 2.1.278: ~180 s, then it resends the whole
+# conversation). api.anthropic.com keeps its streams alive with pings, so
+# the router does the same for the streams it produces. Ten seconds is an
+# order of magnitude inside the tightest abort observed, and a ping is a
+# few dozen bytes, so the cost of pinging early is nil.
+STREAM_KEEPALIVE_INTERVAL_S: float = 10.0
+
 # Bounds of the message-thread store (``services.thread_store``): one entry
 # per response the translated provider hands out under a ``thread`` field,
 # holding the whole conversation that produced it -- hundreds of KB for a

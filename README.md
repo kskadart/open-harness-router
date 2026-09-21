@@ -190,6 +190,13 @@ provider/model is a YAML edit, no code changes. Provider types:
   the tools it could actually call, not every MCP schema, and cannot call
   a tool Claude Code has not loaded. A reference to a tool the request
   does not define is logged as `tool_addition_unresolved` and skipped.
+  A translated stream is kept alive the way the Claude API keeps its own:
+  when no visible event has been produced for `STREAM_KEEPALIVE_INTERVAL_S`
+  (10 s, `src/const.py`) -- a reasoning upstream thinking, a gateway
+  holding the request in its queue -- the router sends the client a `ping`
+  event, so Claude Code's silent-stream watchdogs do not abort the request
+  and resend the whole conversation. A stream that needed pings is logged
+  as `stream_keepalive` with the count and the longest gap.
 
 `passthrough` has two mutually exclusive auth modes, set by
 `forward_client_auth` (`ProviderCfg`, `src/routing/schema.py`):

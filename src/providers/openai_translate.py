@@ -62,6 +62,7 @@ from models.claude import (
 from providers.base import ClientChannel, ProviderResult
 from routing.schema import ProviderCfg, RouteLimits
 from services.http_transport import build_upstream_transport, build_upstream_verify
+from services.keepalive import with_keepalive
 from services.reasoning_cache import ReasoningCache
 from services.thread_store import ThreadMissError, ThreadStore
 from services.token_estimator import estimate_openai_request_tokens
@@ -809,7 +810,7 @@ class OpenAITranslateProvider:
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                 },
-                body=_encode_sse(converted),
+                body=_encode_sse(with_keepalive(converted, provider=self.name)),
             )
 
         try:
