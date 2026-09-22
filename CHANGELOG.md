@@ -4,6 +4,20 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are `major.minor.micro`
 and every release is tagged `vX.Y.Z`.
 
+## [0.2.0] - 2026-09-22
+
+### Added
+
+- hold Claude Code message threads for translated providers: a `thread` continuation is rebuilt from the router's record of the previous turn, and a miss is answered with a 400 that makes the client resend the conversation (`x-ohr-capability-rejected`, `rejected` on the dashboard) ([#26](https://github.com/kskadart/open-harness-router/pull/26))
+- hide deferred tools until the conversation surfaces them: a `defer_loading` tool goes upstream only once a `tool_addition` block references it, the `DeferredToolPlaceholder` never ([#28](https://github.com/kskadart/open-harness-router/pull/28))
+- deferred tools: keep a redefined tool, skip an invalid definition, exclude the placeholder by name ([#29](https://github.com/kskadart/open-harness-router/pull/29))
+- keep a silent translated stream alive with `ping` events after `STREAM_KEEPALIVE_INTERVAL_S` (10 s) of silence, logged as `stream_keepalive`, so Claude Code's watchdogs do not abort a reasoning or queued request ([#30](https://github.com/kskadart/open-harness-router/pull/30))
+
+### Fixed
+
+- report the version from pyproject.toml ([#25](https://github.com/kskadart/open-harness-router/pull/25))
+- relay a unary passthrough response as received, `content-encoding` included: Brotli bodies reached the client undecodable, so Claude Code's auto-mode classifier verdicts were unreadable and its checks fell back to the session model ([#27](https://github.com/kskadart/open-harness-router/pull/27))
+
 ## [0.1.1] - 2026-09-07
 
 ### Added
