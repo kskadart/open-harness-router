@@ -287,6 +287,46 @@ def cap_tools(
     return builtins + kept_mcp
 
 
+def _describe_failure(exc: BaseException) -> str:
+    """Render an SDK exception together with the explicit causes behind it.
+
+    ``str()`` of ``openai.APIConnectionError`` is the fixed text
+    "Connection error." (``APITimeoutError``: "Request timed out."): the
+    transport failure that actually happened -- an expired upstream
+    certificate, a refused port, a DNS miss -- sits in ``__cause__``, where
+    httpx and the SDK put it with an explicit ``raise ... from``. Without
+    the chain the router's log and the client's 502 read the same for a
+    certificate incident and for a network outage.
+
+    Only ``__cause__`` is followed, never the implicit ``__context__``: the
+    latter would drag in whatever exception happened to be active in an
+    ``except`` block. A cause whose text repeats the one above it (httpx
+    wraps ``ssl`` errors with the same message) is left out.
+
+    Args:
+        exc: exception raised by the OpenAI SDK.
+
+    Returns:
+        ``str(exc)``, followed by ``Type: message`` of each explicit cause
+        in brackets, outermost first; ``str(exc)`` alone when there is none.
+    """
+    message = str(exc)
+    causes: list[str] = []
+    seen_text = {message}
+    seen_ids = {id(exc)}
+    cause = exc.__cause__
+    while cause is not None and id(cause) not in seen_ids:
+        seen_ids.add(id(cause))
+        text = str(cause)
+        if text not in seen_text:
+            seen_text.add(text)
+            causes.append(f"{type(cause).__name__}: {text}")
+        cause = cause.__cause__
+    if not causes:
+        return message
+    return f"{message} [caused by {'; '.join(causes)}]"
+
+
 def _json_result(
     status_code: int,
     content: dict[str, Any],
@@ -596,6 +636,12 @@ class OpenAITranslateProvider:
         ``capability_rejected: prompt_too_long`` token; other statuses are
         never remapped, so a 429 mentioning tokens keeps its meaning.
 
+        A transport failure is rendered with its httpx cause chain (see
+        ``_describe_failure``): the SDK's own text is the fixed
+        "Connection error.", which cannot tell an expired upstream
+        certificate from a network outage -- neither in the ``upstream
+        error`` log entry nor in the 502 the client receives.
+
         Args:
             exc: OpenAI SDK exception.
 
@@ -611,7 +657,7 @@ class OpenAITranslateProvider:
                 status_code=400,
                 error_type="invalid_request_error",
             )
-        detail = self.classify_error(str(exc))
+        detail = self.classify_error(_describe_failure(exc))
         if isinstance(exc, AuthenticationError):
             return ProviderError(message=detail, status_code=401)
         if isinstance(exc, RateLimitError):
