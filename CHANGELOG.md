@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are `major.minor.micro`
 and every release is tagged `vX.Y.Z`.
 
+## [Unreleased]
+
+### Added
+
+- raise the process's open-file soft limit to 8192 at startup (`services.open_files`) and report the ceiling in force as `open_files_limit` in `proxy_startup`: launchd hands agents 256, and on 2026-09-22 a burst of parallel tunnels exhausted it (`socket.accept() out of system resource`), taking every client behind the router offline; the README plist carries the matching `SoftResourceLimits`
+
+### Fixed
+
+- name the transport failure behind an upstream "Connection error.": the openai-translate 502 and its `upstream error` log entry now carry the httpx cause chain (for example `[SSL: CERTIFICATE_VERIFY_FAILED] ... certificate has expired`), so an expired gateway certificate is no longer indistinguishable from a network outage
+
 ## [0.2.0] - 2026-09-22
 
 ### Added

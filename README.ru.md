@@ -754,6 +754,11 @@ LaunchAgent на уровне пользователя, без `sudo`, стар�
     <true/>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/Users/USERNAME/Library/Logs/open-harness-router.log</string>
@@ -784,6 +789,16 @@ LaunchAgent на уровне пользователя, без `sudo`, стар�
 - `ThrottleInterval` задаёт минимальный интервал между автоматическими
   перезапусками в секундах, чтобы цикл падений не съедал процессор и не
   заливал журнал.
+- `SoftResourceLimits` / `NumberOfFiles` задаёт лимит открытых файлов
+  процесса. launchd запускает агентов с лимитом 256 (`launchctl limit
+  maxfiles`), а forward-proxy держит два дескриптора на туннель плюс один
+  на каждую попытку соединения в полёте, поэтому всплеск параллельных
+  клиентов (пакетный менеджер, унаследовавший `HTTPS_PROXY`, парк
+  субагентов) исчерпывает 256 за секунды: `accept()` падает с `EMFILE`, и
+  всё, что ходит через роутер, остаётся без связи. Сервис сам поднимает
+  soft-лимит до 8192 на старте (`services.open_files`; действующий потолок
+  пишется в `proxy_startup` полем `open_files_limit`), так что запись в
+  plist служит второй линией обороны и документирует намерение.
 - `StandardOutPath` и `StandardErrorPath` разводят stdout и stderr по разным
   файлам.
 
@@ -822,6 +837,10 @@ launchctl kickstart -k gui/$(id -u)/com.example.open-harness-router
 # status (state, pid, last exit code)
 launchctl print gui/$(id -u)/com.example.open-harness-router
 ```
+
+`kickstart` перезапускает процесс с тем plist, что уже загружен: после
+правки plist (например, блока `SoftResourceLimits`) выполните `bootout`, а
+затем снова `bootstrap`, иначе изменение до процесса не дойдёт.
 
 Старый синтаксис `launchctl load/unload ~/Library/LaunchAgents/<label>.plist`
 ещё работает, но Apple рекомендует `bootstrap` и `bootout`.
