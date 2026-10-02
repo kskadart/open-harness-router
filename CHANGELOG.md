@@ -4,16 +4,12 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are `major.minor.micro`
 and every release is tagged `vX.Y.Z`.
 
-## [Unreleased]
-
-### Added
-
-- ride out an upstream's output-token quota window: a gateway refusal with a "retry in N minutes" hint (`422`/`429` with quota wording) closes a per-provider gate, the refused request and every request that arrives meanwhile wait for the window and leave one by one, and a window longer than `quota_wait_max_s` (default 300 s) becomes `429 rate_limit_error` with `retry-after` (capped at 60 s, the most Claude Code honors) instead of a status that ends the Claude Code turn or subagent
-- raise the process's open-file soft limit to 8192 at startup (`services.open_files`) and report the ceiling in force as `open_files_limit` in `proxy_startup`: launchd hands agents 256, and on 2026-09-22 a burst of parallel tunnels exhausted it (`socket.accept() out of system resource`), taking every client behind the router offline; the README plist carries the matching `SoftResourceLimits`
+## [0.2.1] - 2026-10-02
 
 ### Fixed
 
-- name the transport failure behind an upstream "Connection error.": the openai-translate 502 and its `upstream error` log entry now carry the httpx cause chain (for example `[SSL: CERTIFICATE_VERIFY_FAILED] ... certificate has expired`), so an expired gateway certificate is no longer indistinguishable from a network outage
+- name the transport failure behind an upstream "Connection error." with the httpx cause chain (for example an expired gateway certificate), and raise the open-file soft limit to 8192 at startup, reported as `open_files_limit` in `proxy_startup`, after launchd's 256 descriptors ran out under a burst of tunnels ([#32](https://github.com/kskadart/open-harness-router/pull/32))
+- ride out a gateway's output-token quota window: a `422`/`429` refusal with a "retry in N minutes" hint closes a per-provider gate, and requests wait for the window (`quota_wait_max_s`, default 300 s) and leave one by one; past the budget the client gets `429 rate_limit_error` with `retry-after` capped at 60 s instead of a status that ends the Claude Code turn ([#33](https://github.com/kskadart/open-harness-router/pull/33))
 
 ## [0.2.0] - 2026-09-22
 
