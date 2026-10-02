@@ -74,6 +74,8 @@ def test_recognizes_quota_refusals(status: int, message: str, expected: float) -
         (422, "Unprocessable: 'messages' must be a list"),
         (422, "Превышен лимит completion-токенов"),
         (429, "try again in 5 seconds"),
+        (422, "Failed to generate the answer, retry in 5 seconds"),
+        (429, "quota hit, wait within 3 minutes"),
     ],
 )
 def test_ignores_everything_else(status: int, message: str) -> None:
@@ -81,9 +83,11 @@ def test_ignores_everything_else(status: int, message: str) -> None:
     assert quota_retry_after(status, message) is None
 
 
-def test_retry_after_header_rounds_up_and_never_zero() -> None:
-    assert retry_after_header(179.2) == "180"
+def test_retry_after_header_rounds_up_never_zero_and_capped() -> None:
+    """Claude Code gives up on retry-after above 60 s, so the header never exceeds it."""
+    assert retry_after_header(41.2) == "42"
     assert retry_after_header(0.0) == "1"
+    assert retry_after_header(179.2) == "60"
 
 
 async def test_open_gate_does_not_wait(gate: QuotaGate, clock: FakeClock) -> None:
@@ -154,3 +158,63 @@ async def test_client_leaving_stops_the_wait(gate: QuotaGate, clock: FakeClock) 
 
     assert await gate.wait_turn(300, leaves_after_three_polls) is False
     assert sum(clock.sleeps) < 10
+
+
+async def test_late_arrival_queues_behind_staggered_waiters(
+    gate: QuotaGate, clock: FakeClock
+) -> None:
+    """After the window ends, a newcomer does not overtake requests still leaving."""
+    gate.close(60)
+    first = gate._departure()
+    second = gate._departure()
+    clock.now = first + 0.5  # window over, second waiter not gone yet
+
+    assert await gate.wait_turn(300, _never_cancelled) is True
+    assert clock.now >= second + upstream_quota.RELEASE_STAGGER_S
+
+
+async def test_open_gate_after_queue_drained_does_not_wait(
+    gate: QuotaGate, clock: FakeClock
+) -> None:
+    gate.close(60)
+    last = gate._departure()
+    clock.now = last + 1
+
+    assert await gate.wait_turn(0, _never_cancelled) is True
+    assert clock.sleeps == []
+
+
+async def test_reclosed_gate_moves_waiter_behind_new_window(
+    gate: QuotaGate, clock: FakeClock
+) -> None:
+    """The first request out refused again: a waiter does not leave on the old schedule."""
+    gate.close(60)
+    reopened = clock.now + 60 + upstream_quota.WINDOW_MARGIN_S
+    reclosed = False
+
+    async def reclose_once_window_ends() -> bool:
+        nonlocal reclosed
+        if not reclosed and clock.now >= reopened - 1:
+            # The request released first was refused again: the gate closes
+            # for a new window, counted from (almost) the old reopening.
+            gate.close(120)
+            reclosed = True
+        return False
+
+    assert await gate.wait_turn(600, reclose_once_window_ends) is True
+    assert reclosed
+    assert clock.now >= reopened - 1 + 120
+
+
+async def test_reclosed_gate_beyond_budget_gives_up(gate: QuotaGate, clock: FakeClock) -> None:
+    gate.close(60)
+    reclosed = False
+
+    async def reclose_far() -> bool:
+        nonlocal reclosed
+        if not reclosed and gate.remaining_s() < 30:
+            gate.close(600)
+            reclosed = True
+        return False
+
+    assert await gate.wait_turn(120, reclose_far) is False

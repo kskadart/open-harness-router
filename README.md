@@ -589,8 +589,9 @@ Fields of an `openai-translate` provider (`ProviderCfg`,
   by all of the provider's requests: they wait until the hinted moment and
   leave one by one, two seconds apart, instead of each spending another
   refusal. A window longer than the budget is answered with
-  `429 rate_limit_error` and `retry-after`, which Claude Code honors and
-  retries on its own. Log events: `upstream_quota_window_closed`,
+  `429 rate_limit_error` and `retry-after`. The header is capped at 60 s:
+  Claude Code retries a `retry-after: 60` exactly a minute later, but gives
+  up at once on a longer one; the error message names the real window. Log events: `upstream_quota_window_closed`,
   `upstream_quota_wait`, `upstream_quota_exhausted`.
 
 `timeout_s` on `ProviderCfg` (either provider type) is currently unused --

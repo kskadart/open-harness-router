@@ -129,7 +129,11 @@ async def test_streaming_request_waits_out_the_window(httpx_mock: HTTPXMock) -> 
 
 
 async def test_window_beyond_budget_becomes_429_with_retry_after(httpx_mock: HTTPXMock) -> None:
-    """A 3-minute window over a 60 s budget: 429 rate_limit_error, no second attempt."""
+    """A 3-minute window over a 60 s budget: 429, retry-after capped at 60, no second attempt.
+
+    Claude Code gives up at once on ``retry-after: 180`` but retries a 60 s
+    one, so the header is capped; the message still names the real window.
+    """
     httpx_mock.add_response(url=_CHAT_URL, method="POST", status_code=422, json=_LONG_REFUSAL)
 
     provider = _provider(quota_wait_max_s=60)
@@ -139,9 +143,10 @@ async def test_window_beyond_budget_becomes_429_with_retry_after(httpx_mock: HTT
         await provider.aclose()
 
     assert result.status_code == 429
-    assert result.headers["retry-after"] == "180"
+    assert result.headers["retry-after"] == "60"
     error = json.loads(result.body)["error"]
     assert error["type"] == "rate_limit_error"
+    assert "reopens in 180 s" in error["message"]
     assert "лимит completion-токенов" in error["message"]
     assert len(httpx_mock.get_requests()) == 1
 

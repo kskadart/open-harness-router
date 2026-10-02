@@ -19,7 +19,12 @@ up together and drain the fresh window in the same second.
 Waiting is bounded by ``ProviderCfg.quota_wait_max_s``: a refusal whose
 window ends later than that, or a repeated refusal after the wait, is
 answered with ``429 rate_limit_error`` and a ``retry-after`` header -- a
-status the client retries by itself, unlike the gateway's ``422``.
+status the client retries by itself, unlike the gateway's ``422``. The
+header never exceeds :data:`CLIENT_RETRY_AFTER_MAX_S`: measured 2026-10-02,
+Claude Code retries a 429 with ``retry-after: 60`` exactly 60 s later, but
+gives up at once on ``retry-after: 180`` (its SDK, like every Stainless SDK,
+honors the header only up to 60 s). A 60 s pause also brings the retry
+back while the gate may still be closed, where it waits in the router.
 """
 
 from __future__ import annotations
@@ -43,15 +48,13 @@ QUOTA_STATUSES = frozenset({422, 429})
 # malformed request has no "try again in N minutes"). Russian and English
 # wordings, seconds/minutes/hours, an integer or decimal amount.
 _RETRY_HINT = re.compile(
-    r"(?:через|in)\s+(?P<amount>\d+(?:[.,]\d+)?)\s*"
+    r"\b(?:через|in)\s+(?P<amount>\d+(?:[.,]\d+)?)\s*"
     r"(?P<unit>сек|с\b|seconds?|secs?|s\b|мин|minutes?|mins?|m\b|час|ч\b|hours?|h\b)",
     re.IGNORECASE,
 )
 # A hint is only trusted next to quota wording: "in 5 seconds" alone could
 # be anything.
-_QUOTA_WORDING = re.compile(
-    r"лимит|квот|limit|quota|rate", re.IGNORECASE
-)
+_QUOTA_WORDING = re.compile(r"\b(?:лимит|квот|limit|quota|rate\b)", re.IGNORECASE)
 _UNIT_SECONDS = {
     "сек": 1, "с": 1, "second": 1, "seconds": 1, "sec": 1, "secs": 1, "s": 1,
     "мин": 60, "minute": 60, "minutes": 60, "min": 60, "mins": 60, "m": 60,
@@ -66,6 +69,8 @@ RELEASE_STAGGER_S = 2.0
 # whole minutes, so leaving exactly on time would mostly earn a second
 # refusal.
 WINDOW_MARGIN_S = 5.0
+# Ceiling of the retry-after the client is given; see the module docstring.
+CLIENT_RETRY_AFTER_MAX_S = 60.0
 # How often a waiting request checks whether its client is still there.
 _CANCEL_POLL_S = 1.0
 
@@ -94,8 +99,11 @@ def quota_retry_after(status_code: int, message: str) -> float | None:
 
 
 def retry_after_header(seconds: float) -> str:
-    """Render a wait as a ``retry-after`` value: whole seconds, never zero."""
-    return str(max(1, math.ceil(seconds)))
+    """Render a wait as a ``retry-after`` value the client will honor.
+
+    Whole seconds, never zero, never above :data:`CLIENT_RETRY_AFTER_MAX_S`.
+    """
+    return str(max(1, math.ceil(min(seconds, CLIENT_RETRY_AFTER_MAX_S))))
 
 
 class QuotaGate:
@@ -124,6 +132,15 @@ class QuotaGate:
         """Seconds until the gate reopens; zero when it is open."""
         return max(0.0, self._closed_until - self._clock())
 
+    def _queue_clear_at(self) -> float:
+        """Moment the last claimed departure slot has passed.
+
+        Until then the gate counts as closed even after the window ended:
+        a request arriving in between must queue behind the staggered ones
+        instead of overtaking them.
+        """
+        return max(self._closed_until, self._next_release - RELEASE_STAGGER_S)
+
     def close(self, retry_after_s: float) -> None:
         """Close the gate for a refusal's window; a later moment wins.
 
@@ -150,8 +167,11 @@ class QuotaGate:
     ) -> bool:
         """Wait for this request's slot behind a closed gate.
 
-        An open gate returns immediately and claims no slot. A closed one
-        hands out departure slots in arrival order, a stagger apart.
+        An open gate with no queue returns immediately and claims no slot.
+        Otherwise departure slots are handed out in arrival order, a stagger
+        apart. A refusal that re-closes the gate while this request waits
+        (the first request out was refused again) moves its slot behind the
+        new window instead of letting it walk into another refusal.
 
         Args:
             max_wait_s: the longest this request may wait.
@@ -162,10 +182,11 @@ class QuotaGate:
             beyond ``max_wait_s`` or the client left -- the caller answers
             with 429 (or drops the request) without touching the upstream.
         """
-        if self.remaining_s() <= 0:
-            return True
         now = self._clock()
-        if max(self._closed_until, self._next_release) - now > max_wait_s:
+        if self._queue_clear_at() <= now:
+            return True
+        deadline = now + max_wait_s
+        if max(self._closed_until, self._next_release) > deadline:
             return False
         departure = self._departure()
         logger.info(
@@ -173,7 +194,12 @@ class QuotaGate:
             provider=self._provider,
             wait_s=round(departure - now, 1),
         )
-        while (left := departure - self._clock()) > 0:
+        while (left := departure - self._clock()) > 0 or self._closed_until > departure:
+            if self._closed_until > departure:
+                if max(self._closed_until, self._next_release) > deadline:
+                    return False
+                departure = self._departure()
+                continue
             if await is_cancelled():
                 return False
             await self._sleep(min(left, _CANCEL_POLL_S))

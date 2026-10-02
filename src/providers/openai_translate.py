@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import time
 import uuid
 from collections.abc import (
@@ -539,9 +540,10 @@ class OpenAITranslateProvider:
         repeated once the gate lets it through; a request arriving while
         the gate is closed waits the same way before its first attempt. The
         whole wait is bounded by ``cfg.quota_wait_max_s``; past it the
-        client gets ``429 rate_limit_error`` with ``retry-after`` -- a
-        status Claude Code retries by itself, unlike the gateway's ``422``,
-        which ends the turn. Every other error propagates unchanged.
+        client gets ``429 rate_limit_error`` with ``retry-after`` (capped at
+        60 s, see ``services.upstream_quota``) -- a status Claude Code
+        retries by itself, unlike the gateway's ``422``, which ends the
+        turn. Every other error propagates unchanged.
 
         Args:
             call: factory of the SDK coroutine, invoked once per attempt.
@@ -575,7 +577,7 @@ class OpenAITranslateProvider:
                 raise ProviderError(
                     message=(
                         f"Output-token quota of provider '{self.name}' is spent; "
-                        f"retry in {retry_after_header(remaining)} s."
+                        f"the window reopens in {math.ceil(remaining)} s."
                         + (f" Upstream: {last_refusal}" if last_refusal else "")
                     ),
                     status_code=429,
