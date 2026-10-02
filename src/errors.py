@@ -59,7 +59,21 @@ class ProviderError(UpstreamError):
     (status_code/message/error_type) in case the exception still goes
     uncaught -- then the already-registered UpstreamError handler kicks in
     (the same class is in its MRO).
+
+    ``retry_after_s`` -- when set, the JSON error response carries a
+    ``retry-after`` header with it: a quota refusal turned into ``429`` tells
+    the client how long to wait, and Claude Code honors it.
     """
+
+    def __init__(
+        self,
+        message: str,
+        status_code: int = 502,
+        error_type: str | None = None,
+        retry_after_s: float | None = None,
+    ) -> None:
+        super().__init__(message, status_code, error_type)
+        self.retry_after_s = retry_after_s
 
 
 def anthropic_error_body(error_type: str, message: str) -> dict[str, Any]:

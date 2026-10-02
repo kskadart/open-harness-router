@@ -100,6 +100,18 @@ REASONING_CACHE_TTL_S: float = 1800.0
 # computed pause (accepted when 0 < Retry-After <= 60).
 UPSTREAM_MAX_RETRIES: int = 5
 
+# Default for ``ProviderCfg.quota_wait_max_s``: how long the router holds a
+# request while an upstream's output-token quota window is closed (see
+# services.upstream_quota). Measured 2026-10-02 against a local stub:
+# Claude Code waits 360 s for response headers before it aborts and resends
+# the request, so the wait plus the request's own time-to-headers must stay
+# under that. The corporate gateway hints at most 4 minutes, plus the
+# gate's 5 s margin; 300 s covers it and leaves a minute for the request.
+# The same measurement showed Claude Code honoring retry-after on a 429
+# (retry exactly 60 s later, again and again), which is what the router
+# falls back to past this budget.
+QUOTA_WAIT_MAX_S: float = 300.0
+
 # Neutral messages about upstream transport failures. The client only gets
 # the fact of the failure and a hint to retry: the httpx exception text
 # stays in the log, so internal details of the connection to the provider

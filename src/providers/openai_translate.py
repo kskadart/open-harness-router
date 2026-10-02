@@ -13,14 +13,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
+import time
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Coroutine, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Coroutine,
+    Mapping,
+)
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, TypeVar, cast
 
 import httpx
 from openai import (
     APIError,
+    APIStatusError,
     AsyncOpenAI,
     AsyncStream,
     AuthenticationError,
@@ -66,9 +76,12 @@ from services.keepalive import with_keepalive
 from services.reasoning_cache import ReasoningCache
 from services.thread_store import ThreadMissError, ThreadStore
 from services.token_estimator import estimate_openai_request_tokens
+from services.upstream_quota import QuotaGate, quota_retry_after, retry_after_header
 from settings import UpstreamSettings
 
 logger = get_logger(__name__)
+
+_CallResult = TypeVar("_CallResult")
 
 # Transient 401 from OpenAI on reasoning models gpt-5.6-*: the upstream
 # fluctuates with "insufficient permissions" even with a valid key. Retried
@@ -327,6 +340,28 @@ def _describe_failure(exc: BaseException) -> str:
     return f"{message} [caused by {'; '.join(causes)}]"
 
 
+def _error_result(exc: ProviderError) -> ProviderResult:
+    """Render a provider error as the client's JSON response.
+
+    Args:
+        exc: the terminal provider error.
+
+    Returns:
+        Anthropic-format error body with the error's status; a
+        ``retry-after`` header when the error carries a wait.
+    """
+    headers = (
+        {"retry-after": retry_after_header(exc.retry_after_s)}
+        if exc.retry_after_s is not None
+        else None
+    )
+    return _json_result(
+        exc.status_code,
+        anthropic_error_body(exc.error_type, exc.message),
+        extra_headers=headers,
+    )
+
+
 def _json_result(
     status_code: int,
     content: dict[str, Any],
@@ -428,6 +463,9 @@ class OpenAITranslateProvider:
         # Same lifetime: a client continues a thread across requests, and
         # both listeners share the registry, so they share the store.
         self._threads = ThreadStore(name)
+        # The gateway meters output tokens per key, so the window is the
+        # provider's, not the request's: one gate for all of its requests.
+        self._quota = QuotaGate(name)
 
     async def create_chat_completion(
         self, request: dict[str, Any], request_id: str | None = None
@@ -458,9 +496,12 @@ class OpenAITranslateProvider:
             completion_task = asyncio.create_task(
                 cast(
                     "Coroutine[Any, Any, BaseModel]",
-                    self._client.responses.create(**request)
-                    if self.cfg.api_flavor == "responses"
-                    else self._client.chat.completions.create(**request),
+                    self._within_quota(
+                        lambda: self._client.responses.create(**request)
+                        if self.cfg.api_flavor == "responses"
+                        else self._client.chat.completions.create(**request),
+                        request_id,
+                    ),
                 )
             )
             if request_id:
@@ -488,6 +529,69 @@ class OpenAITranslateProvider:
         finally:
             if request_id and request_id in self.active_requests:
                 del self.active_requests[request_id]
+
+    async def _within_quota(
+        self, call: Callable[[], Awaitable[_CallResult]], request_id: str | None
+    ) -> _CallResult:
+        """Make one upstream call, riding out the provider's quota window.
+
+        A quota refusal (``services.upstream_quota.quota_retry_after``)
+        closes the provider's gate for the hinted window, and the call is
+        repeated once the gate lets it through; a request arriving while
+        the gate is closed waits the same way before its first attempt. The
+        whole wait is bounded by ``cfg.quota_wait_max_s``; past it the
+        client gets ``429 rate_limit_error`` with ``retry-after`` (capped at
+        60 s, see ``services.upstream_quota``) -- a status Claude Code
+        retries by itself, unlike the gateway's ``422``, which ends the
+        turn. Every other error propagates unchanged.
+
+        Args:
+            call: factory of the SDK coroutine, invoked once per attempt.
+            request_id: identifier for cooperative cancellation.
+
+        Returns:
+            The SDK call's result.
+
+        Raises:
+            ProviderError: 429 when the window outlasts the wait budget, 499
+                when the client leaves while waiting.
+        """
+
+        async def cancelled() -> bool:
+            event = self.active_requests.get(request_id) if request_id else None
+            return event is not None and event.is_set()
+
+        deadline = time.monotonic() + self.cfg.quota_wait_max_s
+        last_refusal = ""
+        while True:
+            if not await self._quota.wait_turn(deadline - time.monotonic(), cancelled):
+                if await cancelled():
+                    raise ProviderError(message="Request cancelled by client", status_code=499)
+                remaining = self._quota.remaining_s()
+                logger.warning(
+                    "upstream_quota_exhausted",
+                    provider=self.name,
+                    request_id=request_id,
+                    retry_after_s=round(remaining, 1),
+                )
+                raise ProviderError(
+                    message=(
+                        f"Output-token quota of provider '{self.name}' is spent; "
+                        f"the window reopens in {math.ceil(remaining)} s."
+                        + (f" Upstream: {last_refusal}" if last_refusal else "")
+                    ),
+                    status_code=429,
+                    error_type="rate_limit_error",
+                    retry_after_s=remaining,
+                )
+            try:
+                return await call()
+            except APIStatusError as exc:
+                retry_after_s = quota_retry_after(exc.status_code, str(exc))
+                if retry_after_s is None:
+                    raise
+                last_refusal = str(exc)
+                self._quota.close(retry_after_s)
 
     async def create_stream(
         self, request: dict[str, Any], request_id: str | None
@@ -548,11 +652,15 @@ class OpenAITranslateProvider:
                 if self.cfg.api_flavor == "responses":
                     return cast(
                         "AsyncStream[ResponseStreamEvent]",
-                        await self._client.responses.create(**request),
+                        await self._within_quota(
+                            lambda: self._client.responses.create(**request), request_id
+                        ),
                     )
                 return cast(
                     "AsyncStream[ChatCompletionChunk]",
-                    await self._client.chat.completions.create(**request),
+                    await self._within_quota(
+                        lambda: self._client.chat.completions.create(**request), request_id
+                    ),
                 )
             except AuthenticationError as exc:
                 last_exc = self._to_provider_error(exc)
@@ -822,9 +930,7 @@ class OpenAITranslateProvider:
                     status_code=exc.status_code,
                     detail=exc.message,
                 )
-                return _json_result(
-                    exc.status_code, anthropic_error_body(exc.error_type, exc.message)
-                )
+                return _error_result(exc)
 
             stream = self.create_chat_completion_stream(
                 streaming_completion, request_id
@@ -869,9 +975,7 @@ class OpenAITranslateProvider:
                 status_code=exc.status_code,
                 detail=exc.message,
             )
-            return _json_result(
-                exc.status_code, anthropic_error_body(exc.error_type, exc.message)
-            )
+            return _error_result(exc)
         claude_response = (
             convert_responses_to_claude_response(
                 openai_response, parsed, reasoning_cache=self._reasoning_cache
