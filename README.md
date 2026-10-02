@@ -750,6 +750,11 @@ reverse-proxy mode:
     <true/>
     <key>ThrottleInterval</key>
     <integer>10</integer>
+    <key>SoftResourceLimits</key>
+    <dict>
+        <key>NumberOfFiles</key>
+        <integer>8192</integer>
+    </dict>
 
     <key>StandardOutPath</key>
     <string>/Users/USERNAME/Library/Logs/open-harness-router.log</string>
@@ -777,6 +782,16 @@ Key fields:
 - `KeepAlive` -- launchd restarts the process on crash.
 - `ThrottleInterval` -- the minimum interval between automatic restarts, in
   seconds, so a crash loop doesn't hog the CPU and flood the log.
+- `SoftResourceLimits` / `NumberOfFiles` -- the process's open-file limit.
+  launchd starts agents with 256 (`launchctl limit maxfiles`), and a
+  forward-proxy holds two descriptors per tunnel plus one per connection
+  attempt in flight, so a burst of parallel clients (a package manager
+  fanning out through `HTTPS_PROXY`, a fleet of subagents) exhausts 256 in
+  seconds: `accept()` fails with `EMFILE` and everything behind the router
+  goes offline. The service raises its own soft limit to 8192 at startup
+  (`services.open_files`; the ceiling in force is logged as
+  `open_files_limit` in `proxy_startup`), so the plist entry is a second
+  line of defense that also documents the intent.
 - `StandardOutPath` / `StandardErrorPath` -- stdout and stderr go to separate
   files.
 
@@ -816,6 +831,10 @@ launchctl kickstart -k gui/$(id -u)/com.example.open-harness-router
 # status (state, pid, last exit code)
 launchctl print gui/$(id -u)/com.example.open-harness-router
 ```
+
+`kickstart` restarts the process under the plist as it was loaded: after
+editing the plist (for example the `SoftResourceLimits` block), run `bootout`
+and then `bootstrap` again, otherwise the change never reaches the process.
 
 The old `launchctl load/unload ~/Library/LaunchAgents/<label>.plist` syntax
 still works, but Apple recommends `bootstrap`/`bootout`.

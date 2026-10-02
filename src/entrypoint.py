@@ -56,6 +56,7 @@ from main import build_runtime, create_app
 from proxy.certificates import CertificateAuthorityError
 from proxy.outbound import OutboundConfigError
 from proxy.server import ForwardProxyServer
+from services.open_files import raise_open_files_limit
 
 logger = get_logger(__name__)
 
@@ -109,6 +110,10 @@ async def run() -> None:
             invalid upstream proxy address for the forward-proxy.
     """
     settings, registry = build_runtime()
+    # After build_runtime, so the outcome lands in the JSON log; before the
+    # listeners, so no connection is ever accepted under the 256-descriptor
+    # ceiling launchd starts agents with (see services.open_files).
+    raise_open_files_limit()
     try:
         stop_requested = asyncio.Event()
 

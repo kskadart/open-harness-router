@@ -48,6 +48,7 @@ from proxy.session import MitmHttpSession, SessionTimeouts
 from proxy.streams import close_stream, pump_tunnel
 from proxy.tls import build_leaf_tls_context, build_upstream_tls_context
 from routing.registry import ProviderRegistry
+from services.open_files import current_open_files_limit, raise_open_files_limit
 from settings import Settings
 
 logger = get_logger(__name__)
@@ -289,6 +290,10 @@ class ForwardProxyServer:
             host=self._settings.proxy.host,
             port=self._settings.proxy.port,
             mitm_hosts=sorted(self._mitm_hosts),
+            # Every tunnel costs two descriptors, every connect attempt in
+            # flight one more: when accept() starts failing with EMFILE,
+            # this is the ceiling to compare against.
+            open_files_limit=current_open_files_limit(),
             # The upstream proxy URL may contain credentials, so only the
             # fact that it is configured goes into the log.
             upstream_proxy_configured=self._upstream_proxy_configured,
@@ -541,6 +546,7 @@ def main() -> None:
             in these cases.
     """
     settings, registry = build_runtime()
+    raise_open_files_limit()
     try:
         server = ForwardProxyServer(settings, registry)
     except (CertificateAuthorityError, OutboundConfigError) as exc:
