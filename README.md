@@ -577,6 +577,21 @@ Fields of an `openai-translate` provider (`ProviderCfg`,
   (`/v1/responses`, allowed only for `openai-translate`): some reasoning
   models reject function tools combined with reasoning on the chat endpoint
   and return a 400.
+- `quota_wait_max_s` -- how long a request may wait for the provider's
+  output-token quota window to reopen (default 300, `0` disables the wait; Claude Code itself gives up on
+  response headers after 360 s).
+  Some gateways meter completion tokens per key over a sliding window of a
+  few minutes and refuse with a status Claude Code treats as final (seen:
+  `422` "Превышен лимит completion-токенов ... Повторите попытку через 3
+  мин."), which kills a turn or a subagent although the same request would
+  pass minutes later. A refusal carrying such a retry hint (a `422` or `429`
+  with quota wording and "retry in N seconds/minutes") closes a gate shared
+  by all of the provider's requests: they wait until the hinted moment and
+  leave one by one, two seconds apart, instead of each spending another
+  refusal. A window longer than the budget is answered with
+  `429 rate_limit_error` and `retry-after`, which Claude Code honors and
+  retries on its own. Log events: `upstream_quota_window_closed`,
+  `upstream_quota_wait`, `upstream_quota_exhausted`.
 
 `timeout_s` on `ProviderCfg` (either provider type) is currently unused --
 only `connect_timeout_s` (`ROUTER_UPSTREAM_CONNECT_TIMEOUT_S`, shared

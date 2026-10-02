@@ -15,7 +15,11 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-from const import CONTEXT_WINDOW_RESERVE_TOKENS, MIN_USEFUL_COMPLETION_TOKENS
+from const import (
+    CONTEXT_WINDOW_RESERVE_TOKENS,
+    MIN_USEFUL_COMPLETION_TOKENS,
+    QUOTA_WAIT_MAX_S,
+)
 from routing.matcher import match_model
 
 ProviderType = Literal["passthrough", "openai-translate"]
@@ -295,6 +299,15 @@ class ProviderCfg(BaseModel):
     override the auth header/key this provider forwards, injects, or
     resolves.
 
+    ``quota_wait_max_s`` -- openai-translate only: how long a request may
+    wait for the provider's output-token quota window to reopen (see
+    ``services.upstream_quota``). A gateway that meters completion tokens
+    per key refuses with a "retry in N minutes" hint; the router holds the
+    request (and every other one to the same provider) until then and
+    retries, instead of passing on a status Claude Code treats as final.
+    Past this budget the client gets ``429`` with ``retry-after``. ``0``
+    turns the wait off and leaves only that translation.
+
     ``pricing`` -- list prices for the dashboard's cost column
     (``PricingCfg``); the default for every rule on this provider, a rule
     may override it. Optional on either type and never sent anywhere.
@@ -315,6 +328,7 @@ class ProviderCfg(BaseModel):
     max_tokens_limit: int | None = None
     context_window: int | None = None
     tools_max: int = 0
+    quota_wait_max_s: float = Field(default=QUOTA_WAIT_MAX_S, ge=0)
     api_flavor: ApiFlavor = "chat"
     reasoning_effort: ReasoningEffort = "medium"
     pricing: PricingCfg | None = None

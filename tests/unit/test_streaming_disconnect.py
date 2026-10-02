@@ -46,6 +46,7 @@ from providers.openai_translate import OpenAITranslateProvider
 from providers.passthrough import PassthroughProvider
 from routing.schema import ProviderCfg, RouteLimits
 from services.reasoning_cache import ReasoningCache
+from services.upstream_quota import QuotaGate
 
 
 def _request() -> ClaudeMessagesRequest:
@@ -89,6 +90,7 @@ def _provider() -> OpenAITranslateProvider:
     provider.name = "openai"
     provider.cfg = cfg
     provider.active_requests = {}
+    provider._quota = QuotaGate("openai")
     provider._client = MagicMock()  # type: ignore[assignment]
     provider._http_client = MagicMock()  # type: ignore[assignment]
     return provider
