@@ -28,7 +28,7 @@ import asyncio
 import json
 import ssl
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Mapping
+from collections.abc import AsyncIterator, Iterable, Mapping
 from dataclasses import dataclass
 
 import h11
@@ -845,13 +845,21 @@ class MitmHttpSession:
             await self._send(h11.EndOfMessage())
             return result.status_code
 
-        await self._send(
-            h11.Response(
-                status_code=result.status_code,
-                headers=framed_headers(headers, None, allow_body=True),
+        try:
+            await self._send(
+                h11.Response(
+                    status_code=result.status_code,
+                    headers=framed_headers(headers, None, allow_body=True),
+                )
             )
-        )
-        await self._stream_body(result.body)
+            await self._stream_body(result.body)
+        finally:
+            # A client gone mid-stream breaks the loop with an exception,
+            # one gone before the response breaks the send of its headers,
+            # before the body is ever started; either way the upstream
+            # response the body holds must go back to the provider's pool
+            # now (see ``ProviderResult.aclose``).
+            await result.aclose()
         await self._send(h11.EndOfMessage())
         return result.status_code
 
@@ -864,17 +872,9 @@ class MitmHttpSession:
         Args:
             body: async byte stream from the provider.
         """
-        try:
-            async for chunk in body:
-                if chunk:
-                    await self._send(h11.Data(data=chunk))
-        finally:
-            # A client disconnect mid-stream breaks the loop with an
-            # exception, and the provider's suspended generator would keep
-            # the connection to the upstream open until garbage collected
-            # -- close it explicitly.
-            if isinstance(body, AsyncGenerator):
-                await body.aclose()
+        async for chunk in body:
+            if chunk:
+                await self._send(h11.Data(data=chunk))
 
     async def _send_bytes(self, status_code: int, content_type: str, body: bytes) -> int:
         """Send the client a ready-made response with a body of known length.

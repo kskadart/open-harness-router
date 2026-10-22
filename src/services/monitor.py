@@ -83,6 +83,9 @@ _USAGE_FIELDS = (
 # its usage stays unknown (zero).
 _ZLIB_ENCODINGS = frozenset({"gzip", "x-gzip", "deflate"})
 _PLAIN_ENCODINGS = frozenset({"", "identity"})
+# The error a streamed request finishes with when its body was released
+# without ever being read: the client went away before the headers.
+_STREAM_NOT_STARTED = "StreamNotStarted"
 
 
 def _now_iso() -> str:
@@ -351,11 +354,27 @@ class RequestTracker:
             return result
         self._active.stream = True
         self._scanner = UsageScanner(_header_value(result.headers, "content-encoding") or "")
-        return replace(result, body=self._wrap(result.body, result.status_code))
+        return replace(
+            result,
+            body=self._wrap(result.body, result.status_code),
+            release=lambda: self._release(result),
+        )
 
     def fail(self, exc: BaseException) -> None:
         """Finish the request after the provider raised."""
         self._finish(status=None, error=type(exc).__name__)
+
+    async def _release(self, result: ProviderResult) -> None:
+        """Release the provider's stream; finish the request if it never ran.
+
+        A stream that ran has already been finished by :meth:`_wrap`, so
+        the final ``_finish`` is a no-op then; one that never started would
+        otherwise stay in flight on the dashboard for good.
+        """
+        try:
+            await result.aclose()
+        finally:
+            self._finish(status=result.status_code, error=_STREAM_NOT_STARTED)
 
     async def _wrap(self, body: AsyncIterator[bytes], status: int) -> AsyncGenerator[bytes]:
         """Yield the stream unchanged while reading its usage."""

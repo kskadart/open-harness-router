@@ -8,7 +8,7 @@ back).
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
@@ -51,11 +51,33 @@ class ProviderResult:
             it.
         body: response body: ready-made bytes for a regular response, or an
             async byte stream for an SSE stream.
+        release: closes what a streaming body holds open upstream (the
+            upstream response and its pooled connection), or ``None`` when
+            the body holds nothing; called by :meth:`aclose`.
     """
 
     status_code: int
     headers: dict[str, str]
     body: bytes | AsyncIterator[bytes]
+    release: Callable[[], Awaitable[None]] | None = None
+
+    async def aclose(self) -> None:
+        """Close the streaming body and release what it holds upstream.
+
+        The transport calls this once it is done with the result, however
+        the response ended. Closing the body generator alone is not enough:
+        ``aclose()`` on a generator that was never started runs none of its
+        ``finally`` blocks, and that is exactly the case of a client that
+        went away before the response headers reached it -- the upstream
+        response would then stay open and keep its connection checked out
+        of the provider's pool for good. Safe to call more than once.
+        """
+        try:
+            if isinstance(self.body, AsyncGenerator):
+                await self.body.aclose()
+        finally:
+            if self.release is not None:
+                await self.release()
 
 
 @runtime_checkable

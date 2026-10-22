@@ -401,7 +401,12 @@ class PassthroughProvider:
                 await upstream.aclose()
 
         return ProviderResult(
-            status_code=upstream.status_code, headers=headers, body=body_iter()
+            status_code=upstream.status_code,
+            headers=headers,
+            body=body_iter(),
+            # body_iter closes the response itself once it runs; release
+            # covers a body that never runs (httpx's aclose is idempotent).
+            release=upstream.aclose,
         )
 
     async def handle_messages(

@@ -324,6 +324,50 @@ async def test_tracker_records_a_stream_that_breaks_and_closes_the_upstream() ->
     assert snapshot["totals"]["usage"]["input_tokens"] == 100
 
 
+async def test_tracker_releases_a_stream_never_read_and_finishes_the_request() -> None:
+    """A stream dropped before its first byte still reaches the provider's release.
+
+    Closing the never-started wrapper alone runs none of its cleanup: the
+    provider's upstream response stayed open and the request stayed in
+    flight on the dashboard for good.
+    """
+    monitor = Monitor()
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    released: list[bool] = []
+
+    async def upstream() -> AsyncIterator[bytes]:
+        yield _STREAM
+
+    async def release() -> None:
+        released.append(True)
+
+    result = tracker.attach(ProviderResult(200, _SSE_HEADERS, upstream(), release))
+    await result.aclose()
+
+    assert released == [True]
+    snapshot = monitor.snapshot()
+    assert snapshot["active"] == []
+    assert snapshot["totals"]["errors"] == 1
+    assert snapshot["events"][0]["error"] == "StreamNotStarted"
+
+
+async def test_tracker_release_after_a_full_stream_keeps_it_a_success() -> None:
+    monitor = Monitor()
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+
+    async def upstream() -> AsyncIterator[bytes]:
+        yield _STREAM
+
+    result = tracker.attach(ProviderResult(200, _SSE_HEADERS, upstream()))
+    assert not isinstance(result.body, bytes)
+    _seen = [chunk async for chunk in result.body]
+    await result.aclose()
+
+    snapshot = monitor.snapshot()
+    assert snapshot["totals"]["errors"] == 0
+    assert "error" not in snapshot["events"][0]
+
+
 def test_feed_keeps_warnings_and_selected_info_events_only() -> None:
     monitor = Monitor()
     monitor.record_log_event({"event": "route", "level": "info", "model": "x"})

@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are `major.minor.micro`
 and every release is tagged `vX.Y.Z`.
 
+## [Unreleased]
+
+### Fixed
+
+- give a streamed upstream response back to the provider's connection pool when the client leaves before the response headers reach it (Esc in Claude Code before the first token): the body was never started, so its own cleanup never ran, each such request kept a pooled connection checked out, and once `max_connections` (100) had leaked every request on that provider waited out the 10 s pool timeout and got `504`; `ProviderResult.release` now closes the upstream response whether or not the body ran, in the MITM session and in the ASGI app alike, and the dashboard no longer keeps such a request in flight ([#35](https://github.com/kskadart/open-harness-router/pull/35))
+
 ## [0.2.1] - 2026-10-02
 
 ### Fixed
