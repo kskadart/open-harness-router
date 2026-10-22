@@ -9,7 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import socket
 import ssl
+import struct
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from pathlib import Path
 
@@ -131,6 +133,43 @@ class StubProvider:
 
     async def aclose(self) -> None:
         """The stub has nothing to close."""
+
+
+class AnswersAfterClientLeftProvider(StubProvider):
+    """Stub that returns its result only once the client has dropped the connection.
+
+    The upstream answering after the client is gone is what Claude Code's
+    Esc before the first token looks like from the router's side.
+    """
+
+    async def handle_messages(
+        self,
+        raw_body: bytes,
+        client_headers: Mapping[str, str],
+        client_channel: ClientChannel,
+        upstream_model: str | None,
+        limits: RouteLimits,
+        *,
+        query: str = "",
+    ) -> ProviderResult:
+        """Wait for the client to leave, then return the prepared result."""
+        async with asyncio.timeout(_TIMEOUT_S):
+            while not await client_channel.is_disconnected():
+                await asyncio.sleep(0.01)
+        return await super().handle_messages(
+            raw_body, client_headers, client_channel, upstream_model, limits, query=query
+        )
+
+
+def _reset_connection(writer: asyncio.StreamWriter) -> None:
+    """Drop the connection with an RST, as a client aborting a request does.
+
+    Args:
+        writer: write stream of the side that aborts.
+    """
+    sock = writer.get_extra_info("socket")
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+    writer.transport.abort()
 
 
 def _registry(provider: StubProvider) -> ProviderRegistry:
@@ -438,6 +477,48 @@ async def test_streaming_result_is_delivered_chunk_by_chunk(
     assert _header(response, b"transfer-encoding") == b"chunked"
     assert _header(response, b"content-length") is None
     task.cancel()
+
+
+async def test_stream_is_released_when_the_client_leaves_before_the_headers(
+    connect_streams: StreamFactory,
+) -> None:
+    """A client gone before the response headers still gets the upstream stream released.
+
+    The headers go out before the body is started, so a reset client
+    breaks the send of the headers and the body generator never runs its
+    own cleanup. Before the fix the upstream response stayed open and its
+    connection checked out of the provider's pool: a hundred such requests
+    exhausted the pool, and every later request waited out the pool timeout
+    and got a 504.
+    """
+    monitor = Monitor.reset()
+    body_started = False
+    released = asyncio.Event()
+
+    async def stream_body() -> AsyncIterator[bytes]:
+        nonlocal body_started
+        body_started = True
+        yield b"event: message_start\n\n"
+
+    async def release() -> None:
+        released.set()
+
+    provider = AnswersAfterClientLeftProvider(
+        ProviderResult(200, {"content-type": "text/event-stream"}, stream_body(), release)
+    )
+    streams = await connect_streams()
+    task = _start_session(streams, _registry(provider))
+    conn = h11.Connection(h11.CLIENT)
+
+    await _send_request(streams, conn, "/v1/messages", _MESSAGES_BODY)
+    _reset_connection(streams.left_writer)
+    await asyncio.wait_for(task, timeout=_TIMEOUT_S)
+
+    assert released.is_set()
+    assert body_started is False
+    snapshot = monitor.snapshot()
+    assert snapshot["active"] == []
+    assert snapshot["events"][0]["error"] == "StreamNotStarted"
 
 
 async def test_count_tokens_path_is_routed_to_the_provider(

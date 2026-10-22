@@ -13,9 +13,41 @@ from __future__ import annotations
 import json
 
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.types import Receive, Scope, Send
 
 from errors import anthropic_error_body
 from providers.base import ProviderResult
+
+
+class _ReleasingStreamingResponse(StreamingResponse):
+    """A ``StreamingResponse`` that releases the provider's stream however it ended.
+
+    Starlette never starts the body iterator when the client is gone before
+    the response goes out: the send of the headers raises, or the
+    disconnect listener cancels the streaming task first. The provider's
+    stream then has to be released from here, or its upstream connection
+    stays checked out of the pool (see ``ProviderResult.aclose``).
+    """
+
+    def __init__(
+        self, result: ProviderResult, *, headers: dict[str, str], media_type: str | None
+    ) -> None:
+        """Wrap the result's streaming body; ``result`` is released after the response."""
+        assert not isinstance(result.body, bytes)  # noqa: S101 - checked by the caller
+        super().__init__(
+            result.body,
+            status_code=result.status_code,
+            headers=headers,
+            media_type=media_type,
+        )
+        self._result = result
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        """Send the response, then release the provider's stream."""
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._result.aclose()
 
 
 def parse_model(raw_body: bytes) -> str | JSONResponse:
@@ -70,9 +102,4 @@ def to_fastapi_response(result: ProviderResult) -> Response:
             headers=headers,
             media_type=media_type,
         )
-    return StreamingResponse(
-        result.body,
-        status_code=result.status_code,
-        headers=headers,
-        media_type=media_type,
-    )
+    return _ReleasingStreamingResponse(result, headers=headers, media_type=media_type)

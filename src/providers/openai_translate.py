@@ -955,6 +955,16 @@ class OpenAITranslateProvider:
             )
             if held is not None:
                 converted = self._threads.record_stream(held, converted)
+
+            async def release() -> None:
+                # The SDK stream closes its httpx response only in the
+                # finally of its own generator, which never runs when the
+                # body is not iterated; the cancellation entry is otherwise
+                # dropped by create_chat_completion_stream's finally.
+                if request_id:
+                    self.active_requests.pop(request_id, None)
+                await streaming_completion.close()
+
             return ProviderResult(
                 status_code=200,
                 headers={
@@ -963,6 +973,7 @@ class OpenAITranslateProvider:
                     "Connection": "keep-alive",
                 },
                 body=_encode_sse(with_keepalive(converted, provider=self.name)),
+                release=release,
             )
 
         try:
