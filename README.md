@@ -1230,11 +1230,16 @@ only in memory, while the rolling window is read back from disk.
 - **Time windows**: the range selector sits above the tiles and governs the
   whole page, Kibana-style -- the tiles, the charts, the Providers table and
   the trend all read the same period, so nothing has to be compared across
-  two different windows. It offers `24h`, `7d`, `30d`, `all` and a custom
-  range (two date fields; `start` alone means "from that day to now"), and
-  the choice is sent to `GET /dashboard/state` as `window=` and
+  two different windows. It offers `Today`, `24h`, `7d`, `30d`, `all` and a
+  custom range (two date fields; `start` alone means "from that day to
+  now"), and the choice is sent to `GET /dashboard/state` as `window=` and
   `start=`/`end=`, so the same figures come out of `curl`/`jq` without the
-  page. A `24h` window is bucketed by hour, everything longer by day; a
+  page. `24h`, `7d` and `30d` are rolling -- an hour of heavy traffic leaving
+  the window makes the totals drop -- and the page labels them so; `Today`
+  runs from the reader's local midnight and only grows until the next one.
+  The server does not know that time zone, so the page sends `Today` as a
+  custom range starting at local midnight with an open end. A window of a
+  day or less (`24h`, `Today`) is bucketed by hour, everything longer by day; a
   range reaching before the retention floor is clamped to it rather than
   silently read as whole (and the page says "clamped to retention"), and an
   unknown window or an inverted range answers `400`. When the store is
@@ -1244,7 +1249,11 @@ only in memory, while the rolling window is read back from disk.
   describe now. Without storage the same page falls back to the in-memory
   counters of the process and labels them "since start".
 - **Throughput (TPS)**: the chart above the Providers table shows the
-  generation speed of every model over the selected window. Throughput
+  generation speed of every model over the selected window, each model its
+  own line -- none is folded into an "other" series. A line keeps its style
+  across windows: the first eight models get the eight palette colours as
+  solid lines, the next ones reuse the colours dashed, dotted and
+  dash-dotted, and the legend shows each line's colour and dash. Throughput
   is the output tokens over the *generation* time -- from the first content
   token to the last response byte -- and deliberately not over the whole
   request: the prompt processing of a two-million-token prompt would

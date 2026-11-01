@@ -23,6 +23,10 @@ const HIDDEN_KEY_PREFIX = "ohr.chart.hidden.";
 const DEFAULT_VIEW = { window: "30d", start: "", end: "" };
 const FALLBACK_WINDOWS = ["24h", "7d", "30d", "all", "custom"];
 const SERIES_COUNT = 8;
+// The second encoding once the colours run out: solid, dashed, dotted,
+// dash-dotted (canvas dash arrays, in px).
+const LINE_DASHES = [[], [8, 4], [2, 3], [8, 3, 2, 3]];
+const STYLE_COUNT = SERIES_COUNT * LINE_DASHES.length;
 const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 // ---- formatting -------------------------------------------------------
@@ -157,6 +161,17 @@ function viewQuery(view) {
   return "?" + params.toString();
 }
 
+// "Today" is a page-side window: the server has no notion of the reader's
+// timezone, so it is asked for an open custom range from the local midnight,
+// recomputed on every poll so the window starts over at 00:00. Unlike the
+// rolling 24h it only grows during the day.
+function stateQuery(view) {
+  if (view.window !== "today") return viewQuery(view);
+  const midnight = new Date();
+  midnight.setHours(0, 0, 0, 0);
+  return viewQuery({ window: "custom", start: midnight.toISOString(), end: "" });
+}
+
 // The series a reader switched off in a chart legend, by series label, so
 // the choice survives the next poll (which hands the chart new datasets)
 // and a reload. One list per chart, keyed by its title.
@@ -241,19 +256,18 @@ const bucketLabel = (key, bucket) => {
 
 // The series of the throughput chart: one per model with data in the
 // window, in the order the store lists the models (first appearance over
-// the whole log).
+// the whole log). Every model is its own line -- none is ever folded away.
 //
-// Colour follows the model: the first eight models ever charted own their
-// slot for good, so they never repaint when the range changes. A model
-// seen later borrows a slot that no owner present in this window uses --
-// with a fleet of dozens of aliases a fixed "ninth means Other" rule would
-// hide every new model forever, even alone in its window. Only when the
-// window holds more models than there are free slots does the rest fold
-// into one "Other" series.
+// A line's style follows its model: the model's place in that list picks
+// it once and for good, so no line repaints when the range changes. The
+// first eight models are solid lines in the eight palette colours; the
+// next eight reuse the colours dashed, then dotted, then dash-dotted -- a
+// second encoding rather than generated hues, which would blur into each
+// other. Past 32 models the styles wrap round; the legend and the tooltip
+// still name every line.
 const tpsBuildSeries = (history) => {
   const tps = (history && history.tps) || {};
   const models = tps.models || [];
-  const byModel = tps.by_model || {};
   const rowsByModel = {};
   (tps.series || []).forEach((row) => {
     const points = rowsByModel[row.model] || (rowsByModel[row.model] = {});
@@ -262,83 +276,21 @@ const tpsBuildSeries = (history) => {
   const present = models.filter(
     (m) => rowsByModel[m] && Object.keys(rowsByModel[m]).length
   );
-  const slotOf = {};
-  const taken = {};
-  present.forEach((m) => {
-    const i = models.indexOf(m);
-    if (i < SERIES_COUNT) {
-      slotOf[m] = i;
-      taken[i] = true;
-    }
+  // A model with data but missing from the list (a store older than the
+  // list) still gets a line, after the listed ones.
+  Object.keys(rowsByModel).forEach((m) => {
+    if (!present.includes(m)) present.push(m);
   });
-  present.forEach((m) => {
-    if (slotOf[m] != null) return;
-    for (let s = 0; s < SERIES_COUNT; s++) {
-      if (!taken[s]) {
-        slotOf[m] = s;
-        taken[s] = true;
-        return;
-      }
-    }
-  });
-  const out = [];
-  let other = null;
-  present.forEach((model) => {
-    const points = rowsByModel[model];
-    const i = slotOf[model];
-    if (i == null) {
-      other = other || { model: "Other", slot: null, points: {}, total: null };
-      Object.keys(points).forEach((b) => {
-        const row = points[b];
-        const cur = other.points[b] ||
-          (other.points[b] = { output_tokens: 0, generation_ms: 0, requests: 0, tps: 0 });
-        cur.output_tokens += row.output_tokens;
-        cur.generation_ms += row.generation_ms;
-        cur.requests += row.requests;
-      });
-      const t = byModel[model];
-      if (t) {
-        other.total = other.total || {
-          output_tokens: 0,
-          generation_ms: 0,
-          requests: 0,
-          ttft_sum: 0,
-          tps: 0,
-          avg_ttft_ms: 0,
-        };
-        other.total.output_tokens += t.output_tokens;
-        other.total.generation_ms += t.generation_ms;
-        other.total.requests += t.requests;
-        other.total.ttft_sum += (t.avg_ttft_ms || 0) * (t.requests || 0);
-      }
-      return;
-    }
-    out.push({
+  return present.map((model) => {
+    const listed = models.indexOf(model);
+    const style = (listed >= 0 ? listed : models.length + present.indexOf(model)) % STYLE_COUNT;
+    return {
       model,
-      slot: i,
-      points,
-      total: byModel[model] || null,
-    });
-  });
-  if (other) {
-    Object.keys(other.points).forEach((b) => {
-      const p = other.points[b];
-      p.tps = p.generation_ms > 0 ? (p.output_tokens * 1000) / p.generation_ms : 0;
-    });
-    const t = other.total || {
-      output_tokens: 0,
-      generation_ms: 0,
-      requests: 0,
-      ttft_sum: 0,
-      tps: 0,
-      avg_ttft_ms: 0,
+      slot: style % SERIES_COUNT,
+      dash: LINE_DASHES[Math.floor(style / SERIES_COUNT)],
+      points: rowsByModel[model],
     };
-    t.tps = t.generation_ms > 0 ? (t.output_tokens * 1000) / t.generation_ms : 0;
-    t.avg_ttft_ms = t.requests > 0 ? t.ttft_sum / t.requests : 0;
-    other.total = t;
-    out.push(other);
-  }
-  return out;
+  });
 };
 
 // ---- colours ----------------------------------------------------------
@@ -500,10 +452,12 @@ function chartConfig(labels, datasets, colours) {
           display: true,
           position: "bottom",
           labels: {
-            // A solid swatch in the series colour beside every label, so the
-            // legend names the colours without a hover. The default swatch
+            // A short stroke of the series' own line beside every label --
+            // its colour and its dash -- so the legend tells the lines apart
+            // without a hover, the dashed ones included. The default swatch
             // reads the series' point style, and the points are radius 0.
             usePointStyle: true,
+            pointStyleWidth: 26,
             boxWidth: 10,
             boxHeight: 10,
             color: colours.text,
@@ -516,8 +470,9 @@ function chartConfig(labels, datasets, colours) {
                   text: dataset.label,
                   fillStyle: swatch,
                   strokeStyle: swatch,
-                  lineWidth: 0,
-                  pointStyle: "rectRounded",
+                  lineWidth: 4,
+                  lineDash: dataset.borderDash || [],
+                  pointStyle: "line",
                   fontColor: hidden ? colours.muted : colours.text,
                   hidden,
                   datasetIndex: index,
@@ -917,12 +872,25 @@ function renderProviderRow(row, props) {
 
 // ---- header -----------------------------------------------------------
 
-const WINDOW_LABELS = { "24h": "24h", "7d": "7d", "30d": "30d", all: "All", custom: "Custom" };
+const WINDOW_LABELS = {
+  today: "Today",
+  "24h": "24h",
+  "7d": "7d",
+  "30d": "30d",
+  all: "All",
+  custom: "Custom",
+};
 
-function windowLine(history) {
+// The named windows that slide with the clock: their oldest hours drop out
+// as time passes, so their totals can fall.
+const ROLLING_WINDOWS = ["24h", "7d", "30d"];
+
+function windowLine(history, selected) {
   if (!history || !history.window) return "storage off — the figures are since process start";
   const w = history.window;
   const parts = [];
+  if (selected === "today") parts.push("today since 00:00");
+  else if (ROLLING_WINDOWS.includes(w.label)) parts.push("rolling " + w.label);
   parts.push(
     (w.bucket === "hour" ? "hourly" : "daily") +
       " · " + fmtLocalDateTime(w.start) +
@@ -938,7 +906,8 @@ function windowLine(history) {
 
 function Header(props) {
   const { state, status, view, rangeError } = props;
-  const windows = (state && state.windows) || FALLBACK_WINDOWS;
+  const served = (state && state.windows) || FALLBACK_WINDOWS;
+  const windows = served.includes("today") ? served : ["today"].concat(served);
   const proxy = (state && state.proxy) || {};
   const live = status.kind === "live";
   const stale = status.kind === "stale";
@@ -1004,7 +973,7 @@ function Header(props) {
         ? html`<div class="window-line"><span class="range-error">${rangeError}</span></div>`
         : null}
       <div class="window-line">
-        ${windowLine(state ? state.history : null)}
+        ${windowLine(state ? state.history : null, view.window)}
         ${proxy.enabled
           ? html` · forward proxy ${proxy.host}:${proxy.port}`
           : html` · forward proxy off`}
@@ -1206,7 +1175,7 @@ function App() {
     let failures = 0;
     const run = async () => {
       try {
-        const response = await fetch(stateUrl + viewQuery(view), { cache: "no-store" });
+        const response = await fetch(stateUrl + stateQuery(view), { cache: "no-store" });
         if (!response.ok) {
           let detail = "HTTP " + response.status;
           try {
@@ -1284,7 +1253,12 @@ function App() {
   const history = (state && state.history) || null;
   const totals = (history && history.totals) || (state && state.totals) || {};
   const usage = totals.usage || {};
-  const windowLabel = history ? (history.window && history.window.label) || "window" : "since start";
+  // "Today" reaches the server as a custom range, so its label is the page's.
+  const windowLabel = !history
+    ? "since start"
+    : view.window === "today"
+    ? "today"
+    : (history.window && history.window.label) || "window";
   const requests = Number(totals.requests) || 0;
   const errors = Number(totals.errors) || 0;
   const active = (state && state.active) || [];
@@ -1334,12 +1308,12 @@ function App() {
     const series = tpsBuildSeries(history);
     if (series.length && buckets.length) {
       const datasets = series.map((item) => {
-        const colour = item.slot == null ? colours.muted : colours["series" + (item.slot + 1)];
+        const colour = colours["series" + (item.slot + 1)];
         const data = buckets.map((b) => {
           const point = item.points[b];
           return point ? Number(point.tps) || 0 : null;
         });
-        return lineDataset(item.model, data, colour, colours);
+        return lineDataset(item.model, data, colour, colours, { borderDash: item.dash });
       });
       tpsConfig = chartConfig(labels, datasets, colours);
       tpsKey = JSON.stringify([history.tps || {}, buckets]);
