@@ -62,13 +62,22 @@ def collect_model_options(
     Rows follow rule order, which is also resolution order, and carry the
     EFFECTIVE window and output cap of their own rule.
 
+    A native passthrough provider (``forward_client_auth: true``) serves
+    model ids the client already knows, so its rules contribute no rows.
+    A passthrough provider with its own key (``forward_client_auth:
+    false``) serves a third-party vendor whose ids the client does not
+    know: such a rule is listed like an ``openai-translate`` one, but the
+    window and the output cap belong to the upstream, so the row says so
+    instead of naming numbers this side does not know.
+
     Args:
         config: the validated routing configuration.
 
     Returns:
-        A triple of (options, passthrough_count, skipped): the picker rows,
-        the number of rules served by a passthrough provider, and the match
-        descriptions of pattern rules skipped for naming no ids.
+        A triple of (options, native_passthrough_count, skipped): the picker
+        rows, the number of rules served by a NATIVE passthrough provider
+        (the client already lists those ids), and the match descriptions of
+        pattern rules skipped for naming no ids.
 
     Raises:
         ConfigError: every rule that could have contributed rows was
@@ -77,11 +86,11 @@ def collect_model_options(
     """
     options: list[dict[str, str]] = []
     skipped: list[str] = []
-    passthrough_count = 0
+    native_passthrough_count = 0
     for rule in config.rules:
         provider = config.providers[rule.provider]
-        if provider.type != "openai-translate":
-            passthrough_count += 1
+        if provider.type == "passthrough" and provider.forward_client_auth:
+            native_passthrough_count += 1
             continue
         model_ids = advertised_model_ids(rule)
         if not model_ids:
@@ -95,17 +104,25 @@ def collect_model_options(
                 file=sys.stderr,
             )
             continue
-        limits = RouteLimits.resolve(provider, rule)
-        if limits.context_window is None:
-            raise ConfigError(
-                f"provider '{rule.provider}' serves {model_ids} without a "
-                "context_window; the picker disables client-side compaction, "
-                "so set it on the rule or the provider"
+        if provider.type == "passthrough":
+            # The schema forbids context_window and max_tokens_limit on a
+            # passthrough rule: the upstream sets both, so this side cannot
+            # name them.
+            description = (
+                f"{rule.provider} -- passthrough, window and output set by the upstream"
             )
-        description = (
-            f"{rule.provider} -- window {limits.context_window}, "
-            f"max output {limits.max_tokens_limit}"
-        )
+        else:
+            limits = RouteLimits.resolve(provider, rule)
+            if limits.context_window is None:
+                raise ConfigError(
+                    f"provider '{rule.provider}' serves {model_ids} without a "
+                    "context_window; the picker disables client-side compaction, "
+                    "so set it on the rule or the provider"
+                )
+            description = (
+                f"{rule.provider} -- window {limits.context_window}, "
+                f"max output {limits.max_tokens_limit}"
+            )
         options.extend(
             {"model": model, "label": model, "description": description}
             for model in model_ids
@@ -116,7 +133,7 @@ def collect_model_options(
             "Add 'client_models' with the exact ids clients may send for at "
             "least one of them"
         )
-    return options, passthrough_count, skipped
+    return options, native_passthrough_count, skipped
 
 
 def read_settings(path: Path) -> tuple[str, dict[str, Any]]:
@@ -290,15 +307,16 @@ def main(argv: list[str] | None = None) -> int:
     settings_path: Path = args.settings_path
     try:
         config = load_routing_config(Settings().routing.config_path)
-        options, passthrough_count, skipped = collect_model_options(config)
+        options, native_passthrough_count, _skipped = collect_model_options(config)
         current, existing = read_settings(settings_path)
         wanted = render_settings(build_settings_document(existing, options))
+        # An empty picker means every rule was a native passthrough rule: a
+        # rule that named no id either went to ``skipped`` (and a skipped rule
+        # with nothing else to offer is a config error raised above) or was
+        # offered. So the count below is the whole story.
         cause = (
-            f"{passthrough_count} rules serve a passthrough provider and "
-            f"{len(skipped)} pattern rules were skipped for naming no 'client_models'"
-            if skipped
-            else "every rule serves a passthrough provider whose native model "
-            "ids the client already lists"
+            f"{native_passthrough_count} rule(s) serve a native passthrough provider "
+            "whose model ids the client already lists"
         )
         zero_model = "" if options else f" -- {cause}; there is nothing to add to the picker"
 

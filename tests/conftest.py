@@ -109,6 +109,14 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ROUTER_LOG_CONF_PATH", str(PROJECT_ROOT / "logging_conf.json"))
     monkeypatch.setenv("OPENAI_COMPATIBLE_KEY", "test-openai-compatible-key")
     monkeypatch.setenv("OPENAI_API_KEY", "test-openai-key")
+    # Storage is on by default; a test running the lifespan would otherwise
+    # create ./state/monitor.db in the checkout. Point it at a per-test
+    # directory instead -- set through the environment, so tests asserting
+    # the settings defaults are unaffected.
+    monkeypatch.setenv(
+        "ROUTER_STORAGE_DB_PATH",
+        str(PROJECT_ROOT / ".pytest_state" / "monitor.db"),
+    )
 
 
 @pytest_asyncio.fixture

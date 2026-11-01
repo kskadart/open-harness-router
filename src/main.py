@@ -7,9 +7,10 @@ import side effects.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections.abc import AsyncIterator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
@@ -20,8 +21,15 @@ from errors import ConfigError, install_exception_handlers
 from log import get_logger, setup_logging
 from routing.config_loader import load_routing_config
 from routing.registry import ProviderRegistry
+from services.monitor import Monitor
+from services.request_store import RequestStore
 from settings import Settings
 from version import project_version
+
+# How long between two passes of the retention prune. The log is pruned once
+# at startup and then daily; a day is the natural period for a cutoff
+# measured in days, and a late pass only means a few hours of surplus rows.
+_PRUNE_INTERVAL_S = 24 * 60 * 60
 
 
 def build_runtime() -> tuple[Settings, ProviderRegistry]:
@@ -59,6 +67,22 @@ def build_runtime() -> tuple[Settings, ProviderRegistry]:
         sys.exit(f"open-harness-router: {exc}")
 
     return settings, registry
+
+
+async def _prune_daily(store: RequestStore, retention_days: int) -> None:
+    """Prune the request log every ``_PRUNE_INTERVAL_S``, quietly.
+
+    A failure is already swallowed inside :meth:`RequestStore.prune`; the
+    loop keeps going so a transient error (a locked database) does not stop
+    retention for good.
+
+    Args:
+        store: the request log to prune.
+        retention_days: how many days of rows to keep.
+    """
+    while True:
+        await asyncio.sleep(_PRUNE_INTERVAL_S)
+        await store.prune(retention_days=retention_days)
 
 
 def create_app(
@@ -106,6 +130,29 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.settings = settings
         app.state.registry = registry
+        # Heartbeat for the persistent request log's daily retention prune:
+        # start it in the lifespan, cancel and await it on shutdown, so no
+        # task outlives the application.
+        prune_task: asyncio.Task[None] | None = None
+        store: RequestStore | None = None
+        if settings.storage.enabled:
+            # The lifespan builds the store itself, so it owns its lifetime
+            # in both run modes: the bare uvicorn factory and the combined
+            # entrypoint (which passes settings and registry but no store).
+            # Nothing else hands a store in, so there is no double-close.
+            store = RequestStore(
+                db_path=settings.storage.db_path,
+                retention_days=settings.storage.retention_days,
+                window_days=settings.storage.window_days,
+            )
+            Monitor.current().attach_store(store)
+            app.state.request_store = store
+            # One prune at startup covers the rows that accumulated while
+            # the process was down; the daily task then keeps the cut fresh.
+            await store.prune(retention_days=settings.storage.retention_days)
+            prune_task = asyncio.create_task(
+                _prune_daily(store, settings.storage.retention_days)
+            )
         if owns_registry and settings.proxy.enabled:
             # Without the combined entrypoint (entrypoint.run) there is no
             # one to start the forward-proxy -- the uvicorn factory only
@@ -130,6 +177,13 @@ def create_app(
         try:
             yield
         finally:
+            if prune_task is not None:
+                prune_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await prune_task
+            if store is not None:
+                Monitor.current().attach_store(None)
+                await store.aclose()
             if owns_registry:
                 await registry.close_all()
             logger.info("shutdown")

@@ -1,6 +1,7 @@
 """Passthrough provider: byte-for-byte reverse proxy to an Anthropic-compatible upstream.
 
-The request body is proxied unchanged; how the auth headers are handled
+The request body is proxied unchanged (the one exception is
+``cfg.fold_tool_additions``, see ``_fold_body``); how the auth headers are handled
 depends on ``cfg.forward_client_auth``: forwarded as-is for native Anthropic
 (billed on the client's subscription), or replaced with the provider's own
 key for a third-party upstream, under an allowlist rather than the client's
@@ -36,6 +37,7 @@ from services.header_utils import (
 )
 from services.http_transport import build_upstream_transport, build_upstream_verify
 from services.retry import retry_connect
+from services.tool_visibility import fold_tool_additions
 from settings import UpstreamSettings
 
 logger = get_logger(__name__)
@@ -276,6 +278,36 @@ class PassthroughProvider:
             )
         return merge_extra_headers(fwd, self.cfg.extra_headers)
 
+    def _fold_body(self, raw_body: bytes) -> bytes:
+        """Resolve ``tool_addition`` blocks for an upstream that rejects them.
+
+        The only place passthrough rewrites a body, and only when
+        ``cfg.fold_tool_additions`` is set (own-key providers, enforced by
+        the schema): a body with nothing to fold, or one that is not a JSON
+        object, goes out as the original bytes.
+
+        Args:
+            raw_body: the request body as received.
+
+        Returns:
+            The rewritten body, or ``raw_body`` itself.
+        """
+        if not self.cfg.fold_tool_additions:
+            return raw_body
+        folded = fold_tool_additions(raw_body)
+        if folded is None:
+            return raw_body
+        logger.info(
+            "tool_additions_folded",
+            provider=self.name,
+            blocks_removed=folded.blocks_removed,
+            tools_added=folded.tools_added,
+            tools_hidden=folded.tools_hidden,
+            invalid_count=len(folded.invalid),
+            unresolved_count=len(folded.unresolved),
+        )
+        return folded.body
+
     async def _proxy(
         self,
         path: str,
@@ -285,6 +317,7 @@ class PassthroughProvider:
     ) -> ProviderResult:
         """Proxy a request to the upstream (streaming or regular)."""
         fwd = self._build_headers(client_headers)
+        raw_body = self._fold_body(raw_body)
         if self._is_stream(raw_body):
             return await self._proxy_stream(path, raw_body, fwd, client_channel)
         return await self._proxy_unary(path, raw_body, fwd)
@@ -419,7 +452,7 @@ class PassthroughProvider:
         *,
         query: str = "",
     ) -> ProviderResult:
-        """Proxy /v1/messages; upstream_model and limits do not apply (verbatim body)."""
+        """Proxy /v1/messages; upstream_model and limits do not apply (body goes as received)."""
         return await self._proxy(
             _with_query(_MESSAGES_PATH, query), raw_body, client_headers, client_channel
         )
@@ -435,7 +468,9 @@ class PassthroughProvider:
     ) -> ProviderResult:
         """Proxy ``/v1/messages/count_tokens`` to the upstream's own endpoint."""
         fwd = self._build_headers(client_headers)
-        return await self._proxy_unary(_with_query(_COUNT_TOKENS_PATH, query), raw_body, fwd)
+        return await self._proxy_unary(
+            _with_query(_COUNT_TOKENS_PATH, query), self._fold_body(raw_body), fwd
+        )
 
     async def aclose(self) -> None:
         """Close the httpx client."""

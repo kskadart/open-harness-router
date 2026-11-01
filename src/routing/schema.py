@@ -64,6 +64,27 @@ class PricingCfg(BaseModel):
     cache_write: float | None = Field(default=None, ge=0)
     cache_read: float | None = Field(default=None, ge=0)
 
+    def rates(self) -> dict[str, float]:
+        """Return the effective per-million prices, with cache fallbacks applied.
+
+        ``cost_usd`` charges an unset cache rate at the ``input`` price --
+        an upper bound, since only a vendor that discounts the cache would
+        set the rate below it. The dashboard shows the same numbers the
+        cost column is billed at, so the fallback is resolved here once
+        instead of at every call site.
+
+        Returns:
+            The four effective rates in USD per million tokens, keyed
+            ``input``, ``output``, ``cache_write`` and ``cache_read``; the
+            cache rates equal ``input`` when left unset.
+        """
+        return {
+            "input": self.input,
+            "output": self.output,
+            "cache_write": self.input if self.cache_write is None else self.cache_write,
+            "cache_read": self.input if self.cache_read is None else self.cache_read,
+        }
+
     def cost_usd(
         self,
         *,
@@ -83,13 +104,12 @@ class PricingCfg(BaseModel):
         Returns:
             The cost in USD.
         """
-        cache_write = self.input if self.cache_write is None else self.cache_write
-        cache_read = self.input if self.cache_read is None else self.cache_read
+        rates = self.rates()
         return (
-            input_tokens * self.input
-            + output_tokens * self.output
-            + cache_write_tokens * cache_write
-            + cache_read_tokens * cache_read
+            input_tokens * rates["input"]
+            + output_tokens * rates["output"]
+            + cache_write_tokens * rates["cache_write"]
+            + cache_read_tokens * rates["cache_read"]
         ) / 1_000_000
 
 
@@ -282,6 +302,18 @@ class ProviderCfg(BaseModel):
     ``openai-translate``) is a startup error, same reasoning as
     ``forward_client_auth`` above.
 
+    ``fold_tool_additions`` -- resolve Claude's deferred-tool visibility in
+    the router instead of forwarding ``tool_addition`` blocks. Claude Code
+    (beta ``mid-conversation-tool-changes-2026-07-01``) puts them into the
+    conversation from the second turn of an agent loop, and an upstream that
+    does not know the block type answers 400 (Kimi: "Invalid request
+    Error"). When set, passthrough removes the blocks and sends the tools
+    the model could see (``services.tool_visibility``) -- the one deliberate
+    exception to byte-for-byte forwarding. Only valid on passthrough with
+    ``forward_client_auth=false``: a native Anthropic upstream must never be
+    rewritten, and ``openai-translate`` always applies the rule. Defaults to
+    ``false``.
+
     ``tls_verify_hostname`` -- when false, the outbound TLS connection
     skips only the hostname match against the leaf certificate; the
     certificate chain is still FULLY verified against ``ca_bundle`` (or the
@@ -323,6 +355,7 @@ class ProviderCfg(BaseModel):
     extra_headers: dict[str, str] = Field(default_factory=dict)
     forward_client_auth: bool = True
     auth_header: AuthHeaderStyle = "bearer"
+    fold_tool_additions: bool = False
     token_param: TokenParam = "max_tokens"
     drop_params: list[str] = Field(default_factory=list)
     max_tokens_limit: int | None = None
@@ -477,6 +510,38 @@ class ProviderCfg(BaseModel):
                 "forwarded; an own key here would be silently ignored); if "
                 "you meant to configure an own-key third-party upstream "
                 "instead, set forward_client_auth=false"
+            )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_fold_tool_additions_usage(self) -> ProviderCfg:
+        """Reject ``fold_tool_additions`` outside an own-key passthrough provider.
+
+        The rewrite is a deliberate exception to byte-for-byte forwarding,
+        so a native Anthropic passthrough (``forward_client_auth=true``)
+        must never get it, and ``openai-translate`` converts the request
+        anyway and always applies the visibility rule.
+
+        Returns:
+            The validated configuration.
+
+        Raises:
+            ValueError: ``fold_tool_additions`` is set on a non-passthrough
+                provider, or on passthrough with ``forward_client_auth=true``.
+        """
+        if not self.fold_tool_additions:
+            return self
+        if self.type != "passthrough":
+            raise ValueError(
+                "fold_tool_additions only applies to passthrough providers; "
+                f"remove it (type='{self.type}' already resolves deferred "
+                "tools while translating)"
+            )
+        if self.forward_client_auth:
+            raise ValueError(
+                "fold_tool_additions is only valid on passthrough with "
+                "forward_client_auth=false: a native Anthropic upstream is "
+                "forwarded byte-for-byte and must never be rewritten"
             )
         return self
 

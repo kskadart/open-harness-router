@@ -64,6 +64,12 @@ rules:
   - match: {type: contains, value: "GLM"}
     provider: openai_compatible
     upstream_model: zai-org/GLM-5.2-FP8
+    # Rule-level prices for the dashboard: cache_write is left unset, so it
+    # falls back to the input price (PricingCfg.rates).
+    pricing:
+      input: 0.5
+      output: 2
+      cache_read: 0.05
   - match: {type: prefix, value: "gpt-"}
     provider: openai
   - match: {type: prefix, value: "chat-"}

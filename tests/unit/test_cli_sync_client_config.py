@@ -107,6 +107,43 @@ _PASSTHROUGH_ROUTING: dict[str, Any] = {
     "default": {"provider": "anthropic"},
 }
 
+# A routing file with a passthrough provider that carries its own key
+# (``forward_client_auth: false``): a third-party vendor whose model ids
+# the client does not know, so its rules belong in the picker next to the
+# openai-translate ones. The native rules beside them stay out of it --
+# including the EXACT one, which names a concrete ``claude-`` id: that id
+# is what the client already lists, so the native rule must contribute no
+# row at all (a prefix rule would contribute no row on its own, and would
+# not tell a regression apart).
+_OWN_KEY_ROUTING: dict[str, Any] = {
+    "version": 1,
+    "providers": {
+        "anthropic": {
+            "type": "passthrough",
+            "base_url": "https://api.anthropic.com",
+        },
+        "minimax": {
+            "type": "passthrough",
+            "base_url": "https://api.minimax.io/anthropic",
+            "forward_client_auth": False,
+            "api_key_env": "MINIMAX_API_KEY",
+            "auth_header": "bearer",
+        },
+    },
+    "rules": [
+        {
+            "match": {"type": "exact", "value": "claude-opus-4-1"},
+            "provider": "anthropic",
+        },
+        {"match": {"type": "prefix", "value": "claude-"}, "provider": "anthropic"},
+        {
+            "match": {"type": "exact", "value": "MiniMax-M3.1-Flash"},
+            "provider": "minimax",
+        },
+    ],
+    "default": {"provider": "anthropic"},
+}
+
 _EXPECTED_OPTIONS: list[dict[str, str]] = [
     {
         "model": "vendor/GLM-Test",
@@ -131,8 +168,11 @@ _EXPECTED_OPTIONS: list[dict[str, str]] = [
 ]
 
 
+# The zero-model run explains itself with the number of native passthrough
+# rules -- the only kind that can leave the picker empty without being
+# skipped (a skipped rule with nothing else to offer is a config error).
 _PASSTHROUGH_ONLY_CAUSE = (
-    "every rule serves a passthrough provider whose native model ids "
+    "{count} rule(s) serve a native passthrough provider whose model ids "
     "the client already lists"
 )
 
@@ -144,6 +184,45 @@ def _clone_routing() -> dict[str, Any]:
         A fresh mapping equal to ``_FLEET_ROUTING``.
     """
     return yaml.safe_load(yaml.safe_dump(_FLEET_ROUTING))
+
+
+def _clone_own_key_routing() -> dict[str, Any]:
+    """Deep copy of the own-key passthrough routing fixture.
+
+    Returns:
+        A fresh mapping equal to ``_OWN_KEY_ROUTING``.
+    """
+    return yaml.safe_load(yaml.safe_dump(_OWN_KEY_ROUTING))
+
+
+def _own_key_pattern_routing() -> dict[str, Any]:
+    """Routing whose own-key passthrough rule matches by prefix, not exactly.
+
+    One openai-translate rule comes along so the picker is never empty:
+    a run that offers nothing at all is a configuration error, and the
+    pattern rule's own skipping must be the only thing under test.
+
+    Returns:
+        A fresh mapping ready to be written and loaded.
+    """
+    raw = _clone_own_key_routing()
+    raw["providers"]["fleet_exact"] = {
+        "type": "openai-translate",
+        "base_url": "https://gateway.example.com/v1",
+        "api_key_env": "FLEET_CHAT_KEY",
+        "max_tokens_limit": 32000,
+        "context_window": 223680,
+    }
+    for rule in raw["rules"]:
+        if rule["provider"] == "minimax":
+            rule["match"] = {"type": "prefix", "value": "MiniMax-"}
+    raw["rules"].append(
+        {
+            "match": {"type": "exact", "value": "fleet-minimax"},
+            "provider": "fleet_exact",
+        }
+    )
+    return raw
 
 
 def _clone_passthrough_routing() -> dict[str, Any]:
@@ -214,6 +293,171 @@ def test_collect_model_options_skips_rules_serving_a_passthrough_provider(
     options = collect_model_options(load_routing_config(fleet_routing))[0]
 
     assert all(not option["model"].startswith("claude-") for option in options)
+
+
+def test_collect_model_options_lists_a_rule_on_an_own_key_passthrough_provider(
+    write_routing: Callable[[dict[str, Any]], Path],
+) -> None:
+    """A vendor behind an own-key passthrough is listed like any other model.
+
+    The provider injects its own key instead of the client's, so the
+    client cannot know the vendor's model ids on its own -- the picker
+    must name them. The window and the output cap are the upstream's,
+    so the row says that instead of inventing numbers.
+    """
+    routing_path = write_routing(_clone_own_key_routing())
+
+    options, native_passthrough_count, skipped = collect_model_options(
+        load_routing_config(routing_path)
+    )
+
+    assert options == [
+        {
+            "model": "MiniMax-M3.1-Flash",
+            "label": "MiniMax-M3.1-Flash",
+            "description": (
+                "minimax -- passthrough, window and output set by the upstream"
+            ),
+        }
+    ]
+    assert native_passthrough_count == 2
+    assert skipped == []
+
+
+def test_collect_model_options_skips_a_native_passthrough_rule(
+    write_routing: Callable[[dict[str, Any]], Path],
+) -> None:
+    """A native passthrough provider still contributes no row and no warning.
+
+    Its model ids are the client's own Anthropic ones, which the client
+    already lists; the rules are counted as native passthrough rules. The
+    fixture's EXACT native rule names a concrete ``claude-`` id, so a
+    regression that let native rules into the picker would show up here
+    as a row -- a prefix rule would have stayed silent either way.
+    """
+    routing_path = write_routing(_clone_own_key_routing())
+
+    options, native_passthrough_count, skipped = collect_model_options(
+        load_routing_config(routing_path)
+    )
+
+    assert options == [
+        {
+            "model": "MiniMax-M3.1-Flash",
+            "label": "MiniMax-M3.1-Flash",
+            "description": (
+                "minimax -- passthrough, window and output set by the upstream"
+            ),
+        }
+    ]
+    assert native_passthrough_count == 2
+    assert skipped == []
+
+
+def test_collect_model_options_skips_an_own_key_pattern_rule_without_client_models(
+    write_routing: Callable[[dict[str, Any]], Path],
+) -> None:
+    """A pattern rule on an own-key provider names no ids, so it lists nothing."""
+    routing_path = write_routing(_own_key_pattern_routing())
+
+    options, native_passthrough_count, skipped = collect_model_options(
+        load_routing_config(routing_path)
+    )
+
+    assert [option["model"] for option in options] == ["fleet-minimax"]
+    assert skipped == ["prefix 'MiniMax-'"]
+    assert native_passthrough_count == 2
+
+
+def test_collect_model_options_lists_an_own_key_pattern_rule_with_client_models(
+    write_routing: Callable[[dict[str, Any]], Path],
+) -> None:
+    """With ``client_models`` the same pattern rule names ids the picker can offer."""
+    raw = _own_key_pattern_routing()
+    for rule in raw["rules"]:
+        if rule["provider"] == "minimax":
+            rule["client_models"] = ["MiniMax-M3"]
+    routing_path = write_routing(raw)
+
+    options, native_passthrough_count, skipped = collect_model_options(
+        load_routing_config(routing_path)
+    )
+
+    assert options[0] == {
+        "model": "MiniMax-M3",
+        "label": "MiniMax-M3",
+        "description": "minimax -- passthrough, window and output set by the upstream",
+    }
+    assert options[1]["model"] == "fleet-minimax"
+    assert skipped == []
+    assert native_passthrough_count == 2
+
+
+def test_main_own_key_pattern_rule_without_client_models_is_skipped_with_a_warning(
+    write_routing: Callable[[dict[str, Any]], Path],
+    settings_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The skipped own-key pattern rule costs its own row, not the whole run."""
+    write_routing(_own_key_pattern_routing())
+
+    exit_code = main(["--settings-path", str(settings_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_OK
+    assert "prefix 'MiniMax-'" in captured.err
+    assert "client_models" in captured.err
+    document = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert [option["model"] for option in document["modelPicker"]["options"]] == [
+        "fleet-minimax"
+    ]
+
+
+def test_main_a_native_passthrough_only_routing_lists_no_model(
+    write_routing: Callable[[dict[str, Any]], Path],
+    settings_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Only native passthrough rules: nothing to add, and the run says why."""
+    write_routing(_clone_passthrough_routing())
+
+    exit_code = main(["--settings-path", str(settings_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_OK
+    assert "0 models" in captured.out
+    assert _PASSTHROUGH_ONLY_CAUSE.format(count=1) in captured.out
+    document = json.loads(settings_path.read_text(encoding="utf-8"))
+    assert document["modelPicker"]["options"] == []
+
+
+def test_main_an_own_key_pattern_rule_alone_fails_the_run(
+    write_routing: Callable[[dict[str, Any]], Path],
+    settings_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """An own-key provider whose only rule names no id leaves nothing to list.
+
+    Before own-key passthrough rules were listed, such a rule was skipped
+    silently and the run wrote an empty picker. Now it is a pattern rule
+    like any other: the picker would be empty, and an empty picker is a
+    configuration error -- the operator has to name the ids in
+    ``client_models``.
+    """
+    raw = _clone_own_key_routing()
+    raw["rules"] = [
+        rule for rule in raw["rules"] if rule["provider"] == "minimax"
+    ]
+    raw["rules"][0]["match"] = {"type": "prefix", "value": "MiniMax-"}
+    write_routing(raw)
+
+    exit_code = main(["--settings-path", str(settings_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == EXIT_CONFIG_ERROR
+    assert "no model can be listed" in captured.err
+    assert "prefix 'MiniMax-'" in captured.err
+    assert not settings_path.exists()
 
 
 def test_every_emitted_model_routes_back_to_the_rule_that_emitted_it(
@@ -532,7 +776,9 @@ def test_main_explains_a_zero_model_run_next_to_the_figure(
     captured = capsys.readouterr()
     assert exit_code == EXIT_OK
     assert ("0 models" in captured.out) is explained
-    assert (_PASSTHROUGH_ONLY_CAUSE in captured.out) is explained
+    assert (
+        _PASSTHROUGH_ONLY_CAUSE.format(count=1) in captured.out
+    ) is explained
 
 
 def test_default_settings_path_is_a_dedicated_file_in_the_user_claude_directory() -> None:

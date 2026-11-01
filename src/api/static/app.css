@@ -1,0 +1,351 @@
+/* The dashboard of open-harness-router.
+ *
+ * Colour tokens live on :root and are redefined for the dark scheme; the
+ * charts read the very same custom properties at build time, so the plots
+ * and the page never drift apart.
+ */
+
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #f0f2f5;
+  --line: #e1e4e8;
+  --fg: #1f2328;
+  --muted: #6a737d;
+  --ok: #1a7f37;
+  --warn: #9a6700;
+  --err: #cf222e;
+  --accent: #0969da;
+  --accent-soft: #ddeaff;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  /* The series colours of the throughput chart, in a fixed order: a
+     model's slot follows the model, never its rank in the window, so the
+     colour does not move when the range changes. */
+  --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+  --series-5: #e87ba4; --series-6: #008300; --series-7: #6250d6; --series-8: #e34948;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0d1117; --panel: #161b22; --panel-2: #1c2129; --line: #30363d;
+    --fg: #e6edf3; --muted: #8b949e;
+    --ok: #3fb950; --warn: #d29922; --err: #f85149; --accent: #58a6ff;
+    --accent-soft: #16304f;
+    --series-1: #3987e5; --series-2: #d95926; --series-3: #199e70; --series-4: #c98500;
+    --series-5: #d55181; --series-6: #008300; --series-7: #9085e9; --series-8: #e66767;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 14px/1.45 var(--font);
+  /* The page never scrolls sideways: a wide table scrolls inside its card. */
+  overflow-x: hidden;
+}
+
+h1, h2 { margin: 0; }
+
+/* ---- header ---------------------------------------------------------- */
+
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+  padding: 10px 16px;
+}
+
+.topbar-inner {
+  max-width: 1440px;
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  align-items: center;
+}
+
+.brand {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  align-items: baseline;
+}
+
+.brand .title { font-size: 16px; font-weight: 650; letter-spacing: -0.01em; }
+.brand .fact { color: var(--muted); font-size: 12px; }
+.brand .fact b { color: var(--fg); font-weight: 600; }
+
+.live {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+
+.dot.ok { background: var(--ok); }
+.dot.warn { background: var(--warn); }
+.live.live-stale { color: var(--warn); }
+
+.segmented {
+  display: inline-flex;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--panel);
+}
+
+.segmented button {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 12px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.segmented button:last-child { border-right: 0; }
+.segmented button:hover { color: var(--fg); }
+.segmented button[aria-pressed="true"] {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.custom-range {
+  max-width: 1440px;
+  margin: 0 auto;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 12px;
+  padding-top: 8px;
+}
+
+.custom-range input[type="date"] {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+}
+
+.btn {
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 12px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+
+.window-line {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding-top: 6px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.range-error { color: var(--err); }
+
+/* ---- layout ---------------------------------------------------------- */
+
+/* Every grid track is minmax(0, 1fr), never a bare 1fr or the implicit auto:
+   a track's minimum is otherwise its content's width, so a nowrap table or a
+   Chart.js canvas widens the column past the viewport and the page is cut
+   off on the right instead of the table scrolling inside its card. */
+.wrap {
+  max-width: 1440px;
+  margin: 0 auto;
+  padding: 16px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+}
+
+.wrap > *, .card, .tile { min-width: 0; }
+
+.tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 12px;
+}
+
+.tile {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+
+.tile .label { color: var(--muted); font-size: 12px; }
+.tile .value {
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+.tile .sub { color: var(--muted); font-size: 12px; }
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 16px;
+}
+
+.card-head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  align-items: baseline;
+  margin-bottom: 12px;
+}
+
+.card h2 {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+
+.charts { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+.two { display: grid; gap: 16px; grid-template-columns: minmax(0, 1fr); }
+
+@media (min-width: 1100px) {
+  .charts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (min-width: 900px) {
+  .two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+/* The chart is the plot: the canvas takes the room the card gives it. */
+.chart-box { position: relative; height: 260px; }
+
+/* ---- tables ---------------------------------------------------------- */
+
+.scroll { overflow-x: auto; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+
+th, td {
+  text-align: left;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+tr:last-child td { border-bottom: 0; }
+td.num, th.num { text-align: right; }
+
+.mono { font-family: var(--mono); font-size: 12px; }
+.muted { color: var(--muted); }
+.ok { color: var(--ok); }
+.warn { color: var(--warn); }
+.err { color: var(--err); }
+
+.pill {
+  display: inline-block;
+  padding: 0 6px;
+  border-radius: 10px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.empty { padding: 24px 4px; color: var(--muted); }
+
+/* The provider rows of the one providers table: a bold parent row with the
+   model rows indented under it. */
+tr.provider-row td { font-weight: 600; }
+tr.model-row td:first-child { padding-left: 28px; font-weight: 400; }
+
+.provider-btn {
+  font: inherit;
+  font-weight: 600;
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-align: left;
+}
+
+.provider-btn .caret { color: var(--muted); font-size: 10px; width: 10px; }
+
+/* ---- routing --------------------------------------------------------- */
+
+details.routing > summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+  list-style: revert;
+}
+
+details.routing[open] > summary { margin-bottom: 12px; }
+.proxy-line { font-size: 12px; color: var(--muted); margin: 12px 0 0; }
+.proxy-line b { color: var(--fg); font-weight: 600; }
+
+@media (max-width: 720px) {
+  .wrap { padding: 12px; gap: 16px; }
+  .card { padding: 12px; }
+  .live { margin-left: 0; }
+  .brand .title { font-size: 15px; }
+}
+
+/* The live feeds (in flight, events) keep a fixed height and scroll inside
+   their card with the header row pinned, instead of growing the page by
+   several screens. */
+.feed {
+  max-height: 360px;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.feed thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  background: var(--panel);
+}

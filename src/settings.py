@@ -11,8 +11,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from pydantic import Field, SecretStr, field_validator
+from pydantic import Field, SecretStr, ValidationInfo, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from const import STORAGE_RETENTION_DAYS, STORAGE_WINDOW_DAYS
 
 _HOST_LIST_SEPARATOR = ","
 
@@ -236,6 +238,87 @@ class ProxySettings(BaseSettings):
         return _split_hosts(self.no_proxy_hosts)
 
 
+class StorageSettings(BaseSettings):
+    """Persistence of the dashboard's request log (SQLite).
+
+    The monitor's counters live in the router process and reset on restart;
+    this setting turns on a request log that survives restarts and answers
+    the same counters over a rolling window (:mod:`services.request_store`).
+
+    Retention is a full year by default, because that is cheap at real
+    volumes and because a year answers "how did this month compare". A row
+    -- sixteen values plus the row header and the timestamp index entry --
+    measures 165 bytes (probe: 200,000 rows -> 31.5 MiB, ``page_size`` 4096),
+    so per year: ~3,000 requests/day is ~172 MiB (~14 MiB/month), a light
+    ~300/day is ~17 MiB, heavy ~10,000/day is ~574 MiB. At those numbers
+    aging rows out is the right mechanism; sampling requests away would bias
+    the series the dashboard shows.
+
+    Attributes:
+        enabled: whether to record the request log at all. Disabled leaves
+            the monitor working exactly as before, in memory only.
+        db_path: path to the SQLite file; its parent directory is created
+            on first use.
+        retention_days: how many days of rows to keep; older rows are
+            pruned at startup and once a day.
+        window_days: the dashboard's rolling window; must not exceed
+            ``retention_days`` -- a window wider than what is kept would
+            silently read an incomplete window as if it were whole.
+    """
+
+    model_config = SettingsConfigDict(
+        env_prefix="ROUTER_STORAGE_", env_file=".env", extra="ignore"
+    )
+
+    enabled: bool = True
+    db_path: Path = Path("./state/monitor.db")
+    retention_days: int = STORAGE_RETENTION_DAYS
+    window_days: int = STORAGE_WINDOW_DAYS
+
+    @field_validator("retention_days", "window_days")
+    @classmethod
+    def _at_least_one(cls, value: int) -> int:
+        """Reject a non-positive window or retention.
+
+        Args:
+            value: the days value from the environment.
+
+        Returns:
+            The value unchanged when it is at least one day.
+
+        Raises:
+            ValueError: when the value is below one.
+        """
+        if value < 1:
+            raise ValueError("must be at least 1 day")
+        return value
+
+    @field_validator("window_days")
+    @classmethod
+    def _window_within_retention(cls, value: int, info: ValidationInfo) -> int:
+        """Reject a window wider than what is kept.
+
+        A window wider than ``retention_days`` would query days that were
+        already pruned and show the shortened result as a full window, so
+        the mistake is refused here rather than papered over at read time.
+
+        Args:
+            value: the parsed ``window_days``.
+            info: validation context carrying the already-parsed
+                ``retention_days``.
+
+        Returns:
+            The value unchanged when it fits within retention.
+
+        Raises:
+            ValueError: when the window exceeds the retention.
+        """
+        retention = info.data.get("retention_days")
+        if isinstance(retention, int) and value > retention:
+            raise ValueError(f"window_days ({value}) must not exceed retention_days ({retention})")
+        return value
+
+
 class LoggingSettings(BaseSettings):
     """Logging settings."""
 
@@ -281,5 +364,6 @@ class Settings(BaseSettings):
     routing: RoutingSettings = Field(default_factory=RoutingSettings)  # type: ignore[arg-type]
     proxy: ProxySettings = Field(default_factory=ProxySettings)
     upstream: UpstreamSettings = Field(default_factory=UpstreamSettings)
+    storage: StorageSettings = Field(default_factory=StorageSettings)
     logging: LoggingSettings = Field(default_factory=LoggingSettings)
     secrets: SecretsResolver = Field(default_factory=SecretsResolver)

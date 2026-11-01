@@ -144,6 +144,25 @@ MONITOR_EVENT_BUFFER: int = 500
 MONITOR_EVENT_TEXT_LIMIT: int = 300
 MONITOR_SSE_LINE_LIMIT: int = 1 << 20
 
+# Defaults of the persistent request log (``services.request_store``, set by
+# ``settings.StorageSettings``): how long rows are kept and how wide the
+# dashboard's rolling window is. Retention is a full year because a row of
+# that table -- sixteen values plus the row header and the timestamp index
+# entry -- measures 165 bytes (probe: 200,000 rows -> 31.5 MiB, page_size
+# 4096): ~3,000 requests/day is ~172 MiB/year (~14 MiB/month), ~300/day is
+# ~17 MiB/year, ~10,000/day is ~574 MiB/year. At those numbers aging rows
+# out beats sampling them away -- sampling would bias the series the
+# dashboard shows.
+STORAGE_RETENTION_DAYS: int = 365
+STORAGE_WINDOW_DAYS: int = 30
+
+# The smallest generation window a request must have to carry a throughput
+# signal: a gateway that buffers the stream delivers every token in one
+# burst at the end, which would read as tens of thousands of tok/s; a
+# generation window under 250 ms carries no throughput signal, and token
+# weighting makes short answers count little anyway.
+TPS_MIN_GENERATION_MS: float = 250.0
+
 # How long a translated stream may stay silent before the router sends the
 # client an Anthropic ``ping`` event (``services.keepalive``). A reasoning
 # upstream streams nothing visible while it thinks (its reasoning deltas are
