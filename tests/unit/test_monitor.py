@@ -275,6 +275,65 @@ async def test_tracker_wraps_a_stream_unchanged_and_finishes_at_the_end() -> Non
     assert snapshot["events"][0]["stream"] is True
 
 
+class _Clock:
+    """A monotonic clock the test moves by hand."""
+
+    def __init__(self, value: float = 1000.0) -> None:
+        self.value = value
+
+    def __call__(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        self.value += seconds
+
+
+async def test_tracker_stamps_the_first_content_token_and_not_the_ping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The first-token time is the first delta; a ping before it is not a token."""
+    clock = _Clock()
+    monkeypatch.setattr("services.monitor.time.monotonic", clock)
+    monitor = Monitor()
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    before = _sse(
+        "message_start", {"type": "message_start", "message": {"usage": {"input_tokens": 5}}}
+    )
+    before += _sse("ping", {"type": "ping"})
+    after = _sse("content_block_delta", {"type": "content_block_delta", "delta": {"text": "hi"}})
+
+    async def upstream() -> AsyncIterator[bytes]:
+        clock.advance(0.5)
+        yield before
+        clock.advance(0.5)
+        yield after
+
+    result = tracker.attach(ProviderResult(200, _SSE_HEADERS, upstream()))
+    async for _chunk in result.body:
+        pass
+
+    entry = monitor.snapshot()["events"][0]
+    # The request started at 1000.0, the ping arrived at 1000.5 and the
+    # first content token at 1001.0.
+    assert entry["ttft_ms"] == 1000.0
+
+
+def test_a_unary_result_records_no_first_token_timing() -> None:
+    """A unary answer has no token to time, so the entry carries no timing."""
+    monitor = Monitor()
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    tracker.attach(ProviderResult(200, _JSON_HEADERS, b'{"usage": {"output_tokens": 9}}'))
+    assert "ttft_ms" not in monitor.snapshot()["events"][0]
+
+
+def test_a_count_tokens_request_records_no_first_token_timing() -> None:
+    """``count_tokens`` answers with a count, not with tokens."""
+    monitor = Monitor()
+    tracker = monitor.start_request(model="m", provider="p", endpoint="count_tokens", pricing=None)
+    tracker.attach(ProviderResult(200, _JSON_HEADERS, b'{"input_tokens": 12}'))
+    assert "ttft_ms" not in monitor.snapshot()["events"][0]
+
+
 async def test_tracker_reads_usage_off_a_gzipped_stream_and_relays_it_compressed() -> None:
     monitor = Monitor()
     tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
@@ -418,3 +477,51 @@ def test_snapshot_has_the_process_facts() -> None:
     assert snapshot["totals"]["requests"] == 0
     assert snapshot["providers"] == {}
     assert snapshot["models"] == {}
+
+
+class _SpyStore:
+    """A stand-in store that counts records and can be made to raise."""
+
+    def __init__(self, *, raises: bool = False) -> None:
+        self.entries: list[dict[str, object]] = []
+        self.raises = raises
+
+    def record(self, entry: dict[str, object]) -> None:
+        """Record the entry once, or raise when configured to."""
+        self.entries.append(entry)
+        if self.raises:
+            raise RuntimeError("storage is down")
+
+
+def test_finish_request_feeds_an_attached_store_once() -> None:
+    """The finished request reaches the store exactly once, with the feed entry."""
+    store = _SpyStore()
+    monitor = Monitor()
+    monitor.attach_store(store)  # type: ignore[arg-type]
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    tracker.attach(ProviderResult(200, _JSON_HEADERS, b'{"usage": {"input_tokens": 3}}'))
+
+    assert monitor.store is store
+    assert len(store.entries) == 1
+    assert store.entries[0] is monitor.snapshot()["events"][0]
+
+
+def test_finish_request_survives_a_store_that_raises() -> None:
+    """A raising store must not break the request path; the monitor still counts."""
+    store = _SpyStore(raises=True)
+    monitor = Monitor(store=store)  # type: ignore[arg-type]
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    tracker.attach(ProviderResult(200, _JSON_HEADERS, b'{"usage": {"input_tokens": 3}}'))
+
+    assert monitor.snapshot()["totals"]["requests"] == 1
+    assert len(store.entries) == 1
+
+
+def test_detaching_the_store_stops_recording() -> None:
+    store = _SpyStore()
+    monitor = Monitor(store=store)  # type: ignore[arg-type]
+    monitor.attach_store(None)
+    tracker = monitor.start_request(model="m", provider="p", endpoint="messages", pricing=None)
+    tracker.attach(ProviderResult(200, _JSON_HEADERS, b'{"usage": {"input_tokens": 3}}'))
+    assert monitor.store is None
+    assert store.entries == []

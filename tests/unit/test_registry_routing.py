@@ -160,3 +160,62 @@ def test_resolve_and_describe_routes_carry_a_rule_limit_override(
     assert registry.providers["openai_compatible"].cfg.max_tokens_limit == 65536
     assert registry.describe_routes()[1]["max_tokens_limit"] == 32000
     assert registry.describe_routes()[1]["context_window"] == 223680
+
+
+def test_describe_pricing_unit_is_usd_per_million(registry: ProviderRegistry) -> None:
+    assert registry.describe_pricing()["unit"] == "USD per 1M tokens"
+
+
+def test_describe_pricing_resolves_provider_rates_and_none(registry: ProviderRegistry) -> None:
+    providers = registry.describe_pricing()["providers"]
+    assert providers["anthropic"] == {
+        "input": 3,
+        "output": 15,
+        "cache_write": 3.75,
+        "cache_read": 0.3,
+    }
+    assert providers["openai_compatible"] is None
+
+
+def test_describe_pricing_route_inherits_its_provider_rates(registry: ProviderRegistry) -> None:
+    route = registry.describe_pricing()["routes"][0]
+    assert route["pricing_source"] == "provider"
+    assert route["pricing"] == {
+        "input": 3,
+        "output": 15,
+        "cache_write": 3.75,
+        "cache_read": 0.3,
+    }
+
+
+def test_describe_pricing_route_on_rule_level_rates(registry: ProviderRegistry) -> None:
+    route = registry.describe_pricing()["routes"][1]
+    assert route["pricing_source"] == "rule"
+    # cache_write is unset on the rule, so it falls back to the input price.
+    assert route["pricing"] == {
+        "input": 0.5,
+        "output": 2,
+        "cache_write": 0.5,
+        "cache_read": 0.05,
+    }
+
+
+def test_describe_pricing_route_without_any_prices(registry: ProviderRegistry) -> None:
+    route = registry.describe_pricing()["routes"][2]
+    assert route["pricing"] is None
+    assert route["pricing_source"] is None
+
+
+def test_describe_pricing_default_entry_is_last(registry: ProviderRegistry) -> None:
+    routes = registry.describe_pricing()["routes"]
+    assert routes[-1] == {
+        "match_type": "default",
+        "provider": registry.default_provider,
+        "pricing": {
+            "input": 3,
+            "output": 15,
+            "cache_write": 3.75,
+            "cache_read": 0.3,
+        },
+        "pricing_source": "provider",
+    }

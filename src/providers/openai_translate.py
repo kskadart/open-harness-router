@@ -45,7 +45,6 @@ from const import (
     CAPABILITY_REJECTED_HEADER,
     CLAUDE_BUILTIN_TOOL_NAMES,
     CONTEXT_WINDOW_RESERVE_TOKENS,
-    DEFERRED_TOOL_PLACEHOLDER,
     DROPPED_TOOLS_LOG_SAMPLE,
     MIN_COMPLETION_TOKENS,
     MIN_USEFUL_COMPLETION_TOKENS,
@@ -76,6 +75,7 @@ from services.keepalive import with_keepalive
 from services.reasoning_cache import ReasoningCache
 from services.thread_store import ThreadMissError, ThreadStore
 from services.token_estimator import estimate_openai_request_tokens
+from services.tool_visibility import resolve_visible
 from services.upstream_quota import QuotaGate, quota_retry_after, retry_after_header
 from settings import UpstreamSettings
 
@@ -209,44 +209,36 @@ def visible_tools(
     if tools is None:
         return None
 
-    referenced: set[str] = set()
-    defined: dict[str, ClaudeTool] = {}
-    for message in messages:
-        if not isinstance(message.content, list):
-            continue
-        for block in message.content:
-            if not isinstance(block, ClaudeContentBlockToolAddition):
-                continue
-            name = block.tool.get("name")
-            if not isinstance(name, str):
-                continue
-            referenced.add(name)
-            if "input_schema" not in block.tool:
-                continue
-            try:
-                defined[name] = ClaudeTool.model_validate(block.tool)
-            except ValidationError:
-                if log_issues:
-                    logger.warning("tool_addition_invalid", provider=provider_name, name=name)
+    def from_definition(definition: Mapping[str, Any]) -> ClaudeTool | None:
+        try:
+            return ClaudeTool.model_validate(definition)
+        except ValidationError:
+            return None
 
-    known = {tool.name for tool in tools}
-    visible = [
-        tool
-        for tool in tools
-        if tool.name != DEFERRED_TOOL_PLACEHOLDER
-        and (not tool.defer_loading or tool.name in referenced)
-    ]
-    visible.extend(tool for name, tool in defined.items() if name not in known)
-
-    unresolved = sorted(referenced - known - set(defined))
-    if unresolved and log_issues:
-        logger.warning(
-            "tool_addition_unresolved",
-            provider=provider_name,
-            names=unresolved[:DROPPED_TOOLS_LOG_SAMPLE],
-            unresolved_count=len(unresolved),
-        )
-    return visible
+    outcome = resolve_visible(
+        tools,
+        (
+            block.tool
+            for message in messages
+            if isinstance(message.content, list)
+            for block in message.content
+            if isinstance(block, ClaudeContentBlockToolAddition)
+        ),
+        name_of=lambda tool: tool.name,
+        deferred_of=lambda tool: bool(tool.defer_loading),
+        from_definition=from_definition,
+    )
+    if log_issues:
+        for name in outcome.invalid:
+            logger.warning("tool_addition_invalid", provider=provider_name, name=name)
+        if outcome.unresolved:
+            logger.warning(
+                "tool_addition_unresolved",
+                provider=provider_name,
+                names=outcome.unresolved[:DROPPED_TOOLS_LOG_SAMPLE],
+                unresolved_count=len(outcome.unresolved),
+            )
+    return outcome.visible
 
 
 def cap_tools(

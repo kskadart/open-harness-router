@@ -51,8 +51,10 @@ class ClaudeContentBlockToolAddition(BaseModel):
     (``defer_loading`` in ``tools``) the model may now see as a reference,
     ``{"type": "tool_reference", "name": ...}``, inside a system-role
     message at the position where ToolSearch surfaced it. ``tool`` is kept
-    as sent: a full definition in its place would be a newer shape, and the
-    provider handles both (``providers.openai_translate.visible_tools``).
+    as sent: a full definition in its place is a newer shape -- Claude Code
+    2.1.2xx sends ``{"type": "tool_definition", "definition": {"name": ...,
+    "input_schema": ...}}`` -- and the visibility rule handles both
+    (``services.tool_visibility.addition_tool``).
     """
 
     type: Literal["tool_addition"]

@@ -7,6 +7,9 @@ __pycache__/
 .mypy_cache/
 *.egg-info/
 proxy-ca/
+# Runtime state of the persistent request log -- the SQLite database and its
+# WAL sidecar files, machine-local, not published (ROUTER_STORAGE_DB_PATH)
+state/
 # Personal working routing config with production providers and internal
 # hosts -- not published. The repository example is routing.example.yaml,
 # see ROUTER_CONFIG_PATH in .env
@@ -25,3 +28,4 @@ tasks/
 .DS_Store
 # Local launchd label for scripts/restart_router.sh -- one machine's service name
 .launchd-label
+.pytest_state/

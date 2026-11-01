@@ -886,3 +886,24 @@ def test_pricing_unset_cache_prices_fall_back_to_input() -> None:
         input_tokens=0, output_tokens=0, cache_write_tokens=500_000, cache_read_tokens=500_000
     )
     assert cost == 2.0
+
+
+def test_rates_resolves_unset_cache_prices_to_input() -> None:
+    """``rates()`` is the single source of the cache fallback ``cost_usd`` uses."""
+    pricing = PricingCfg(input=2, output=10)
+    assert pricing.rates() == {
+        "input": 2,
+        "output": 10,
+        "cache_write": 2,
+        "cache_read": 2,
+    }
+
+
+def test_rates_keeps_explicit_cache_prices() -> None:
+    pricing = PricingCfg(input=3, output=15, cache_write=3.75, cache_read=0.3)
+    assert pricing.rates() == {
+        "input": 3,
+        "output": 15,
+        "cache_write": 3.75,
+        "cache_read": 0.3,
+    }

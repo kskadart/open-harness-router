@@ -230,6 +230,15 @@ provider/model is a YAML edit, no code changes. Provider types:
   disagree on this even when both expose an otherwise Anthropic-compatible
   endpoint.
 
+  An own-key provider may also set `fold_tool_additions: true` (rejected on
+  any other provider) for an upstream that answers `400` to Claude Code's
+  mid-conversation `tool_addition` blocks, which appear from the second turn
+  of an agent loop (Kimi: "Invalid request Error"). The router then removes
+  the blocks and sends only the tools the model could see -- deferred ones
+  once referenced, `DeferredToolPlaceholder` never, `defer_loading` dropped
+  -- the one exception to byte-for-byte forwarding; a request with nothing to
+  fold is forwarded untouched.
+
 Because of this, `default.provider` must be a passthrough provider with
 `forward_client_auth: true`, not merely `type: passthrough` -- an unmatched
 model must never silently land on a third-party vendor billed on its own
@@ -1010,8 +1019,16 @@ The command (`src/cli/sync_client_config.py`, also runnable as
   own rule (so two models sharing a provider advertise their own limits). A
   `prefix`/`contains`/`regex` rule without `client_models` is skipped with a
   warning naming the rule, and the run fails only when no model can be
-  listed at all. Rules serving a `passthrough` provider are skipped --
-  native `claude-*` ids are already in the picker.
+  listed at all. Rules serving a `passthrough` provider in NATIVE mode
+  (`forward_client_auth: true`) are skipped -- native `claude-*` ids are
+  already in the picker. A `passthrough` provider in OWN-KEY mode
+  (`forward_client_auth: false`) is a third-party vendor whose model ids the
+  client does not know, so its rules ARE listed, like an `openai-translate`
+  rule's; the window and the output cap belong to that upstream, so the row
+  says so instead of naming numbers this side does not know. Such a rule
+  still needs `client_models` when its match is a pattern: without them no
+  id can be offered, and if no other rule can be listed either, the run
+  fails.
 - `env.CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT` = `"1"` --
   without it, Claude Code compacts proactively against the window it assumes
   for an unrecognised model id, which has nothing to do with the real window
@@ -1114,13 +1131,19 @@ response).
 ## Dashboard
 
 `http://127.0.0.1:8787/dashboard` (the ASGI listener, in both run modes)
-shows what the router is doing without a log file: the requests in flight
-and how long they have been running, per-provider and per-model counters
-(requests, errors, average duration, tokens in/out/cache, cost), a feed of
-the last events, the routing table, and the forward-proxy facts (listen
+shows what the router is doing without a log file: the tiles (requests,
+errors, in flight, tokens, cost), two charts (requests and errors per
+bucket, and the generation throughput per model), ONE Providers table with
+the model rows under their provider, the requests in flight, a feed of the
+last events, the routing table, and the forward-proxy facts (listen
 address, MITM allowlist, root CA expiry). The page polls
 `GET /dashboard/state`, which returns the same picture as JSON, so it can
 be read with `curl`/`jq` or scraped by anything else.
+
+The page is Preact 11.1.1 + htm 3.1.1 with Chart.js 4.6.1, vendored
+byte-for-byte under `src/api/static/vendor` -- no build step, and no CDN at
+runtime: the page loads same-origin files only, served by
+`GET /dashboard/static/...` from a fixed whitelist.
 
 What feeds it (`src/services/monitor.py`):
 
@@ -1151,6 +1174,16 @@ anywhere; on a subscription-billed passthrough route the column shows what
 the same traffic would cost at API prices. Without `pricing` the column
 reads `n/a` and the token columns still work.
 
+The pricing itself is on the page too, so the cost column is readable
+without opening `routing.yaml`: the cost cell of every provider and model
+row carries the list prices it was computed at (`in $ / out $ / cache $`
+per million, with the source -- `rule` or `provider`), and the routing
+table in the "Routing" block lists the same prices for every route, with
+`(provider)` marking the routes that inherit their provider's numbers
+rather than setting their own. It is the same resolution the cost column
+uses (`effective_pricing`), so a rule that overrides its provider is
+visible as such.
+
 ```yaml
 providers:
   anthropic:
@@ -1159,10 +1192,78 @@ providers:
     pricing: {input: 3, output: 15, cache_write: 3.75, cache_read: 0.3}
 ```
 
-The counters live in the router process (they reset on restart) and the
-feed keeps the last 500 entries. The state names models, providers, request
-paths and tunnelled hosts, never bodies or credentials; like `/health`, it
-is meant for the loopback interface the listener binds by default.
+Two charts sit above the Providers table: the requests and errors per
+bucket, and the generation throughput of every model over the selected
+window (a line per model) -- see "Persistent request log" below.
+
+The in-process counters live in the router process and reset on restart;
+the feed keeps the last 500 entries. The same window is also persisted, so
+the statistics survive a restart -- see "Persistent request log" below. The
+state names models, providers, request paths and tunnelled hosts, never
+bodies or credentials; like `/health`, it is meant for the loopback
+interface the listener binds by default.
+
+### Persistent request log
+
+Every finished routed request is also written to a SQLite file, so the
+dashboard's statistics outlive the process: the counters reset on restart
+only in memory, while the rolling window is read back from disk.
+
+- **What is stored**: one row per finished routed request -- the timestamp,
+  request id, endpoint, model, provider, status, error name, stream flag,
+  deliberate-rejection name, duration, the four token counts, the cost and
+  the time to the first content token (a streamed answer only). No bodies,
+  no credentials, nothing else.
+- **Where**: `ROUTER_STORAGE_DB_PATH` (default `./state/monitor.db`; the
+  parent directory is created on first use and `state/` is gitignored).
+- **How long**: `ROUTER_STORAGE_RETENTION_DAYS`, default `365`. Rows older
+  than the cutoff are pruned once at startup and then once a day -- the
+  oldest are dropped, a rolling year is kept.
+- **Size**: a row measures 165 bytes including its timestamp index entry
+  (probe: 200,000 rows -> 31.5 MiB, `page_size` 4096). Per year that is
+  ~17 MiB at 300 requests/day, ~172 MiB (~14 MiB/month) at 3,000/day, and
+  ~574 MiB at 10,000/day. That is why a full year is kept and why rows are
+  pruned rather than sampled: sampling would bias the series the dashboard
+  shows.
+- **Window**: the dashboard reads a rolling `ROUTER_STORAGE_WINDOW_DAYS`
+  (default `30`); a window wider than the retention is refused at startup.
+- **Time windows**: the range selector sits above the tiles and governs the
+  whole page, Kibana-style -- the tiles, the charts, the Providers table and
+  the trend all read the same period, so nothing has to be compared across
+  two different windows. It offers `24h`, `7d`, `30d`, `all` and a custom
+  range (two date fields; `start` alone means "from that day to now"), and
+  the choice is sent to `GET /dashboard/state` as `window=` and
+  `start=`/`end=`, so the same figures come out of `curl`/`jq` without the
+  page. A `24h` window is bucketed by hour, everything longer by day; a
+  range reaching before the retention floor is clamped to it rather than
+  silently read as whole (and the page says "clamped to retention"), and an
+  unknown window or an inverted range answers `400`. When the store is
+  younger than the selected window the page says "data since ..." instead of
+  showing an empty range (the timestamp comes from `history.data_since`).
+  Only "in flight" and the event feed stay process-local, since they
+  describe now. Without storage the same page falls back to the in-memory
+  counters of the process and labels them "since start".
+- **Throughput (TPS)**: the chart above the Providers table shows the
+  generation speed of every model over the selected window. Throughput
+  is the output tokens over the *generation* time -- from the first content
+  token to the last response byte -- and deliberately not over the whole
+  request: the prompt processing of a two-million-token prompt would
+  dominate the total duration and understate the generation speed badly.
+  Only a streamed `/v1/messages` answer qualifies (a unary answer has no
+  token to time), and only when its generation window is at least 250 ms --
+  a gateway that buffers the stream delivers every token in one burst at the
+  end, which would read as tens of thousands of tok/s. Every figure is
+  token-weighted: the sum of the output tokens over the sum of the
+  generation windows, never the mean of the per-request ratios. The
+  Providers table carries the same numbers per model plus the average time
+  to the first token (TTFT). Rows recorded before this measurement existed
+  carry no first-token timing and therefore do not appear in the chart at
+  all.
+- **Failures never break a request**: if the database cannot be opened,
+  written or read (read-only or full disk, corrupt file, a busy lock) the
+  error is logged and carried into the window snapshot as `storage_error`;
+  the model response is delivered as usual. Set `ROUTER_STORAGE_ENABLED=false`
+  to turn the log off entirely and keep the old in-memory-only behavior.
 
 ### Prometheus and Grafana
 

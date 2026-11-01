@@ -31,6 +31,13 @@ providers:
     # USD per million tokens, never sent anywhere. On a subscription-billed
     # route this shows what the same traffic would cost at API prices. A
     # rule may override it for its own model (pricing: under rules:).
+    # A vendor that quotes its rate card in another currency needs the
+    # conversion done here: divide the quoted figure by the rate and write
+    # the USD result down with the rate and the date in a comment, e.g.
+    # 39 RUB in / 156 RUB out / 1 RUB cache at 80.6761 RUB per USD
+    # (CBR, 2026-10-30) becomes input 0.4834, output 1.9337, and that same
+    # cache figure in both cache_write and cache_read when the card lists
+    # one cache price with no read/write split.
     # pricing:
     #   input: 3
     #   output: 15
@@ -163,6 +170,40 @@ providers:
   #   base_url: https://api.moonshot.ai/anthropic
   #   forward_client_auth: false
   #   api_key_env: MOONSHOT_API_KEY
+  #   auth_header: bearer
+  #   stream_read_timeout_s: 600
+  #   # Optional, own-key passthrough only (rejected anywhere else): for an
+  #   # upstream that answers 400 to Claude Code's mid-conversation
+  #   # tool_addition blocks, the router removes them and sends only the tools
+  #   # the model could see (deferred ones once referenced, the
+  #   # DeferredToolPlaceholder never, defer_loading dropped). The one
+  #   # exception to byte-for-byte forwarding; a body with nothing to fold
+  #   # goes out untouched. Default false.
+  #   fold_tool_additions: true
+
+  # MiniMax via passthrough: MiniMax exposes an Anthropic-compatible
+  # endpoint, so no translation is needed (same code path as kimi_anthropic
+  # above). forward_client_auth: false is REQUIRED, for the same reason as
+  # there: the client's Claude Code OAuth token must never reach a
+  # third-party host. The router injects MINIMAX_API_KEY instead.
+  # The docs recommend "Authorization: Bearer" (it wins if x-api-key is sent
+  # too), hence auth_header: bearer.
+  # https://platform.minimax.io/docs/api-reference/text-chat-anthropic.md
+  # base_url is the docs' Anthropic-compatible base without /v1/messages (the
+  # router appends it): https://platform.minimax.io/docs/api-reference/text-anthropic-api
+  # Mainland China is a separate platform and domain
+  # (https://api.minimaxi.com/anthropic per a web search; not verified
+  # against the platform.minimaxi.com page): keys are not interchangeable.
+  # The docs show no variable name for the key (ANTHROPIC_AUTH_TOKEN holds it
+  # in their Claude Code guide), so MINIMAX_API_KEY is this repo's choice.
+  # No max_tokens_limit / context_window here: both are rejected on a
+  # passthrough provider. Documented limits: 1M context for both models,
+  # max_tokens up to 524288 (MiniMax-M3 and MiniMax-M3.1-Flash).
+  # minimax:
+  #   type: passthrough
+  #   base_url: https://api.minimax.io/anthropic
+  #   forward_client_auth: false
+  #   api_key_env: MINIMAX_API_KEY
   #   auth_header: bearer
   #   stream_read_timeout_s: 600
 
@@ -310,8 +351,19 @@ rules:
   # Alternative to the rule above -- only if the kimi_anthropic passthrough
   # provider is uncommented instead of (not in addition to) openai-translate
   # "kimi"; both rules would otherwise fight over the same "kimi-" prefix.
+  # A prefix rule on an own-key passthrough provider needs client_models:
+  # the client does not know that vendor's model ids on its own, so without
+  # the list there is nothing to put in the /model picker.
   # - match: {type: prefix, value: "kimi-"}
   #   provider: kimi_anthropic
+  #   client_models: ["kimi-k2.5"]
+  # MiniMax: exact ids, case-sensitive (the id is the model on passthrough,
+  # there is no upstream_model). Uncomment together with the "minimax" block.
+  # https://platform.minimax.io/docs/faq/models.md
+  # - match: {type: exact, value: "MiniMax-M3.1-Flash"}
+  #   provider: minimax
+  # - match: {type: exact, value: "MiniMax-M3"}
+  #   provider: minimax
   # No trailing dash in the qwen prefix: the family mixes a dash right after
   # the vendor name (qwen-plus, qwen-max, qwen-turbo, qwen-flash) with a
   # version first (qwen3.8-max, qwen3.7-plus, qwen3-coder-plus), and "qwen-"

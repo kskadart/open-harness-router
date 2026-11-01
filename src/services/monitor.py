@@ -28,6 +28,7 @@ Two feeds fill it:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import time
@@ -36,7 +37,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping, MutableMapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from const import (
     CAPABILITY_REJECTED_HEADER,
@@ -46,6 +47,11 @@ from const import (
 )
 from providers.base import ProviderResult
 from routing.schema import PricingCfg
+
+if TYPE_CHECKING:
+    # Runtime import would cycle: request_store imports ``log``, which
+    # imports ``capture_for_monitor`` from this module.
+    from services.request_store import RequestStore
 
 # Paths the request tracker covers itself: their ``proxy_request`` log
 # events would duplicate the tracked entries in the feed.
@@ -186,6 +192,10 @@ class UsageScanner:
     line longer than ``MONITOR_SSE_LINE_LIMIT`` is dropped. A body in a
     ``content-encoding`` the scanner cannot inflate is skipped altogether,
     whichever shape it has.
+
+    A stream also leaves behind the instant of its first content token
+    (:attr:`first_delta_monotonic`), which is what the throughput figures
+    are measured from.
     """
 
     def __init__(self, content_encoding: str = "") -> None:
@@ -195,6 +205,7 @@ class UsageScanner:
             content_encoding: the stream's ``content-encoding`` header value.
         """
         self.usage = Usage()
+        self.first_delta_monotonic: float | None = None
         self._pending = b""
         encoding = content_encoding.strip().lower()
         self._inflater = _Inflater() if encoding in _ZLIB_ENCODINGS else None
@@ -237,6 +248,15 @@ class UsageScanner:
         if not isinstance(payload, dict):
             return
         event_type = payload.get("type")
+        if event_type == "content_block_delta":
+            # The first content token of the answer: the start of the
+            # generation window the throughput is measured over. A keepalive
+            # ``ping`` and a ``message_start`` are not tokens -- they say
+            # nothing was generated yet -- so only this event type counts.
+            # A thinking delta is a generated token and counts too.
+            if self.first_delta_monotonic is None:
+                self.first_delta_monotonic = time.monotonic()
+            return
         if event_type == "message_start":
             message = payload.get("message")
             usage = message.get("usage") if isinstance(message, dict) else None
@@ -418,7 +438,22 @@ class RequestTracker:
             usage=usage,
             cost_usd=cost,
             rejected=rejected,
+            ttft_ms=self._ttft_ms(),
         )
+
+    def _ttft_ms(self) -> float | None:
+        """Return the time to the first content token, in milliseconds.
+
+        Only a streamed ``/v1/messages`` answer has one: a unary body and a
+        ``count_tokens`` request never carry a token, so their throughput is
+        not defined and the timing stays unknown.
+        """
+        scanner = self._scanner
+        if scanner is None or scanner.first_delta_monotonic is None:
+            return None
+        if self._active.endpoint != "messages":
+            return None
+        return (scanner.first_delta_monotonic - self._active.started_monotonic) * 1000.0
 
 
 class Monitor:
@@ -426,11 +461,15 @@ class Monitor:
 
     _current: Monitor | None = None
 
-    def __init__(self, *, event_buffer: int = MONITOR_EVENT_BUFFER) -> None:
+    def __init__(
+        self, *, event_buffer: int = MONITOR_EVENT_BUFFER, store: RequestStore | None = None
+    ) -> None:
         """Start an empty monitor for this process.
 
         Args:
             event_buffer: how many feed entries to keep.
+            store: optional persistent request log; every finished request
+                is also written to it (see :meth:`finish_request`).
         """
         self.pid = os.getpid()
         self.started_at = _now_iso()
@@ -442,6 +481,20 @@ class Monitor:
         self._model_provider: dict[str, str] = {}
         self._active: dict[int, _Active] = {}
         self._next_id = 1
+        self._store = store
+
+    @property
+    def store(self) -> RequestStore | None:
+        """Return the attached persistent request log, if any."""
+        return self._store
+
+    def attach_store(self, store: RequestStore | None) -> None:
+        """Attach (or detach, with ``None``) the persistent request log.
+
+        Args:
+            store: the store to attach, or ``None`` to detach it.
+        """
+        self._store = store
 
     @classmethod
     def current(cls) -> Monitor:
@@ -491,6 +544,7 @@ class Monitor:
         usage: Usage,
         cost_usd: float | None,
         rejected: str | None = None,
+        ttft_ms: float | None = None,
     ) -> None:
         """Move a request from in-flight to the counters and the feed.
 
@@ -498,6 +552,11 @@ class Monitor:
         (the ``CAPABILITY_REJECTED_HEADER`` value): that 4xx is part of the
         protocol with the client, so it is a request, not an error, and the
         feed entry carries the name.
+
+        ``ttft_ms`` is the time to the first content token of a streamed
+        answer; it is ``None`` when there was no token to time (a unary
+        body, a ``count_tokens`` request), and the feed entry then carries
+        no timing at all.
         """
         self._active.pop(active.request_id, None)
         duration_ms = (time.monotonic() - active.started_monotonic) * 1000.0
@@ -529,7 +588,19 @@ class Monitor:
             entry["rejected"] = rejected
         if cost_usd is not None:
             entry["cost_usd"] = round(cost_usd, 6)
+        if ttft_ms is not None:
+            entry["ttft_ms"] = round(ttft_ms, 1)
         self._events.append(entry)
+        # Persist the same entry, never a second shape. ``record`` is a
+        # single synchronous INSERT (microseconds at the volumes above), so
+        # it runs on the loop thread without delaying the response; handing
+        # it to a thread would only add scheduling for no measurable gain.
+        # The store swallows its own failures; the guard here keeps the
+        # request path safe even if a store ever raises anyway.
+        store = self._store
+        if store is not None:
+            with contextlib.suppress(Exception):
+                store.record(entry)
 
     def record_log_event(self, event_dict: Mapping[str, Any]) -> None:
         """Copy a log event into the feed when it belongs there.
