@@ -4,6 +4,16 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are `major.minor.micro`
 and every release is tagged `vX.Y.Z`.
 
+## [0.4.0] - 2026-11-01
+
+### Added
+
+- add a `Today` window to the dashboard, first in the range selector: it runs from the reader's local midnight and only grows until the next one, unlike the rolling `24h`/`7d`/`30d` windows whose totals drop as heavy traffic leaves them (the window line now says `today since 00:00` or `rolling 24h`); the server does not know the reader's time zone, so the page sends it as `window=custom` with `start=` at local midnight and an open end, bucketed by hour -- the backend is unchanged ([#38](https://github.com/kskadart/open-harness-router/pull/38))
+
+### Changed
+
+- draw every model as its own line on the dashboard's throughput chart instead of folding the models past the eighth palette colour into one `Other` line with a pooled TPS: the first eight models are solid lines in the eight colours and the next ones reuse the colours dashed, dotted, then dash-dotted, keyed to the model's place in the store's list so a line never restyles when the range changes; the legend swatch is a short stroke of the line itself, showing its dash as well as its colour ([#38](https://github.com/kskadart/open-harness-router/pull/38))
+
 ## [0.3.0] - 2026-11-01
 
 ### Added
