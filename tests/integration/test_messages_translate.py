@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 
 import httpx
+import pytest
 from pytest_httpx import HTTPXMock
 
 _OPENAI_COMPATIBLE_CHAT_URL = "https://gateway.example.com/v1/chat/completions"
@@ -95,6 +96,55 @@ async def test_translate_returns_anthropic_shaped_response(
     # The provider must call openai_compatible, not Anthropic.
     outbound = httpx_mock.get_requests(url=_OPENAI_COMPATIBLE_CHAT_URL, method="POST")
     assert len(outbound) == 1
+
+
+@pytest.mark.parametrize("minimal_replay", [False, True])
+async def test_translate_continues_history_with_thinking_blocks(
+    client: httpx.AsyncClient, httpx_mock: HTTPXMock, minimal_replay: bool
+) -> None:
+    httpx_mock.add_response(url=_OPENAI_COMPATIBLE_CHAT_URL, method="POST", json=_OPENAI_RESPONSE)
+    redaction = {} if minimal_replay else {"data": "opaque"}
+    thinking = {} if minimal_replay else {"thinking": "synthetic reasoning", "signature": ""}
+    result_content = {} if minimal_replay else {"content": "ready"}
+    history = [
+        {"role": "user", "content": "Check the status."},
+        {"role": "assistant", "content": [{"type": "redacted_thinking", **redaction}]},
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", **thinking},
+                {"type": "text", "text": "Checking."},
+                {"type": "tool_use", "id": "call_1", "name": "status", "input": {}},
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "call_1", **result_content}],
+        },
+    ]
+    payload = {"model": "zai-org/GLM-5.2-FP8", "messages": history}
+    headers = {"x-api-key": "test"}
+    count = await client.post("/v1/messages/count_tokens", json=payload, headers=headers)
+    assert count.status_code == 200
+    assert count.json()["input_tokens"] > 0
+    result = await client.post("/v1/messages", json={**payload, "max_tokens": 32}, headers=headers)
+    assert result.status_code == 200
+    sent = json.loads(httpx_mock.get_requests(url=_OPENAI_COMPATIBLE_CHAT_URL)[0].content)
+    assert sent["messages"] == [
+        history[0],
+        {
+            "role": "assistant",
+            "content": "Checking.",
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "id": "call_1",
+                    "function": {"name": "status", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": result_content.get("content", "")},
+    ]
 
 
 async def test_translate_hides_deferred_tools_until_the_conversation_surfaces_them(

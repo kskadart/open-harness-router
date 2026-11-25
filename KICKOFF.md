@@ -19,9 +19,14 @@ flowchart TD
 ```
 
 - Messages requests use passthrough or the existing OpenAI translation pipeline.
+  Translation accepts Claude thinking blocks in conversation history and omits
+  them from the converted assistant content. Empty tool results retain their call
+  IDs. Translation errors identify the first failing field or unsupported block.
 - Codex uses native Responses when `responses_base_url` is configured.
-  An `openai-translate` provider with `api_flavor: responses` also serves native
-  Responses using its `base_url`; that setting is invalid for `passthrough`.
+  An API-key `openai-translate` provider with `api_flavor: responses` also serves
+  native Responses using its `base_url`. A `chatgpt_oauth` provider instead uses
+  that flavor for Messages translation only: it has no native Responses transport
+  and cannot be `responses_default`. The flavor is invalid for `passthrough`.
   Other own-key providers use Responses ↔ Messages mappers and the same pipeline.
 - `default` controls the Messages fallback; `responses_default` independently
   controls the Responses fallback. Explicit model rules take precedence.

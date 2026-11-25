@@ -41,6 +41,49 @@ def _convert(request: ClaudeMessagesRequest) -> dict[str, Any]:
     return convert_claude_to_openai(request, _MODEL, max_tokens_limit=8192)
 
 
+def test_thinking_only_replay_between_plain_user_turns_keeps_text_boundary() -> None:
+    request = _build_request(
+        messages=[
+            {"role": "user", "content": "one"},
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "hidden"}]},
+            {"role": "user", "content": "two"},
+        ]
+    )
+    assert _convert(request)["messages"] == [{"role": "user", "content": "one\n\ntwo"}]
+
+
+def test_thinking_only_replay_coalesces_user_text_and_images_in_order() -> None:
+    image = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": "QQ=="},
+    }
+    hidden = {"role": "assistant", "content": [{"type": "redacted_thinking", "data": "hidden"}]}
+    request = _build_request(
+        messages=[
+            {"role": "user", "content": "first"},
+            hidden,
+            {"role": "user", "content": [image, {"type": "text", "text": "second"}]},
+            hidden,
+            {"role": "user", "content": "third"},
+            {"role": "assistant", "content": "visible reply"},
+            {"role": "user", "content": "next turn"},
+        ]
+    )
+    assert _convert(request)["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "first"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QQ=="}},
+                {"type": "text", "text": "second"},
+                {"type": "text", "text": "third"},
+            ],
+        },
+        {"role": "assistant", "content": "visible reply"},
+        {"role": "user", "content": "next turn"},
+    ]
+
+
 def test_tool_choice_auto_converted_to_auto() -> None:
     """tool_choice type=auto leaves the call up to the model -> auto."""
     result = _convert(_build_request(tool_choice={"type": "auto"}))

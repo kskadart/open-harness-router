@@ -512,10 +512,12 @@ def convert_responses_to_claude_response(
     """
 
     output_items = responses_response.get("output", [])
-    if not output_items:
-        raise ProviderError(
-            message="No output in OpenAI Responses response", status_code=500
-        )
+    empty_stop = _responses_stop_reason(responses_response, has_tool_use=False)
+    limited_without_output = (
+        responses_response.get("output") == [] and empty_stop == Constants.STOP_MAX_TOKENS
+    )
+    if not output_items and not limited_without_output:
+        raise ProviderError(message="No output in OpenAI Responses response", status_code=500)
 
     for call_id, reasoning_items in extract_reasoning_by_call_id(output_items).items():
         reasoning_cache.store(call_id, reasoning_items)

@@ -12,8 +12,10 @@ from pydantic import ValidationError
 
 from cli.sync_codex_config import main
 from errors import ConfigError
-from routing.schema import CodexModelCfg, ProviderCfg
+from routing.registry import ProviderRegistry
+from routing.schema import CodexModelCfg, ProviderCfg, RoutingConfig
 from services.codex_catalog import load_catalog, merge_catalogs
+from settings import Settings
 
 
 @pytest.mark.parametrize("url", ["", "ftp://example.com", "/v1"])
@@ -35,6 +37,38 @@ def test_responses_cannot_forward_claude_client_credentials() -> None:
             base_url="https://example.com",
             responses_base_url="https://example.com/v1",
         )
+
+
+async def test_subscription_provider_has_messages_but_no_native_responses_transport(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    path = tmp_path / "routing.yaml"
+    monkeypatch.setenv("ROUTER_CONFIG_PATH", str(path))
+    settings = Settings()
+    config = {
+        "version": 1,
+        "providers": {
+            "native": {"type": "passthrough", "base_url": "https://api.anthropic.com"},
+            "subscription": {
+                "type": "openai-translate",
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "api_flavor": "responses",
+                "chatgpt_oauth": True,
+                "max_tokens_limit": 8192,
+            },
+        },
+        "rules": [{"match": {"type": "exact", "value": "test-model"}, "provider": "subscription"}],
+        "default": {"provider": "native"},
+    }
+    registry = ProviderRegistry.build(RoutingConfig.model_validate(config), settings)
+    try:
+        assert registry.resolve("test-model").provider is registry.providers["subscription"]
+        assert "subscription" not in registry.responses_providers
+    finally:
+        await registry.close_all()
+    with pytest.raises(ValidationError, match="responses_default.provider must not be"):
+        RoutingConfig.model_validate({**config, "responses_default": {"provider": "subscription"}})
 
 
 def test_codex_default_effort_must_be_supported() -> None:

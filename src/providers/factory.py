@@ -101,6 +101,11 @@ def build_provider(name: str, cfg: ProviderCfg, settings: Settings) -> Provider:
             api_key = _resolve_required_api_key(name, cfg, settings)
         return PassthroughProvider(name, cfg, settings.upstream, api_key, ca_path)
 
+    if cfg.chatgpt_oauth:
+        # Subscription credential from cli.chatgpt_login; the provider
+        # injects live OAuth headers instead of a static key.
+        return OpenAITranslateProvider(name, cfg, None, ca_path, settings.upstream)
+
     api_key = _resolve_required_api_key(name, cfg, settings)
     return OpenAITranslateProvider(name, cfg, api_key, ca_path, settings.upstream)
 
@@ -115,7 +120,9 @@ def build_responses_provider(
     only with a separate explicit opt-in for the client's native provider.
     """
     base_url = cfg.responses_base_url
-    if base_url is None and cfg.api_flavor == "responses":
+    if base_url is None and cfg.api_flavor == "responses" and not cfg.chatgpt_oauth:
+        # chatgpt_oauth authenticates per request with the stored OAuth
+        # credential; the static-key native transport cannot serve it.
         base_url = cfg.base_url
     if base_url is None:
         return None

@@ -16,6 +16,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from auth.chatgpt_oauth import SUBSCRIPTION_ENDPOINT as CHATGPT_SUBSCRIPTION_ENDPOINT
 from const import (
     CONTEXT_WINDOW_RESERVE_TOKENS,
     MIN_USEFUL_COMPLETION_TOKENS,
@@ -378,6 +379,11 @@ class ProviderCfg(BaseModel):
     responses_forward_client_auth: bool = False
     responses_custom_tools_as_functions: list[str] = Field(default_factory=list)
     api_key_env: str | None = None
+    # ChatGPT subscription OAuth: the provider authenticates with the
+    # credential from state/chatgpt_auth.json (cli.chatgpt_login) instead
+    # of a static key. Only valid on openai-translate with
+    # api_flavor="responses" targeting chatgpt.com/backend-api/codex.
+    chatgpt_oauth: bool = False
     ca_bundle: str | None = None
     tls_verify_hostname: bool = True
     timeout_s: int = 120
@@ -396,6 +402,42 @@ class ProviderCfg(BaseModel):
     reasoning_effort: ReasoningEffort = "medium"
     forward_chat_reasoning_effort: bool = False
     pricing: PricingCfg | None = None
+
+    @model_validator(mode="after")
+    def _validate_chatgpt_oauth(self) -> ProviderCfg:
+        """The subscription flag is only valid in its supported shape.
+
+        ``chatgpt_oauth`` means the provider authenticates with the stored
+        ChatGPT subscription credential (``cli.chatgpt_login``), not a
+        static key: it requires the Responses flavor (that is what the
+        subscription backend speaks) and excludes ``api_key_env`` -- the
+        two auth sources would race and one would silently win.
+
+        The ``base_url`` is pinned to the subscription backend and TLS
+        hostname verification is required: the credential is a live
+        account bearer token, so a misconfigured route must never be able
+        to attach it to an arbitrary destination.
+        """
+        if not self.chatgpt_oauth:
+            return self
+        if self.type != "openai-translate" or self.api_flavor != "responses":
+            raise ValueError(
+                "chatgpt_oauth is only valid on openai-translate with "
+                "api_flavor='responses' (the ChatGPT backend speaks Responses)"
+            )
+        if self.api_key_env:
+            raise ValueError("chatgpt_oauth excludes api_key_env (OAuth, not a static key)")
+        if self.base_url != CHATGPT_SUBSCRIPTION_ENDPOINT:
+            raise ValueError(
+                "chatgpt_oauth requires base_url="
+                f"'{CHATGPT_SUBSCRIPTION_ENDPOINT}' exactly (the subscription "
+                "credential may only reach the ChatGPT Codex backend)"
+            )
+        if not self.tls_verify_hostname:
+            raise ValueError("chatgpt_oauth requires TLS hostname verification")
+        if self.base_url != CHATGPT_SUBSCRIPTION_ENDPOINT and self.responses_base_url:
+            raise ValueError("chatgpt_oauth does not support responses_base_url")
+        return self
 
     @model_validator(mode="after")
     def _validate_responses_base_url(self) -> ProviderCfg:
@@ -729,9 +771,10 @@ class RoutingConfig(BaseModel):
                 forwarding the client's own credentials.
         """
         for name, cfg in self.providers.items():
-            if cfg.type == "openai-translate" and not cfg.api_key_env:
+            if cfg.type == "openai-translate" and not cfg.api_key_env and not cfg.chatgpt_oauth:
                 raise ValueError(
-                    f"provider '{name}': openai-translate requires 'api_key_env'"
+                    f"provider '{name}': openai-translate requires 'api_key_env' "
+                    "(or 'chatgpt_oauth: true' for the ChatGPT subscription)"
                 )
 
         if self.codex_catalog_path is not None and self.responses_default is None:
@@ -742,6 +785,15 @@ class RoutingConfig(BaseModel):
             if name not in self.providers:
                 raise ValueError(f"responses_default -> unknown provider '{name}'")
             cfg = self.providers[name]
+            if cfg.chatgpt_oauth:
+                # The native transport is deliberately skipped for OAuth
+                # providers (per-request credential injection); accepting
+                # one as the native fallback would silently route Codex
+                # clients through the Messages bridge instead.
+                raise ValueError(
+                    "responses_default.provider must not be a chatgpt_oauth "
+                    "provider (no native Responses transport for it)"
+                )
             if cfg.responses_base_url is None and cfg.api_flavor != "responses":
                 raise ValueError("responses_default.provider must support native Responses")
 

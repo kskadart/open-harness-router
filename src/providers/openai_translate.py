@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import math
+import re
 import time
 import uuid
 from collections.abc import (
@@ -41,6 +42,11 @@ from openai.types.chat import ChatCompletionChunk
 from openai.types.responses import ResponseStreamEvent
 from pydantic import BaseModel, SecretStr, ValidationError
 
+from auth.chatgpt_oauth import (
+    SUBSCRIPTION_ENDPOINT,
+    ChatGPTOAuthProvider,
+    ChatGPTTokenStore,
+)
 from const import (
     CAPABILITY_REJECTED_HEADER,
     CLAUDE_BUILTIN_TOOL_NAMES,
@@ -386,7 +392,28 @@ def _json_result(
 
 def _invalid_request(exc: ValidationError) -> ProviderResult:
     """The 400 for a client body the Anthropic request schema rejects."""
-    return _json_result(400, anthropic_error_body("invalid_request_error", str(exc)))
+    error = exc.errors(include_input=False, include_url=False)[0]
+    loc = error["loc"]
+    detail = error["msg"]
+    if loc[:1] == ("messages",) and loc[2:4] == ("content", "blocks"):
+        # Pydantic includes the list union branch and the discriminator tag in
+        # the location. Only the index and field names exist in the request.
+        loc = loc[:3] + loc[4:5] + loc[6:]
+        if error["type"] == "union_tag_invalid":
+            tag = (error.get("ctx") or {}).get("tag", "")
+            label = f" '{tag}'" if re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", str(tag)) else ""
+            detail = (
+                f"This route cannot translate content block{label}. "
+                "Resume on a route that supports this block, or start a new conversation "
+                "with a summary of the task."
+            )
+        elif error["type"] == "union_tag_not_found":
+            detail = "A content block must have a type."
+        elif error["type"] == "list_type":
+            detail = "Expected a string or an array of content blocks."
+    path = "".join(f"[{part}]" if isinstance(part, int) else f".{part}" for part in loc)
+    message = f"{path.lstrip('.') or 'request'}: {detail}"
+    return _json_result(400, anthropic_error_body("invalid_request_error", message))
 
 
 async def _encode_sse(chunks: AsyncIterator[str]) -> AsyncIterator[bytes]:
@@ -409,7 +436,7 @@ class OpenAITranslateProvider:
         self,
         name: str,
         cfg: ProviderCfg,
-        api_key: SecretStr,
+        api_key: SecretStr | None,
         ca_bundle_path: Path | None,
         upstream: UpstreamSettings,
     ) -> None:
@@ -418,7 +445,9 @@ class OpenAITranslateProvider:
         Args:
             name: provider name in the registry.
             cfg: provider configuration.
-            api_key: upstream API key.
+            api_key: upstream API key, or None with ``chatgpt_oauth`` --
+                the provider then authenticates with the stored ChatGPT
+                subscription credential (auth.chatgpt_oauth) instead.
             ca_bundle_path: path to the CA bundle, or None for system roots.
             upstream: outbound connection settings (IPv4 binding, pool
                 limits).
@@ -432,16 +461,30 @@ class OpenAITranslateProvider:
             pool=10.0,
         )
         verify = build_upstream_verify(ca_bundle_path, cfg.tls_verify_hostname)
-        self._http_client = httpx.AsyncClient(
-            timeout=timeout, transport=build_upstream_transport(upstream, verify)
-        )
+        self._oauth: ChatGPTOAuthProvider | None = None
+        if cfg.chatgpt_oauth:
+            self._oauth = ChatGPTOAuthProvider(ChatGPTTokenStore(Path("state/chatgpt_auth.json")))
+            self._http_client = httpx.AsyncClient(
+                timeout=timeout,
+                transport=build_upstream_transport(upstream, verify),
+                auth=self._oauth_auth(),
+            )
+        else:
+            self._http_client = httpx.AsyncClient(
+                timeout=timeout,
+                transport=build_upstream_transport(upstream, verify),
+            )
         # max_retries is set explicitly: the SDK default (2) was exhausted in
         # ~1.5s and dropped the client on 429/5xx that outlived that window.
         # Retries happen inside the SDK before AsyncStream is created, so the
         # streaming response never risks splicing two different generations
         # together.
         self._client = AsyncOpenAI(
-            api_key=api_key.get_secret_value(),
+            # With chatgpt_oauth the real Authorization header comes from
+            # the httpx auth hook; the SDK still requires some api_key, so
+            # the placeholder keeps it constructor-happy. The hook overwrites
+            # authorization, so the placeholder never reaches the wire.
+            api_key=api_key.get_secret_value() if api_key is not None else "chatgpt-oauth",
             base_url=cfg.base_url,
             default_headers=dict(cfg.extra_headers),
             http_client=self._http_client,
@@ -458,6 +501,38 @@ class OpenAITranslateProvider:
         # The gateway meters output tokens per key, so the window is the
         # provider's, not the request's: one gate for all of its requests.
         self._quota = QuotaGate(name)
+
+    def _oauth_auth(self) -> httpx.Auth:
+        """httpx auth that injects the live subscription headers per request.
+
+        Only called when ``cfg.chatgpt_oauth`` set the holder. The hook
+        runs on every outgoing request, so a token refreshed mid-session
+        lands on the next request; the refresh itself is coordinated per
+        credential store (auth.chatgpt_oauth). The destination is
+        re-checked on every request before the bearer is attached --
+        schema validation pins base_url at startup, this is the runtime
+        half of that guarantee.
+        """
+        oauth = cast(ChatGPTOAuthProvider, self._oauth)
+
+        class _SubscriptionAuth(httpx.Auth):
+            # The callback belongs to the hook, not to the provider; the
+            # underscore name keeps ruff's self-convention check quiet.
+            async def async_auth_flow(
+                _self, request: httpx.Request  # noqa: N805
+            ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+                destination = str(request.url)
+                if not destination.startswith(SUBSCRIPTION_ENDPOINT):
+                    raise httpx.ConnectError(
+                        "refusing to attach the ChatGPT subscription credential "
+                        f"to a non-subscription destination: {destination}"
+                    )
+                headers = await oauth.get_auth_headers()
+                for key, value in headers.items():
+                    request.headers[key] = value
+                yield request
+
+        return _SubscriptionAuth()
 
     async def create_chat_completion(
         self, request: dict[str, Any], request_id: str | None = None
@@ -480,6 +555,22 @@ class OpenAITranslateProvider:
         if request_id:
             cancel_event = asyncio.Event()
             self.active_requests[request_id] = cancel_event
+
+        if self.cfg.chatgpt_oauth:
+            if not request_id:
+                return await self._aggregate_subscription(request, None)
+            work = asyncio.create_task(self._aggregate_subscription(request, request_id))
+            cancelled = asyncio.create_task(self.active_requests[request_id].wait())
+            try:
+                await asyncio.wait((work, cancelled), return_when=asyncio.FIRST_COMPLETED)
+                if self.active_requests[request_id].is_set():
+                    raise ProviderError("Request cancelled by client", 499)
+                return await work
+            finally:
+                work.cancel()
+                cancelled.cancel()
+                await asyncio.gather(work, cancelled, return_exceptions=True)
+                self.active_requests.pop(request_id, None)
 
         try:
             # The SDK overload cannot be inferred from a dict argument, but
@@ -521,6 +612,50 @@ class OpenAITranslateProvider:
         finally:
             if request_id and request_id in self.active_requests:
                 del self.active_requests[request_id]
+
+    async def _aggregate_subscription(
+        self, request: dict[str, Any], request_id: str | None
+    ) -> dict[str, Any]:
+        """Consume the streaming-only backend, closing it on cancellation or exit."""
+        stream = None
+        try:
+            stream = await self.create_stream(request, request_id)
+            async for event in stream:
+                event_type = getattr(event, "type", None)
+                if event_type == "error":
+                    raise ProviderError(getattr(event, "message", None) or "upstream error", 502)
+                if event_type in (
+                    "response.completed",
+                    "response.incomplete",
+                    "response.failed",
+                ):
+                    response_obj = getattr(event, "response", None)
+                    if response_obj is None:
+                        break
+                    if event_type == "response.failed":
+                        err = getattr(response_obj, "error", None)
+                        detail = getattr(err, "message", None) or "upstream response failed"
+                        raise ProviderError(detail, 502)
+                    # completed and incomplete both carry the full
+                    # response object, which is exactly what a
+                    # non-streaming ``responses.create`` would have
+                    # returned; incomplete keeps the partial answer
+                    # and its own status/finish reason.
+                    aggregated: dict[str, Any] = response_obj.model_dump()
+                    return aggregated
+        except ProviderError:
+            raise
+        except APIError as exc:
+            # SDK SSE errors flow through the normal provider error
+            # mapping, same as the ordinary request path.
+            raise self._to_provider_error(exc) from exc
+        except Exception as exc:
+            raise ProviderError(f"subscription stream failed: {exc}", 502) from exc
+        finally:
+            if stream is not None:
+                await stream.close()
+        raise ProviderError("upstream closed the stream without a terminal event", 502)
+
 
     async def _within_quota(
         self, call: Callable[[], Awaitable[_CallResult]], request_id: str | None
@@ -1089,6 +1224,20 @@ class OpenAITranslateProvider:
         # to a body whose ``stream`` is missing or ``null``, and the SDK
         # serializes a ``None`` kwarg as ``null`` instead of dropping it.
         openai_request["stream"] = bool(parsed.stream)
+        if self.cfg.chatgpt_oauth:
+            # The subscription backend is streaming-only ("Stream must be
+            # set to true"); force it and aggregate for non-streaming
+            # clients. It also rejects a stored response ("Store must be
+            # set to false"). Scoped here, NOT in the shared converter:
+            # the base Responses API defaults store to true for ordinary
+            # API-key routes, and that upstream behavior must not change.
+            openai_request["stream"] = True
+            openai_request["store"] = False
+            # The documented field for carrying reasoning across stateless
+            # turns: the router replays the returned reasoning item (from
+            # its tool-call cache) before the corresponding tool call on
+            # the next turn.
+            openai_request.setdefault("include", []).append("reasoning.encrypted_content")
         return openai_request
 
     def _enforce_context_window(

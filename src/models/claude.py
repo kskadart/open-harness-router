@@ -7,9 +7,9 @@ content blocks (text, image, tool use, tool result) and tool descriptions.
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, Tag
 
 
 class ClaudeContentBlockText(BaseModel):
@@ -17,6 +17,21 @@ class ClaudeContentBlockText(BaseModel):
 
     type: Literal["text"]
     text: str
+
+
+class ClaudeContentBlockThinking(BaseModel):
+    """Assistant reasoning replayed from an earlier Messages turn."""
+
+    type: Literal["thinking"]
+    thinking: str = ""
+    signature: str | None = None
+
+
+class ClaudeContentBlockRedactedThinking(BaseModel):
+    """Opaque reasoning replayed from an earlier Messages turn."""
+
+    type: Literal["redacted_thinking"]
+    data: str | None = None
 
 
 class ClaudeContentBlockImage(BaseModel):
@@ -40,7 +55,7 @@ class ClaudeContentBlockToolResult(BaseModel):
 
     type: Literal["tool_result"]
     tool_use_id: str
-    content: str | list[dict[str, Any]] | dict[str, Any]
+    content: str | list[dict[str, Any]] | dict[str, Any] = ""
 
 
 class ClaudeContentBlockToolAddition(BaseModel):
@@ -68,6 +83,18 @@ class ClaudeSystemContent(BaseModel):
     text: str
 
 
+ClaudeContentBlock = Annotated[
+    ClaudeContentBlockText
+    | ClaudeContentBlockThinking
+    | ClaudeContentBlockRedactedThinking
+    | ClaudeContentBlockImage
+    | ClaudeContentBlockToolUse
+    | ClaudeContentBlockToolResult
+    | ClaudeContentBlockToolAddition,
+    Field(discriminator="type"),
+]
+
+
 class ClaudeMessage(BaseModel):
     """Message in a Claude conversation.
 
@@ -76,16 +103,7 @@ class ClaudeMessage(BaseModel):
     """
 
     role: Literal["user", "assistant", "system"]
-    content: (
-        str
-        | list[
-            ClaudeContentBlockText
-            | ClaudeContentBlockImage
-            | ClaudeContentBlockToolUse
-            | ClaudeContentBlockToolResult
-            | ClaudeContentBlockToolAddition
-        ]
-    )
+    content: Annotated[list[ClaudeContentBlock], Tag("blocks")] | str
 
 
 class ClaudeTool(BaseModel):
