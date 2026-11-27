@@ -205,6 +205,8 @@ reject the encrypted task locally before contacting the upstream, so direct
 encrypted spawn fails on custom routes.
 The response is HTTP 400 with code `unsupported_encrypted_agent_message` and
 instructions for sending the task as plaintext through Codex Code Mode.
+Custom routes also omit Codex Work cross-thread delivery receipts without a
+`call_id`. Paired tool calls and results stay in the request history.
 Codex's inert `{"cyber":"standard"}` `access_programs` marker is removed on
 custom routes. Other program selections fail locally with
 `unsupported_access_programs`, while official OpenAI Responses routes receive

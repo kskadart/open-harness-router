@@ -103,6 +103,8 @@ To delegate to a translated model such as `cl-deepseek-v4.1-flash` from a
 Multi-Agent V2 parent with Code Mode, use `spawn_agent` in the standard
 profile. OHR turns the plaintext agent task into a user message on custom
 Responses and translated routes.
+Custom routes omit Codex Work cross-thread delivery receipts without a
+`call_id` and preserve paired tool calls and results.
 Encrypted agent tasks can only go to GPT models on the authenticated OpenAI
 Responses fallback.
 Chat Completions providers can opt in to forwarding the requested reasoning

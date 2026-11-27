@@ -55,6 +55,14 @@ _PLAINTEXT_AGENT_MESSAGE = {
     "recipient": "/root/worker",
     "content": [{"type": "input_text", "text": "Plaintext task"}],
 }
+_CODEX_THREAD_RECEIPT = {
+    "type": "function_call_output",
+    "id": "fco_receipt",
+    "namespace": "codex_tui",
+    "name": "send_message_to_thread",
+    "output": "Synthetic delivery receipt",
+    "internal_chat_message_metadata_passthrough": {"turn_id": "test", "create_time": 0},
+}
 _STANDARD_ACCESS_PROGRAMS = {"cyber": "standard"}
 
 
@@ -277,6 +285,35 @@ async def test_custom_native_responses_receives_plaintext_agent_task_as_user_mes
     }
 
 
+async def test_custom_native_responses_drops_inherited_codex_thread_receipt(
+    codex_client: httpx.AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=_URL, json=_RESPONSE)
+    paired_call = {
+        "type": "function_call",
+        "call_id": "call_test",
+        "namespace": "codex_tui",
+        "name": "send_message_to_thread",
+        "arguments": "{}",
+    }
+    paired_output = {**_CODEX_THREAD_RECEIPT, "id": "fco_paired", "call_id": "call_test"}
+    response = await codex_client.post(
+        "/v1/responses",
+        json={
+            "model": "kimi-for-coding",
+            "input": [_CODEX_THREAD_RECEIPT, _PLAINTEXT_AGENT_MESSAGE, paired_call, paired_output],
+        },
+    )
+    assert response.status_code == 200
+    outbound = httpx_mock.get_request()
+    assert outbound is not None
+    assert json.loads(outbound.content)["input"] == [
+        {"type": "message", "role": "user", "content": _PLAINTEXT_AGENT_MESSAGE["content"]},
+        paired_call,
+        paired_output,
+    ]
+
+
 @pytest.mark.parametrize("codex_client", [True], indirect=True)
 async def test_combined_catalog_preserves_native_metadata(codex_client: httpx.AsyncClient) -> None:
     catalog = (await codex_client.get("/codex/models")).json()
@@ -334,7 +371,10 @@ async def test_encrypted_agent_message_is_forwarded_intact_to_native_gpt(
 ) -> None:
     httpx_mock.add_response(url=url, json=_RESPONSE)
     body = json.dumps(
-        {"model": "gpt-native", "input": [_PLAINTEXT_AGENT_MESSAGE, agent_message]},
+        {
+            "model": "gpt-native",
+            "input": [_CODEX_THREAD_RECEIPT, _PLAINTEXT_AGENT_MESSAGE, agent_message],
+        },
         indent=2,
     )
     response = await codex_client.post(

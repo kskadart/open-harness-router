@@ -81,9 +81,27 @@ async def bridge_client(
             await registry.close_all()
 
 
+@pytest.mark.parametrize(
+    "input_items",
+    [
+        "Hello",
+        [
+            {
+                "type": "function_call_output",
+                "namespace": "codex_tui",
+                "name": "send_message_to_thread",
+                "output": "Synthetic delivery receipt",
+                "internal_chat_message_metadata_passthrough": {"turn_id": "test", "create_time": 0},
+            },
+            {"type": "message", "role": "user", "content": "Hello"},
+        ],
+    ],
+    ids=["text", "inherited-thread-receipt"],
+)
 async def test_messages_roundtrip_and_auth_isolation(
     bridge_client: httpx.AsyncClient,
     httpx_mock: HTTPXMock,
+    input_items: str | list[dict[str, Any]],
 ) -> None:
     httpx_mock.add_response(url="https://messages.example/v1/messages", json=MESSAGE)
     response = await bridge_client.post(
@@ -92,7 +110,7 @@ async def test_messages_roundtrip_and_auth_isolation(
             "authorization": "Bearer codex-private",
             "chatgpt-account-id": "private-account",
         },
-        json={"model": "messages-model", "instructions": "Be helpful", "input": "Hello"},
+        json={"model": "messages-model", "instructions": "Be helpful", "input": input_items},
     )
     assert response.status_code == 200
     data = response.json()

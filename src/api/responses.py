@@ -49,20 +49,37 @@ def _is_trusted_openai_agent_route(
     )
 
 
-def _normalize_access_programs(payload: dict[str, Any]) -> dict[str, Any]:
-    """Remove Codex's inert standard access marker only from compatibility routes."""
-    if "access_programs" not in payload:
-        return payload
-    if payload["access_programs"] != _STANDARD_ACCESS_PROGRAMS:
+def _normalize_custom_responses(payload: dict[str, Any]) -> dict[str, Any]:
+    """Adapt Codex-only request fields for third-party Responses providers."""
+    if "access_programs" in payload and payload["access_programs"] != _STANDARD_ACCESS_PROGRAMS:
         raise UpstreamError(
             "access_programs is supported only by the official OpenAI Responses endpoint. "
             "The selected custom model route cannot safely honor a nonstandard program selection.",
             400,
             "unsupported_access_programs",
         )
-    normalized = payload.copy()
-    del normalized["access_programs"]
-    return normalized
+    if "access_programs" in payload:
+        payload = payload.copy()
+        del payload["access_programs"]
+
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return payload
+    # Work adds cross-thread delivery receipts to the recipient's history.
+    # These internal records have no tool call in either the parent or child.
+    filtered = [
+        item
+        for item in items
+        if not (
+            isinstance(item, dict)
+            and item.get("type") == "function_call_output"
+            and item.get("namespace") == "codex_tui"
+            and item.get("name") == "send_message_to_thread"
+            and item.get("call_id") in (None, "")
+            and isinstance(item.get("internal_chat_message_metadata_passthrough"), dict)
+        )
+    ]
+    return {**payload, "input": filtered} if len(filtered) != len(items) else payload
 
 
 @router.websocket("/v1/responses")
@@ -205,7 +222,7 @@ async def create_response(
             if not trusted_agent_route:
                 adapted = adapt_agent_messages(payload)
                 if not official_responses_route:
-                    adapted = _normalize_access_programs(adapted)
+                    adapted = _normalize_custom_responses(adapted)
                 if adapted is not payload:
                     raw_body = json.dumps(adapted).encode()
             elif not http_request.headers.get("authorization") and has_encrypted_agent_message(
@@ -218,7 +235,7 @@ async def create_response(
         else:
             if has_encrypted_agent_message(payload):
                 raise unsupported_encrypted_agent_message()
-            payload = _normalize_access_programs(payload)
+            payload = _normalize_custom_responses(payload)
             result = await handle_translated_responses(
                 payload, decision.provider, http_request, decision.upstream_model, decision.limits
             )
