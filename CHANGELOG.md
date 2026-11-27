@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are `major.minor.micro`
 and every release is tagged `vX.Y.Z`.
 
+## [0.9.1] - 2026-11-27
+
+### Fixed
+
+- Prevent Kimi and other custom Responses providers from rejecting Codex Work subagent requests that contain an inherited delivery receipt without a call ID ([#64](https://github.com/kskadart/open-harness-router/pull/64))
+
 ## [0.9.0] - 2026-11-23
 
 ### Added
