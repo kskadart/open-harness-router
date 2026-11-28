@@ -57,8 +57,10 @@ route handling.
   and result in order.
 - A translated route completes a plaintext subagent request containing a
   thread-creation receipt, preserving the paired call and result in the Chat
-  Completions request. Call-less results without the receipt envelope still
-  fail as invalid translated requests before an upstream call.
+  Completions request. A result that lacks both the receipt envelope and
+  the `call_id` key still fails as an invalid translated request before an
+  upstream call. Items outside the envelope with an explicit null or empty
+  call ID retain their existing route-specific handling.
 - Native third-party requests containing only items outside the receipt
   contract retain those items. Official OpenAI routes preserve both receipts,
   including on explicit routes and routes using a router-owned key.
