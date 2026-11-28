@@ -15,6 +15,7 @@ from conversion.responses_ingress import (
     can_translate_responses,
     has_encrypted_agent_message,
     is_trusted_openai_responses_url,
+    omit_codex_thread_receipts,
     unsupported_encrypted_agent_message,
 )
 from dependencies import LoggerDep, RegistryDep
@@ -62,24 +63,7 @@ def _normalize_custom_responses(payload: dict[str, Any]) -> dict[str, Any]:
         payload = payload.copy()
         del payload["access_programs"]
 
-    items = payload.get("input")
-    if not isinstance(items, list):
-        return payload
-    # Work adds cross-thread delivery receipts to the recipient's history.
-    # These internal records have no tool call in either the parent or child.
-    filtered = [
-        item
-        for item in items
-        if not (
-            isinstance(item, dict)
-            and item.get("type") == "function_call_output"
-            and item.get("namespace") == "codex_tui"
-            and item.get("name") == "send_message_to_thread"
-            and item.get("call_id") in (None, "")
-            and isinstance(item.get("internal_chat_message_metadata_passthrough"), dict)
-        )
-    ]
-    return {**payload, "input": filtered} if len(filtered) != len(items) else payload
+    return omit_codex_thread_receipts(payload)
 
 
 @router.websocket("/v1/responses")
