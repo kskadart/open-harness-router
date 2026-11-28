@@ -63,6 +63,12 @@ _CODEX_THREAD_RECEIPT = {
     "output": "Synthetic delivery receipt",
     "internal_chat_message_metadata_passthrough": {"turn_id": "test", "create_time": 0},
 }
+_CODEX_CREATION_RECEIPT = {
+    **_CODEX_THREAD_RECEIPT,
+    "id": "fco_creation",
+    "name": "create_thread",
+    "output": "Synthetic thread creation receipt",
+}
 _STANDARD_ACCESS_PROGRAMS = {"cyber": "standard"}
 
 
@@ -285,23 +291,46 @@ async def test_custom_native_responses_receives_plaintext_agent_task_as_user_mes
     }
 
 
-async def test_custom_native_responses_drops_inherited_codex_thread_receipt(
-    codex_client: httpx.AsyncClient, httpx_mock: HTTPXMock
+@pytest.mark.parametrize(
+    "receipt",
+    [
+        _CODEX_THREAD_RECEIPT,
+        _CODEX_CREATION_RECEIPT,
+        {
+            **_CODEX_CREATION_RECEIPT,
+            "name": "new_work_operation",
+            "output": '{"call_id":"ignored"}',
+        },
+        {
+            **_CODEX_CREATION_RECEIPT,
+            "call_id": None,
+            "internal_chat_message_metadata_passthrough": {},
+        },
+        {
+            **_CODEX_CREATION_RECEIPT,
+            "call_id": "",
+            "internal_chat_message_metadata_passthrough": {"future_key": "value"},
+        },
+    ],
+    ids=["delivery", "creation", "future-operation", "creation-null-id", "creation-empty-id"],
+)
+async def test_custom_native_responses_drops_codex_thread_receipts_and_keeps_tool_history(
+    codex_client: httpx.AsyncClient, httpx_mock: HTTPXMock, receipt: dict[str, Any]
 ) -> None:
     httpx_mock.add_response(url=_URL, json=_RESPONSE)
     paired_call = {
         "type": "function_call",
         "call_id": "call_test",
         "namespace": "codex_tui",
-        "name": "send_message_to_thread",
+        "name": receipt["name"],
         "arguments": "{}",
     }
-    paired_output = {**_CODEX_THREAD_RECEIPT, "id": "fco_paired", "call_id": "call_test"}
+    paired_output = {**receipt, "id": "fco_paired", "call_id": "call_test"}
     response = await codex_client.post(
         "/v1/responses",
         json={
             "model": "kimi-for-coding",
-            "input": [_CODEX_THREAD_RECEIPT, _PLAINTEXT_AGENT_MESSAGE, paired_call, paired_output],
+            "input": [receipt, _PLAINTEXT_AGENT_MESSAGE, paired_call, paired_output],
         },
     )
     assert response.status_code == 200
@@ -312,6 +341,86 @@ async def test_custom_native_responses_drops_inherited_codex_thread_receipt(
         paired_call,
         paired_output,
     ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"namespace": "other_namespace"},
+        {"internal_chat_message_metadata_passthrough": None},
+        {"internal_chat_message_metadata_passthrough": "not an object"},
+        {"type": "custom_tool_call_output"},
+        {"call_id": 0},
+        {"call_id": False},
+        {"call_id": " "},
+        {"call_id": "call_unpaired"},
+        {"name": None},
+        {"name": ""},
+        {"name": []},
+    ],
+    ids=[
+        "different-namespace",
+        "null-metadata",
+        "non-object-metadata",
+        "different-item-type",
+        "numeric-id",
+        "boolean-id",
+        "whitespace-id",
+        "unpaired-id",
+        "null-name",
+        "empty-name",
+        "malformed-name",
+    ],
+)
+async def test_custom_native_responses_preserves_items_outside_thread_receipt_contract(
+    codex_client: httpx.AsyncClient, httpx_mock: HTTPXMock, overrides: dict[str, Any]
+) -> None:
+    httpx_mock.add_response(url=_URL, json=_RESPONSE)
+    item = {**_CODEX_CREATION_RECEIPT, **overrides}
+    message = {"type": "message", "role": "user", "content": "Hello"}
+    body = json.dumps({"model": "kimi-for-coding", "input": [item, message]}, indent=2)
+    response = await codex_client.post(
+        "/v1/responses", content=body, headers={"content-type": "application/json"}
+    )
+    assert response.status_code == 200
+    outbound = httpx_mock.get_request()
+    assert outbound is not None
+    assert outbound.content == body.encode()
+
+
+async def test_custom_native_responses_filters_only_top_level_thread_receipts(
+    codex_client: httpx.AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=_URL, json=_RESPONSE)
+    result = {
+        "type": "function_call_output",
+        "call_id": "call_test",
+        "output": json.dumps(_CODEX_CREATION_RECEIPT),
+    }
+    response = await codex_client.post(
+        "/v1/responses",
+        json={
+            "model": "kimi-for-coding",
+            "input": [_CODEX_CREATION_RECEIPT, _CODEX_THREAD_RECEIPT, result],
+        },
+    )
+    assert response.status_code == 200
+    outbound = httpx_mock.get_request()
+    assert outbound is not None
+    assert json.loads(outbound.content)["input"] == [result]
+
+
+async def test_custom_native_responses_leaves_receipt_only_input_validation_to_upstream(
+    codex_client: httpx.AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    httpx_mock.add_response(url=_URL, json=_RESPONSE)
+    response = await codex_client.post(
+        "/v1/responses", json={"model": "kimi-for-coding", "input": [_CODEX_CREATION_RECEIPT]}
+    )
+    assert response.status_code == 200
+    outbound = httpx_mock.get_request()
+    assert outbound is not None
+    assert json.loads(outbound.content)["input"] == []
 
 
 @pytest.mark.parametrize("codex_client", [True], indirect=True)
@@ -373,7 +482,12 @@ async def test_encrypted_agent_message_is_forwarded_intact_to_native_gpt(
     body = json.dumps(
         {
             "model": "gpt-native",
-            "input": [_CODEX_THREAD_RECEIPT, _PLAINTEXT_AGENT_MESSAGE, agent_message],
+            "input": [
+                _CODEX_CREATION_RECEIPT,
+                _CODEX_THREAD_RECEIPT,
+                _PLAINTEXT_AGENT_MESSAGE,
+                agent_message,
+            ],
         },
         indent=2,
     )
@@ -522,7 +636,7 @@ async def test_nonstandard_access_programs_is_rejected_before_custom_upstream(
     ],
     indirect=["codex_client"],
 )
-async def test_official_openai_responses_preserves_access_programs(
+async def test_official_openai_responses_preserves_access_programs_and_thread_receipts(
     codex_client: httpx.AsyncClient, httpx_mock: HTTPXMock, url: str
 ) -> None:
     httpx_mock.add_response(url=url, json=_RESPONSE)
@@ -530,7 +644,11 @@ async def test_official_openai_responses_preserves_access_programs(
         {
             "model": "gpt-native",
             "access_programs": {"cyber": "named"},
-            "input": "Hello",
+            "input": [
+                _CODEX_CREATION_RECEIPT,
+                _CODEX_THREAD_RECEIPT,
+                {"type": "message", "role": "user", "content": "Hello"},
+            ],
         },
         indent=2,
     )

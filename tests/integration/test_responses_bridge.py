@@ -28,6 +28,19 @@ MESSAGE = {
     "stop_reason": "end_turn",
     "usage": {"input_tokens": 10, "output_tokens": 2, "cache_read_input_tokens": 3},
 }
+_CODEX_CREATION_RECEIPT = {
+    "type": "function_call_output",
+    "namespace": "codex_tui",
+    "name": "create_thread",
+    "output": "Synthetic thread creation receipt",
+    "internal_chat_message_metadata_passthrough": {"turn_id": "test", "create_time": 0},
+}
+_PLAINTEXT_AGENT_TASK = {
+    "type": "agent_message",
+    "author": "/root",
+    "recipient": "/root/worker",
+    "content": [{"type": "input_text", "text": "Use echo"}],
+}
 
 
 @pytest_asyncio.fixture
@@ -131,30 +144,31 @@ async def test_messages_roundtrip_and_auth_isolation(
 
 
 @pytest.mark.parametrize(
-    ("bridge_client", "task"),
+    ("bridge_client", "history"),
     [
-        (False, {"role": "user", "content": "Use echo"}),
+        (False, [{"role": "user", "content": "Use echo"}]),
+        (True, [_PLAINTEXT_AGENT_TASK]),
         (
             True,
-            {
-                "type": "agent_message",
-                "author": "/root",
-                "recipient": "/root/worker",
-                "content": [{"type": "input_text", "text": "Use echo"}],
-            },
+            [
+                _CODEX_CREATION_RECEIPT,
+                {**_CODEX_CREATION_RECEIPT, "name": "new_work_operation"},
+                _PLAINTEXT_AGENT_TASK,
+            ],
         ),
     ],
-    ids=["user", "agent"],
+    ids=["user", "agent", "agent-with-thread-creation"],
     indirect=["bridge_client"],
 )
 async def test_chat_function_call_and_tool_result_continuation(
     bridge_client: httpx.AsyncClient,
     httpx_mock: HTTPXMock,
-    task: dict[str, Any],
+    history: list[dict[str, Any]],
     request: pytest.FixtureRequest,
 ) -> None:
     httpx_mock.add_response(
         url="https://chat.example/v1/chat/completions",
+        is_optional=True,
         json={
             "id": "chat_1",
             "object": "chat.completion",
@@ -191,7 +205,7 @@ async def test_chat_function_call_and_tool_result_continuation(
             }
         ],
         "input": [
-            task,
+            *history,
             {
                 "type": "function_call",
                 "call_id": "call_1",
@@ -214,8 +228,46 @@ async def test_chat_function_call_and_tool_result_continuation(
     expected_effort = "high" if request.node.callspec.params["bridge_client"] else None
     assert body.get("reasoning_effort") == expected_effort
     assert body["messages"][0] == {"role": "user", "content": "Use echo"}
+    assert len(body["messages"]) == 3
+    assert body["messages"][1]["tool_calls"] == [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "echo", "arguments": '{"value": "one"}'},
+        }
+    ]
     assert body["messages"][-1] == {"role": "tool", "tool_call_id": "call_1", "content": "one"}
     assert upstream.headers["authorization"] == "Bearer own-key"
+
+
+async def test_translated_responses_rejects_call_less_result_without_receipt_metadata(
+    bridge_client: httpx.AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    response = await bridge_client.post(
+        "/v1/responses",
+        json={
+            "model": "chat-model",
+            "input": [
+                {**_CODEX_CREATION_RECEIPT, "internal_chat_message_metadata_passthrough": None},
+                _PLAINTEXT_AGENT_TASK,
+            ],
+        },
+    )
+    assert response.status_code == 400
+    assert not httpx_mock.get_requests()
+
+
+async def test_translated_responses_validates_receipt_only_input_as_empty(
+    bridge_client: httpx.AsyncClient, httpx_mock: HTTPXMock
+) -> None:
+    response = await bridge_client.post(
+        "/v1/responses", json={"model": "chat-model", "input": [_CODEX_CREATION_RECEIPT]}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["message"] == (
+        "Responses input must contain at least one message"
+    )
+    assert not httpx_mock.get_requests()
 
 
 @pytest.mark.parametrize(
