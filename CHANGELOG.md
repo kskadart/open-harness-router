@@ -4,6 +4,12 @@ All notable changes to this project are documented in this file. The format foll
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions are `major.minor.micro`
 and every release is tagged `vX.Y.Z`.
 
+## [0.9.2] - 2026-11-28
+
+### Fixed
+
+- Keep Codex Work subagents working on DeepSeek, Kimi, and other custom Responses routes by filtering thread lifecycle receipts while preserving genuine tool history ([#66](https://github.com/kskadart/open-harness-router/pull/66))
+
 ## [0.9.1] - 2026-11-27
 
 ### Fixed
