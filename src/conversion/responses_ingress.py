@@ -119,6 +119,29 @@ def adapt_agent_messages(payload: dict[str, Any]) -> dict[str, Any]:
     return {**payload, "input": adapted} if adapted is not None else payload
 
 
+def _is_codex_thread_receipt(item: Any) -> bool:
+    if not isinstance(item, dict):
+        return False
+    name = item.get("name")
+    return (
+        item.get("type") == "function_call_output"
+        and item.get("namespace") == "codex_tui"
+        and isinstance(name, str)
+        and name != ""
+        and item.get("call_id") in (None, "")
+        and isinstance(item.get("internal_chat_message_metadata_passthrough"), dict)
+    )
+
+
+def omit_codex_thread_receipts(payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove local Codex Work lifecycle records before third-party translation."""
+    items = payload.get("input")
+    if not isinstance(items, list):
+        return payload
+    filtered = [item for item in items if not _is_codex_thread_receipt(item)]
+    return {**payload, "input": filtered} if len(filtered) != len(items) else payload
+
+
 def can_translate_responses(cfg: ProviderCfg) -> bool:
     """Own-key upstreams can use the Messages adapter without leaking Codex auth."""
     return cfg.type == "openai-translate" or not cfg.forward_client_auth
